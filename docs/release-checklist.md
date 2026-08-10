@@ -61,4 +61,4 @@ The last verified portable artifact was:
 - path: `artifacts/foliohelm-0.1.0-windows-x64-mock.exe`
 - SHA-256: `0125964F1C7E4FB192E8C4D496618C5E0CCE91A70898F0E8F960E00A89676DF7`
 - build command: `npm run desktop:build:portable`
-- commit: record the release commit here at publish time
+- commit: `4434a71` (theme parity and interaction checkpoint)
