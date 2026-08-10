@@ -59,7 +59,6 @@ SHA-256 and mark it unsigned.
 The last verified portable artifact was:
 
 - path: `artifacts/foliohelm-0.1.0-windows-x64-mock.exe`
-- SHA-256: `EC2E22BEBC772AAAE0F88E47C3CC5262C9A6C8493F64157A26DB4F30997C224E`
+- SHA-256: `C4A368E8C9DEEC9AAC82E8D6B6DE64ABD6E99C27BD1FF8073679463CF7B5B5BF`
 - build command: `npm run desktop:build:portable`
 - commit: record the release commit here at publish time
-
