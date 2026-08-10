@@ -35,7 +35,7 @@ export function App() {
   const [tradeRequest, setTradeRequest] = useState<{ symbol?: string } | null>(null);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const copy = getCopy(language);
-  const mockPortfolio = getMockPortfolio();
+  const mockPortfolio = getMockPortfolio(language);
 
   useEffect(() => {
     writeStored("language", language);

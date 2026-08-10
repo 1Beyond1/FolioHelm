@@ -48,6 +48,23 @@ describe("FolioHelm demo home", () => {
     expect(screen.getByRole("status")).toHaveTextContent(/[+-]/);
   });
 
+  it("hides and restores the portfolio value without pretending USD or the year are controls", () => {
+    const { container } = render(<App />);
+
+    const hideBalance = screen.getByRole("button", { name: /Hide portfolio value|隐藏组合金额/i });
+    fireEvent.click(hideBalance);
+
+    expect(screen.getByText("••••••")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Show portfolio value|显示组合金额/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: /^USD$/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Show portfolio value|显示组合金额/i }));
+    expect(screen.queryByText("••••••")).not.toBeInTheDocument();
+    expect(screen.getByText("USD")).toBeInTheDocument();
+    expect(container.querySelector(".year-label")).toHaveTextContent("2026");
+    expect(container.querySelector(".year-label")?.tagName).toBe("SPAN");
+  });
+
   it("inspects the home chart and adjusts its time span with the wheel", () => {
     render(<App />);
 

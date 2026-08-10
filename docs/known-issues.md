@@ -25,13 +25,6 @@
 - 影响：当前导出的证据是 Mock 辅助记录，不是券商对账单或绝对事实证明。
 - 处理：真实写能力前完成本地完整事件、设备签名、双证据设计和独立审查。
 
-### FH-I18N-001 — 个别演示事件和日期仍含领域英文
-
-- 严重程度：P2
-- 现状：页面主界面已支持 English/简体中文，但首页近期活动、证券名称和部分日期仍来自虚构数据字段，可能出现 `buy order working`、`shares` 或英文月份。
-- 影响：中文截图和新人阅读的一致性不足。
-- 处理：将活动事件改为结构化 key，由页面 locale formatter 统一输出；不影响 API Gate。
-
 ### FH-RELEASE-001 — WiX/NSIS 安装包在当前环境被权限拒绝
 
 - 严重程度：P2（外部环境）
@@ -67,6 +60,10 @@ Ticket → Safety check → Mock preview → Demo receipt 已由 Mock Broker 驱
 ### FH-AUTO-001 — Mock/Paper/Dry Run 自动化
 
 已实现模式选择、允许列表、单笔/每日预算、并发与速率边界、幂等键、Kill Switch 和本地运行日志；Real Trading 仍不可用。
+
+### FH-I18N-001 — 首页活动和图表领域文案本地化
+
+已修复：中文首页活动、持仓单位、热力图月份、图表时间标签和交易步骤不再出现误导性的英文残留。`Mock`、`Paper Trading`、`Dry Run`、`API` 等模式/协议名称保留为产品术语。
 
 ### FH-UX-002 / FH-UX-003 — Modal、键盘和 900px 响应式收口
 

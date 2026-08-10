@@ -1,15 +1,17 @@
 .fh-page {
-  --fh-bg: #0d0e0d;
-  --fh-surface: #151615;
-  --fh-surface-raised: #1b1c1b;
-  --fh-line: #292b28;
-  --fh-line-strong: #393b37;
-  --fh-text: #f0f1ed;
-  --fh-muted: #969991;
-  --fh-muted-strong: #babdb5;
-  --fh-lime: #b7ff22;
-  --fh-lime-soft: rgba(183, 255, 34, 0.11);
-  --fh-red: #db777b;
+  --fh-bg: var(--bg);
+  --fh-surface: var(--surface);
+  --fh-surface-raised: var(--surface-raised);
+  --fh-surface-soft: var(--surface-soft);
+  --fh-line: var(--line);
+  --fh-line-strong: var(--line-strong);
+  --fh-text: var(--text);
+  --fh-muted: var(--muted);
+  --fh-muted-strong: var(--muted-strong);
+  --fh-lime: var(--lime);
+  --fh-lime-soft: var(--lime-soft);
+  --fh-red: var(--negative);
+  --fh-ink: var(--ink-on-lime);
   box-sizing: border-box;
   min-height: 100%;
   padding: 38px clamp(18px, 4vw, 64px) 56px;
@@ -469,7 +471,7 @@
 .fh-trade-button:hover,
 .fh-trade-button:focus-visible {
   background: var(--fh-lime);
-  color: #0b0c0b;
+  color: var(--fh-ink);
 }
 
 .fh-data-quality {

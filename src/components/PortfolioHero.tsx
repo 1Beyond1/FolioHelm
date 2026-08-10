@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { Copy } from "../i18n";
 import { formatCurrency, formatSignedCurrency, formatSignedPercent } from "../formatters";
 import type { Language, PortfolioMockData } from "../types";
@@ -14,19 +15,27 @@ interface PortfolioHeroProps {
 }
 
 export function PortfolioHero({ copy, language, data, onNavigate, onSearch }: PortfolioHeroProps) {
+  const [valueVisible, setValueVisible] = useState(true);
+
   return (
     <section className="hero" id="home" aria-labelledby="portfolio-title">
       <div className="hero-summary">
         <div className="eyebrow-row">
           <span id="portfolio-title">{copy.totalPortfolioValue}</span>
-          <button className="eye-button" type="button" aria-label={copy.totalPortfolioValue}>
+          <button
+            className="eye-button"
+            type="button"
+            aria-label={valueVisible ? copy.hideBalance : copy.showBalance}
+            aria-pressed={!valueVisible}
+            onClick={() => setValueVisible((visible) => !visible)}
+          >
             <Icon name="eye" />
           </button>
         </div>
 
         <div className="balance-row">
-          <strong>{formatCurrency(data.totalValue, language)}</strong>
-          <button className="currency-selector" type="button">USD <span>⌄</span></button>
+          <strong>{valueVisible ? formatCurrency(data.totalValue, language) : "••••••"}</strong>
+          <span className="currency-selector" aria-label="USD">USD</span>
         </div>
 
         <div className="daily-return">

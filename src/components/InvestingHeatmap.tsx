@@ -42,6 +42,9 @@ export function InvestingHeatmap({
   const bestDay = availableEntries.reduce((best, entry) => Math.max(best, entry.dailyReturnPct ?? Number.NEGATIVE_INFINITY), Number.NEGATIVE_INFINITY);
   const downDays = availableEntries.filter((entry) => (entry.dailyReturnPct ?? 0) < 0).length;
   const isReturnMode = mode === "return";
+  const months = language === "zh"
+    ? ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
+    : ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const hoveredColumn = hoveredIndex === null ? null : Math.floor(hoveredIndex / 7);
   const hoveredRow = hoveredIndex === null ? null : hoveredIndex % 7;
   const columnCount = Math.ceil(entries.length / 7);
@@ -102,13 +105,13 @@ export function InvestingHeatmap({
               </button>
             </div>
           )}
-          <button className="year-selector" type="button">{copy.year} <span>⌄</span></button>
+          <span className="year-label" aria-label={copy.year}>{copy.year}</span>
         </div>
       </div>
 
       <div className={`heatmap-frame ${isReturnMode ? "return-mode" : ""}`} data-mode={mode}>
         <div className="month-labels" aria-hidden="true">
-          <span>Jan</span><span>Feb</span><span>Mar</span><span>Apr</span><span>May</span><span>Jun</span><span>Jul</span><span>Aug</span><span>Sep</span><span>Oct</span><span>Nov</span><span>Dec</span>
+          {months.map((month) => <span key={month}>{month}</span>)}
         </div>
         <div className="weekday-labels" aria-hidden="true">
           {copy.weekdays.map((weekday) => <span key={weekday}>{weekday}</span>)}

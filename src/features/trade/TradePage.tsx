@@ -36,11 +36,11 @@ interface DemoReceipt {
 
 const SYMBOLS: readonly TradeSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
 
-function getTradeQuote(symbol: TradeSymbol): Quote {
+function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
   const canonicalQuote = findMockQuote(symbol);
   const canonicalHolding = findMockHolding(symbol);
   return {
-    company: canonicalQuote?.companyEn ?? symbol,
+    company: language === "zh" ? canonicalQuote?.companyZh ?? symbol : canonicalQuote?.companyEn ?? symbol,
     price: canonicalQuote?.price ?? price("0"),
     changePct: canonicalQuote?.changePct ?? ("0" as Percent),
     heldShares: canonicalHolding?.quantity ?? makeQuantity("0"),
@@ -119,10 +119,10 @@ const COPY = {
     eyebrow: "虚构执行流程",
     demoOnly: "仅演示",
     noConnection: "未连接券商 · 任何内容都不会发送",
-    ticket: "Ticket",
-    safety: "Safety check",
-    preview: "Mock preview",
-    receipt: "Demo receipt",
+    ticket: "订单",
+    safety: "安全检查",
+    preview: "模拟预览",
+    receipt: "演示回执",
     symbol: "代码",
     side: "方向",
     buy: "买入",
@@ -139,7 +139,7 @@ const COPY = {
     dollars: "美元",
     continue: "继续",
     back: "返回",
-    continuePreview: "继续到 Mock preview",
+    continuePreview: "继续到模拟预览",
     safetyTitle: "检查虚构安全门槛",
     accountMatch: "账户匹配",
     matchedDemo: "已匹配 · 演示账户",
@@ -200,7 +200,9 @@ const ZERO_PRICE = price("0");
 export function TradePage({ language, initialSymbol, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
   const demoSnapshot = MOCK_BROKER.getSnapshot();
-  const demoAccount = `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
+  const demoAccount = language === "zh"
+    ? `演示券商 · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
+    : `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
   const demoBuyingPower = demoSnapshot.account.buyingPower;
   const [step, setStep] = useState<TradeStep>("ticket");
   const [symbol, setSymbol] = useState<TradeSymbol>(() =>
@@ -215,7 +217,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const [preview, setPreview] = useState<MockPreview | null>(null);
   const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
 
-  const currentQuote = getTradeQuote(symbol);
+  const currentQuote = getTradeQuote(symbol, language);
   const draft = useMemo<OrderDraft | null>(() => {
     if (!WHOLE_QUANTITY_RE.test(quantity.trim())) return null;
     if (orderType === "Limit" && !POSITIVE_PRICE_RE.test(limitPrice.trim())) return null;
@@ -391,7 +393,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
                 >
                   {SYMBOLS.map((option) => (
                     <option key={option} value={option}>
-                      {option} · {getTradeQuote(option).company}
+                      {option} · {getTradeQuote(option, language).company}
                     </option>
                   ))}
                 </select>

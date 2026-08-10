@@ -139,8 +139,9 @@ const LEGACY_ORDERS: OrderRecord[] = [
   },
 ];
 
-function readOrders(): OrderRecord[] {
+function readOrders(language: Language): OrderRecord[] {
   void LEGACY_ORDERS;
+  const locale = language === "zh" ? "zh-CN" : "en-US";
   return MOCK_BROKER.getSnapshot().orders.map((order) => ({
     id: order.id,
     symbol: order.symbol,
@@ -150,10 +151,10 @@ function readOrders(): OrderRecord[] {
     filled: decimalToNumber(order.filledQuantity),
     limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
     status: order.status,
-    submitted: new Intl.DateTimeFormat("en-US", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
+    submitted: new Intl.DateTimeFormat(locale, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
     timeline: order.events.map((event) => ({
       kind: event.kind,
-      timestamp: new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
+      timestamp: new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
       detail: event.detailEn,
     })),
   }));
@@ -297,7 +298,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   const copy = COPY[language];
   // Read the canonical local ledger on every render so a newly consumed Mock
   // preview appears immediately after the trade modal closes.
-  const orders = readOrders();
+  const orders = readOrders(language);
   const [activeStatus, setActiveStatus] = useState<OrderStatus>("working");
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);

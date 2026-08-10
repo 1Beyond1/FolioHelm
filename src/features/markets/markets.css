@@ -229,13 +229,13 @@
   padding: 0 13px;
   border: 1px solid var(--markets-line-strong);
   border-radius: 13px;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--markets-raised);
   transition: border-color 160ms ease, background 160ms ease;
 }
 
 .markets-search-field:focus-within {
-  border-color: rgba(183, 255, 34, 0.48);
-  background: rgba(0, 0, 0, 0.28);
+  border-color: var(--markets-lime);
+  background: var(--markets-soft);
 }
 
 .markets-search-icon {
@@ -259,7 +259,7 @@
 }
 
 .markets-search-field input::placeholder {
-  color: #686864;
+  color: var(--markets-muted);
 }
 
 .markets-clear-search {
@@ -286,7 +286,7 @@
 .markets-search-hint {
   grid-column: 2;
   margin: 0 3px;
-  color: #686864;
+  color: var(--markets-muted);
   font-size: 9px;
 }
 
@@ -570,7 +570,7 @@
   align-items: center;
   padding: 3px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--markets-soft);
 }
 
 .markets-segmented-control {
@@ -593,8 +593,9 @@
 
 .markets-segmented-control button.active,
 .instrument-period-switcher button.active {
-  background: #303030;
+  background: var(--markets-raised);
   color: var(--markets-text);
+  box-shadow: 0 0 0 1px var(--markets-line-strong);
 }
 
 .markets-movers-list {
@@ -612,7 +613,7 @@
 }
 
 .markets-mover-rank {
-  color: #5d5d59;
+  color: var(--markets-muted);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
 }
@@ -910,7 +911,7 @@
   pointer-events: none;
   border: 1px solid var(--markets-line-strong);
   border-radius: 12px;
-  background: rgba(25, 25, 25, 0.94);
+  background: var(--markets-raised);
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.38);
 }
 
@@ -945,7 +946,7 @@
   position: absolute;
   top: 14px;
   left: 23px;
-  color: rgba(255, 255, 255, 0.34);
+  color: var(--markets-muted);
   font-size: 9px;
   pointer-events: none;
 }
@@ -958,7 +959,7 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  color: #666662;
+  color: var(--markets-muted);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
 }
@@ -970,7 +971,7 @@
   left: 23px;
   display: flex;
   justify-content: space-between;
-  color: #666662;
+  color: var(--markets-muted);
   font-size: 9px;
 }
 

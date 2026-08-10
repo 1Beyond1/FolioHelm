@@ -26,14 +26,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features -- -D warnings
 ```
 
-- [ ] Windows portable build completes:
+- [x] Windows portable build completes:
 
 ```powershell
 npm run desktop:build:portable
 ```
 
-- [ ] The EXE starts without a Vite dev server and exits cleanly.
-- [ ] The artifact is hashed with SHA-256.
+- [x] The EXE starts without a Vite dev server and exits cleanly.
+- [x] The artifact is hashed with SHA-256.
 
 ## Manual acceptance
 
@@ -59,6 +59,6 @@ SHA-256 and mark it unsigned.
 The last verified portable artifact was:
 
 - path: `artifacts/foliohelm-0.1.0-windows-x64-mock.exe`
-- SHA-256: `C4A368E8C9DEEC9AAC82E8D6B6DE64ABD6E99C27BD1FF8073679463CF7B5B5BF`
+- SHA-256: `0125964F1C7E4FB192E8C4D496618C5E0CCE91A70898F0E8F960E00A89676DF7`
 - build command: `npm run desktop:build:portable`
 - commit: record the release commit here at publish time

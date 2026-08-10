@@ -1,7 +1,7 @@
 import { MOCK_BROKER } from "../domain/mockBroker";
 import { decimalToNumber } from "../domain/decimal";
 import type { BrokerSymbol } from "../domain/contracts";
-import type { ActivityItem, HeatmapEntry, PortfolioMockData, PortfolioPoint, PortfolioPeriod, Position } from "../types";
+import type { ActivityItem, HeatmapEntry, Language, PortfolioMockData, PortfolioPoint, PortfolioPeriod, Position } from "../types";
 
 /** View adapter: the canonical source is the local Mock Broker, never a page-local fixture. */
 function toHeatmapEntry(entry: ReturnType<typeof MOCK_BROKER.getSnapshot>["heatmap"][number]): HeatmapEntry {
@@ -17,12 +17,13 @@ function toHeatmapEntry(entry: ReturnType<typeof MOCK_BROKER.getSnapshot>["heatm
 
 export const MOCK_DATA_NOTICE = "Demo data · No brokerage connection";
 
-export function getMockPortfolio(): PortfolioMockData {
+export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
   const snapshot = MOCK_BROKER.getSnapshot();
+  const chinese = language === "zh";
   const quoteBySymbol = new Map(snapshot.quotes.map((item) => [item.symbol, item]));
   const positions: Position[] = snapshot.holdings.map((holding) => ({
     ticker: holding.symbol,
-    company: `${holding.companyEn} · ${holding.quantity} shares`,
+    company: `${chinese ? holding.companyZh : holding.companyEn} · ${holding.quantity} ${chinese ? "股" : "shares"}`,
     shares: decimalToNumber(holding.quantity),
     marketValue: decimalToNumber(holding.marketValue),
     unrealizedPnl: decimalToNumber(holding.dayPnl),
@@ -49,13 +50,17 @@ export function getMockPortfolio(): PortfolioMockData {
     const quote = quoteBySymbol.get(order.symbol);
     const isFilled = order.status === "filled";
     const detailPrice = order.limitPrice === null
-      ? quote ? `$${decimalToNumber(quote.price).toFixed(2)}` : "market"
+      ? quote ? `$${decimalToNumber(quote.price).toFixed(2)}` : chinese ? "市价" : "market"
       : `$${decimalToNumber(order.limitPrice).toFixed(2)}`;
+    const sideLabel = chinese ? order.side === "buy" ? "买入" : "卖出" : order.side === "buy" ? "buy" : "sell";
+    const statusLabel = chinese
+      ? order.status === "filled" ? "订单已成交" : order.status === "working" ? "订单工作中" : order.status === "canceled" ? "订单已撤销" : order.status === "rejected" ? "订单已拒绝" : "订单状态未知"
+      : order.status;
     return {
       kind: isFilled ? "filled" : "pending",
-      title: `${order.symbol} ${order.side === "buy" ? "buy" : "sell"} order ${isFilled ? "filled" : order.status}`,
-      detail: `${decimalToNumber(order.quantity)} shares · ${detailPrice}`,
-      time: new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)),
+      title: `${order.symbol} ${sideLabel} ${statusLabel}`,
+      detail: `${decimalToNumber(order.quantity)} ${chinese ? "股" : "shares"} · ${detailPrice}`,
+      time: new Intl.DateTimeFormat(chinese ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)),
     };
   });
 

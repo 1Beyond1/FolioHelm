@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PortfolioPage } from "../../src/features/portfolio/PortfolioPage";
 import { OrdersPage } from "../../src/features/orders/OrdersPage";
 import { MOCK_BROKER } from "../../src/domain/mockBroker";
+import { getMockPortfolio } from "../../src/mocks/portfolio";
 
 afterEach(() => {
   MOCK_BROKER.reset();
@@ -50,6 +51,15 @@ describe("dynamic Mock snapshot", () => {
 
     expect(screen.getAllByText("$25,000.00")).toHaveLength(3);
     expect(screen.queryByTestId(/^portfolio-holding-row-/)).not.toBeInTheDocument();
+  });
+
+  it("localizes Mock activity content for Chinese users", () => {
+    const activity = getMockPortfolio("zh").activity;
+
+    expect(activity).not.toHaveLength(0);
+    expect(activity.every((item) => !/\b(buy|sell|working|filled|shares|market)\b/i.test(`${item.title} ${item.detail}`))).toBe(true);
+    expect(activity[0]?.title).toContain("买入");
+    expect(activity[0]?.detail).toContain("股");
   });
 });
 

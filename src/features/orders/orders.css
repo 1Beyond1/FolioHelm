@@ -1,15 +1,18 @@
 .fh-orders-page {
-  --fh-bg: #0d0e0d;
-  --fh-surface: #151615;
-  --fh-line: #292b28;
-  --fh-line-strong: #393b37;
-  --fh-text: #f0f1ed;
-  --fh-muted: #969991;
-  --fh-muted-strong: #babdb5;
-  --fh-lime: #b7ff22;
-  --fh-lime-soft: rgba(183, 255, 34, 0.11);
-  --fh-red: #db777b;
-  --fh-amber: #d6b978;
+  --fh-bg: var(--bg);
+  --fh-surface: var(--surface);
+  --fh-surface-raised: var(--surface-raised);
+  --fh-surface-soft: var(--surface-soft);
+  --fh-line: var(--line);
+  --fh-line-strong: var(--line-strong);
+  --fh-text: var(--text);
+  --fh-muted: var(--muted);
+  --fh-muted-strong: var(--muted-strong);
+  --fh-lime: var(--lime);
+  --fh-lime-soft: var(--lime-soft);
+  --fh-red: var(--negative);
+  --fh-amber: var(--warning);
+  --fh-ink: var(--ink-on-lime);
   box-sizing: border-box;
   min-height: 100%;
   padding: 38px clamp(18px, 4vw, 64px) 56px;
@@ -80,7 +83,7 @@
   border: 1px solid var(--fh-lime);
   border-radius: 999px;
   background: var(--fh-lime);
-  color: #0b0c0b;
+  color: var(--fh-ink);
   cursor: pointer;
   font-size: 11px;
   font-weight: 800;
@@ -115,7 +118,7 @@
   padding: 4px;
   border: 1px solid var(--fh-line);
   border-radius: 13px;
-  background: #111211;
+  background: var(--fh-surface-raised);
 }
 
 .fh-order-tab {
@@ -140,7 +143,7 @@
 }
 
 .fh-order-tab.is-active {
-  background: #252724;
+  background: var(--fh-surface-soft);
   color: var(--fh-text);
   box-shadow: inset 0 0 0 1px var(--fh-line-strong);
 }
@@ -152,7 +155,7 @@
   place-items: center;
   padding: 0 4px;
   border-radius: 999px;
-  background: #292b28;
+  background: var(--fh-surface-soft);
   color: var(--fh-muted-strong);
   font-size: 9px;
   font-weight: 750;
@@ -172,7 +175,7 @@
   padding: 0 12px;
   border: 1px solid var(--fh-line);
   border-radius: 11px;
-  background: #111211;
+  background: var(--fh-surface-raised);
 }
 
 .fh-order-search > span {
@@ -194,7 +197,7 @@
 }
 
 .fh-order-search input::placeholder {
-  color: #656861;
+  color: var(--fh-muted);
 }
 
 .fh-unknown-warning {
@@ -299,7 +302,7 @@
 .fh-orders-table th,
 .fh-orders-table td {
   padding: 14px 13px;
-  border-bottom: 1px solid rgba(41, 43, 40, 0.72);
+  border-bottom: 1px solid var(--fh-line);
   vertical-align: middle;
   text-align: left;
   white-space: nowrap;
@@ -449,8 +452,8 @@
 
 .fh-order-detail-row td {
   padding: 0 24px 22px;
-  border-bottom: 1px solid rgba(41, 43, 40, 0.72);
-  background: rgba(0, 0, 0, 0.12);
+  border-bottom: 1px solid var(--fh-line);
+  background: color-mix(in srgb, var(--fh-surface-raised) 82%, var(--fh-bg));
 }
 
 .fh-order-timeline-heading {

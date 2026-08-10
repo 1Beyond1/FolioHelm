@@ -54,7 +54,7 @@ git -c safe.directory=D:/Code-D/FolioHelm commit -m "checkpoint: describe stage"
 
 最近验证：
 
-- `npm test`：6 个文件，34 个测试通过。
+- `npm test`：6 个文件，38 个测试通过。
 - `npm run build`：通过。
 - `cargo fmt --manifest-path src-tauri/Cargo.toml --check`：通过。
 - `cargo test --manifest-path src-tauri/Cargo.toml --locked`：11 个 Rust 测试通过。
@@ -64,12 +64,10 @@ git -c safe.directory=D:/Code-D/FolioHelm commit -m "checkpoint: describe stage"
 
 ## 建议后续顺序
 
-1. 重新运行上述基线，确认 Settings 清理逻辑和文档改动。
-2. 完成 Playwright/应用内浏览器回归：主页、市场、个股、组合、订单、交易、设置、自动化；双语言、三主题、900×680。
-3. 清理中文页面残留的英文活动事件和月份文案。
-4. 增加跨页面动态快照测试，尤其是空账户、无购买力、过期报价和 Mock 订单。
-5. 更新 `docs/known-issues.md`，建立 Git checkpoint。
-6. 重新构建 portable EXE，计算 SHA-256，更新 `docs/release-checklist.md`。
+1. 后续每次 UI 或 Mock Broker 改动后，重跑前端/Rust 基线和浏览器回归。
+2. 继续补充跨页面动态快照测试，尤其是无购买力、过期报价、断网、超时和 Unknown 订单。
+3. 继续保持 `docs/api-gate.md` 的官方契约门槛；在 API Gate 通过前不加入 Schwab 凭据、OAuth 或真实写入。
+4. 若准备公开发布，使用有权限的 Windows 环境重新评估 WiX/NSIS 安装包，并保留 portable EXE 的精确 SHA-256。
 
 ## 不要做的事情
 
@@ -85,4 +83,3 @@ git -c safe.directory=D:/Code-D/FolioHelm commit -m "checkpoint: describe stage"
 本阶段完成的定义是：独立运行的 Windows Mock 版本，页面和交互齐全，
 数据来自统一 Mock Broker，测试/构建/文档/发布清单齐备，并清楚声明无
 Schwab 真实连接。真实只读、Preview 和真实交易属于之后的独立阶段。
-

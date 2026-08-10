@@ -1,18 +1,38 @@
 :root {
   color-scheme: dark;
   --bg: #050505;
+  --bg-glow: rgba(183, 255, 34, 0.035);
   --surface: #141414;
   --surface-raised: #1a1a1a;
   --surface-soft: #202020;
+  --surface-3: #282828;
+  --ink-on-lime: #080808;
   --text: #f5f5f1;
   --muted: #8b8b87;
   --muted-strong: #b7b7b2;
   --lime: #b7ff22;
   --lime-soft: rgba(183, 255, 34, 0.12);
+  --lime-glow: rgba(183, 255, 34, 0.12);
   --positive: #57e68a;
   --negative: #ff5b8f;
+  --warning: #ffca75;
   --line: rgba(255, 255, 255, 0.065);
   --line-strong: rgba(255, 255, 255, 0.1);
+  --overlay: rgba(0, 0, 0, 0.72);
+  --overlay-strong: rgba(0, 0, 0, 0.78);
+  --chart-panel: radial-gradient(circle at 74% 41%, rgba(183, 255, 34, 0.12), transparent 36%), linear-gradient(145deg, #111210 0%, #090909 58%, #0c0c0c 100%);
+  --chart-grid: rgba(255, 255, 255, 0.05);
+  --chart-focus: rgba(255, 255, 255, 0.15);
+  --chart-muted: #666662;
+  --heatmap-frame: rgba(0, 0, 0, 0.19);
+  --heat-neutral: #282828;
+  --heat-positive-1: #354a1d;
+  --heat-positive-2: #597e1c;
+  --heat-positive-3: #82bd1b;
+  --heat-negative-1: #54323f;
+  --heat-negative-2: #773b50;
+  --heat-negative-3: #9a4963;
+  --heat-negative-4: #b8617b;
   --radius-xl: 30px;
   --radius-lg: 22px;
   --font: Inter, "SF Pro Display", "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -21,18 +41,38 @@
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #f4f5f0;
+  --bg-glow: rgba(108, 159, 0, 0.04);
   --surface: #ffffff;
   --surface-raised: #fbfcf8;
   --surface-soft: #edf0e9;
+  --surface-3: #dfe4da;
+  --ink-on-lime: #11150b;
   --text: #12150f;
   --muted: #73786d;
   --muted-strong: #4f554a;
   --lime: #6c9f00;
   --lime-soft: rgba(108, 159, 0, 0.13);
+  --lime-glow: rgba(108, 159, 0, 0.13);
   --positive: #207b4d;
   --negative: #a9476a;
+  --warning: #996319;
   --line: rgba(18, 21, 15, 0.11);
   --line-strong: rgba(18, 21, 15, 0.2);
+  --overlay: rgba(18, 21, 15, 0.42);
+  --overlay-strong: rgba(18, 21, 15, 0.52);
+  --chart-panel: radial-gradient(circle at 74% 41%, rgba(108, 159, 0, 0.13), transparent 36%), linear-gradient(145deg, #f9fbf4 0%, #eef4e5 58%, #e5edd8 100%);
+  --chart-grid: rgba(18, 21, 15, 0.11);
+  --chart-focus: rgba(18, 21, 15, 0.22);
+  --chart-muted: #74796e;
+  --heatmap-frame: rgba(18, 21, 15, 0.055);
+  --heat-neutral: #dfe4da;
+  --heat-positive-1: #d2e1b6;
+  --heat-positive-2: #b7d17c;
+  --heat-positive-3: #8eb64a;
+  --heat-negative-1: #ead9df;
+  --heat-negative-2: #d9b8c5;
+  --heat-negative-3: #c4879d;
+  --heat-negative-4: #a9476a;
 }
 
 * {
@@ -49,7 +89,7 @@ body {
   margin: 0;
   overflow-x: hidden;
   background:
-    radial-gradient(circle at 72% 12%, rgba(183, 255, 34, 0.035), transparent 28%),
+    radial-gradient(circle at 72% 12%, var(--bg-glow), transparent 28%),
     var(--bg);
   color: var(--text);
   font-family: var(--font);
@@ -63,6 +103,7 @@ body {
     --surface: #ffffff;
     --surface-raised: #fbfcf8;
     --surface-soft: #edf0e9;
+    --surface-3: #dfe4da;
     --text: #12150f;
     --muted: #73786d;
     --muted-strong: #4f554a;
@@ -252,6 +293,12 @@ a:focus-visible {
 .currency-selector {
   border: 0;
   background: transparent;
+}
+
+.account-menu,
+.icon-button,
+.eye-button,
+button.currency-selector {
   cursor: pointer;
 }
 
@@ -370,10 +417,6 @@ main {
   font-weight: 650;
 }
 
-.currency-selector span {
-  color: var(--muted);
-}
-
 .daily-return {
   display: flex;
   align-items: center;
@@ -435,7 +478,7 @@ main {
   place-items: center;
   border-radius: 50%;
   background: var(--lime);
-  color: #080808;
+  color: var(--ink-on-lime);
   box-shadow: 0 12px 34px rgba(183, 255, 34, 0.08);
   transition: transform 180ms ease, box-shadow 180ms ease;
 }
@@ -465,15 +508,13 @@ main {
   min-width: 0;
   overflow: hidden;
   border-radius: 34px;
-  background:
-    radial-gradient(circle at 74% 41%, rgba(183, 255, 34, 0.12), transparent 36%),
-    linear-gradient(145deg, #111210 0%, #090909 58%, #0c0c0c 100%);
+  background: var(--chart-panel);
 }
 
 .performance-panel::after {
   position: absolute;
   inset: 0;
-  border: 1px solid rgba(255, 255, 255, 0.055);
+  border: 1px solid var(--line);
   border-radius: inherit;
   pointer-events: none;
   content: "";
@@ -523,7 +564,7 @@ main {
   align-items: center;
   padding: 3px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--surface-soft);
 }
 
 .period-switcher button,
@@ -542,8 +583,9 @@ main {
 
 .period-switcher button.active,
 .segmented-control button.active {
-  background: #303030;
+  background: var(--surface-raised);
   color: var(--text);
+  box-shadow: 0 0 0 1px var(--line-strong);
 }
 
 .chart-wrap {
@@ -567,7 +609,7 @@ main {
 
 .chart-grid path {
   fill: none;
-  stroke: rgba(255, 255, 255, 0.05);
+  stroke: var(--chart-grid);
   stroke-width: 1;
 }
 
@@ -593,7 +635,7 @@ main {
 }
 
 .chart-focus line {
-  stroke: rgba(255, 255, 255, 0.15);
+  stroke: var(--chart-focus);
   stroke-dasharray: 3 5;
 }
 
@@ -616,7 +658,7 @@ main {
   padding: 10px 12px;
   border: 1px solid var(--line-strong);
   border-radius: 13px;
-  background: rgba(25, 25, 25, 0.94);
+  background: var(--surface-raised);
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.34);
 }
 
@@ -641,7 +683,7 @@ main {
   position: absolute;
   top: 7px;
   left: 25px;
-  color: rgba(255, 255, 255, 0.32);
+  color: var(--muted);
   font-size: 8px;
   pointer-events: none;
 }
@@ -654,7 +696,7 @@ main {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  color: #666662;
+  color: var(--chart-muted);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
 }
@@ -666,7 +708,7 @@ main {
   left: 25px;
   display: flex;
   justify-content: space-between;
-  color: #5e5e5a;
+  color: var(--chart-muted);
   font-size: 9px;
 }
 
@@ -725,21 +767,16 @@ main {
   padding: 0 12px;
 }
 
-.year-selector {
+.year-label {
+  display: inline-flex;
+  align-items: center;
   height: 34px;
   padding: 0 13px;
-  border: 0;
   border-radius: 999px;
   background: var(--surface-soft);
   color: var(--muted-strong);
   font-size: 10px;
   font-weight: 650;
-  cursor: pointer;
-}
-
-.year-selector span {
-  margin-left: 5px;
-  color: var(--muted);
 }
 
 .heatmap-frame {
@@ -747,14 +784,14 @@ main {
   margin-top: 22px;
   padding: 21px 12px 16px 42px;
   border-radius: 20px;
-  background: rgba(0, 0, 0, 0.19);
+  background: var(--heatmap-frame);
 }
 
 .month-labels {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
   margin: 0 2px 10px;
-  color: #656561;
+  color: var(--muted);
   font-size: 9px;
 }
 
@@ -770,7 +807,7 @@ main {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  color: #5f5f5b;
+  color: var(--muted);
   font-size: 8px;
 }
 
@@ -786,7 +823,7 @@ main {
 .heat-cell {
   min-width: 7px;
   border-radius: 2.5px;
-  background: #282828;
+  background: var(--heat-neutral);
   cursor: crosshair;
   transition: transform 100ms ease, outline-color 100ms ease;
 }
@@ -799,11 +836,11 @@ main {
 }
 
 .heat-cell[data-level="1"],
-.heatmap-legend i[data-level="1"] { background: #354a1d; }
+.heatmap-legend i[data-level="1"] { background: var(--heat-positive-1); }
 .heat-cell[data-level="2"],
-.heatmap-legend i[data-level="2"] { background: #597e1c; }
+.heatmap-legend i[data-level="2"] { background: var(--heat-positive-2); }
 .heat-cell[data-level="3"],
-.heatmap-legend i[data-level="3"] { background: #82bd1b; }
+.heatmap-legend i[data-level="3"] { background: var(--heat-positive-3); }
 .heat-cell[data-level="4"],
 .heatmap-legend i[data-level="4"] { background: var(--lime); box-shadow: 0 0 10px rgba(183, 255, 34, 0.14); }
 
@@ -819,7 +856,7 @@ main {
   padding: 10px 11px;
   border: 1px solid var(--line-strong);
   border-radius: 12px;
-  background: #252525;
+  background: var(--surface-raised);
   box-shadow: 0 16px 28px rgba(0, 0, 0, 0.3);
   opacity: 0;
   pointer-events: none;
@@ -886,7 +923,7 @@ main {
   width: 9px;
   height: 9px;
   border-radius: 2px;
-  background: #282828;
+  background: var(--heat-neutral);
 }
 
 .side-stack {
@@ -950,7 +987,7 @@ main {
   padding-right: 8px;
   padding-left: 8px;
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--surface-soft);
 }
 
 .position-row:last-child {

@@ -145,6 +145,32 @@ function persistableState(state: AutomationState): AutomationState {
   };
 }
 
+function automationModeLabel(mode: AutomationMode, language: Language): string {
+  if (language === "en") return mode === "dry-run" ? "Dry Run" : mode === "paper" ? "Paper Trading" : mode === "real" ? "Real Trading" : "Mock";
+  return mode === "dry-run" ? "试运行" : mode === "paper" ? "纸上交易" : mode === "real" ? "真实交易" : "Mock";
+}
+
+function automationStatusLabel(status: AutomationState["logs"][number]["status"], language: Language): string {
+  if (language === "en") return status === "would-run" ? "Would run" : status === "duplicate" ? "Duplicate prevented" : "Blocked";
+  return status === "would-run" ? "将会运行" : status === "duplicate" ? "已阻止重复运行" : "已阻止";
+}
+
+function automationReasonLabel(reason: string, language: Language): string {
+  if (language === "en") return reason;
+  const labels: Record<string, string> = {
+    "Recorded locally; no broker write exists in this build": "已在本地记录；此版本不存在券商写入",
+    "Idempotency key was already processed; no second action was created": "幂等键已经处理过；没有创建第二次操作",
+    "Automation is disabled": "自动化已关闭",
+    "Global kill switch is active": "全局紧急停止已触发",
+    "Real Trading is unavailable until the Schwab API gate is completed": "完成嘉信 API Gate 前，真实交易不可用",
+    "Symbol is not on the explicit automation allowlist": "该证券不在明确的自动化允许列表中",
+    "Order value exceeds the configured per-order cap": "订单金额超过单笔上限",
+    "Daily value cap would be exceeded; remaining budget is frozen": "将超过每日金额上限；剩余预算已冻结",
+    "Backpressure: maximum concurrent task count reached": "已达到最大并发任务数",
+  };
+  return labels[reason] ?? reason;
+}
+
 export function AutomationPage({ language }: AutomationPageProps) {
   const copy = COPY[language];
   const [state, setState] = useState<AutomationState>(() => normalizeAutomationState(readStored("automation", DEFAULT_AUTOMATION_STATE)));
@@ -266,8 +292,8 @@ export function AutomationPage({ language }: AutomationPageProps) {
       <section className="automation-card automation-card--wide">
         <div className="automation-card-heading"><div><span>04</span><h2>{copy.logs}</h2></div><button type="button" className="automation-link" onClick={reset}>{copy.reset}</button></div>
         <p className="automation-muted">{copy.resetBody}</p>
-        {lastResult && <div className={`automation-result automation-result--${lastResult.status}`}><strong>{lastResult.status === "would-run" ? copy.wouldRun : lastResult.status === "duplicate" ? copy.duplicate : copy.blocked}</strong><span>{lastResult.reason}</span></div>}
-        <div className="automation-log-list">{state.logs.length === 0 ? <p className="automation-muted">{copy.noRuns}</p> : state.logs.map((log) => <div className="automation-log" key={log.id}><strong>{log.id} · {log.symbol}</strong><span>{log.mode} · {log.status} · {formatMoney(log.amount, language)}</span><small>{log.reason}</small></div>)}</div>
+        {lastResult && <div className={`automation-result automation-result--${lastResult.status}`}><strong>{automationStatusLabel(lastResult.status, language)}</strong><span>{automationReasonLabel(lastResult.reason, language)}</span></div>}
+        <div className="automation-log-list">{state.logs.length === 0 ? <p className="automation-muted">{copy.noRuns}</p> : state.logs.map((log) => <div className="automation-log" key={log.id}><strong>{log.id} · {log.symbol}</strong><span>{automationModeLabel(log.mode, language)} · {automationStatusLabel(log.status, language)} · {formatMoney(log.amount, language)}</span><small>{automationReasonLabel(log.reason, language)}</small></div>)}</div>
       </section>
     </main>
   );

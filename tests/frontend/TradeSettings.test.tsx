@@ -73,6 +73,19 @@ describe("TradePage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create another" }));
     expect(screen.getByRole("heading", { name: "Ticket" })).toBeInTheDocument();
   });
+
+  it("uses localized step labels in the Chinese trade workspace", () => {
+    render(<TradePage language="zh" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    expect(screen.getByRole("heading", { name: "订单" })).toBeInTheDocument();
+    expect(screen.getByText("安全检查")).toBeInTheDocument();
+    expect(screen.getByText("模拟预览")).toBeInTheDocument();
+    expect(screen.getByText("演示回执")).toBeInTheDocument();
+    expect(screen.queryByText("Ticket")).not.toBeInTheDocument();
+    expect(screen.queryByText("Safety check")).not.toBeInTheDocument();
+    expect(screen.queryByText("Mock preview")).not.toBeInTheDocument();
+    expect(screen.queryByText("Demo receipt")).not.toBeInTheDocument();
+  });
 });
 
 describe("SettingsPage", () => {

@@ -63,7 +63,21 @@ function chartPointLabel(period: MarketPeriod, index: number, total: number, lan
     return months[Math.min(months.length - 1, Math.round(progress * (months.length - 1)))];
   }
 
-  return String(2025 + Math.round(progress));
+  const year = 2025 + Math.round(progress);
+  return language === "zh" ? `${year} 年` : String(year);
+}
+
+function displayPeriod(period: MarketPeriod, language: Language): string {
+  if (language === "en") return period;
+  return { "1D": "1日", "1W": "1周", "1M": "1月", "6M": "6月", "1Y": "1年" }[period];
+}
+
+function chartBoundaryLabels(period: MarketPeriod, language: Language): [string, string] {
+  if (period === "1D") return ["09:30", language === "zh" ? "现在" : "Now"];
+  if (period === "1W") return [language === "zh" ? "周一" : "Mon", language === "zh" ? "周五" : "Fri"];
+  if (period === "1M") return [language === "zh" ? "第 1 周" : "Week 1", language === "zh" ? "现在" : "Now"];
+  if (period === "6M") return [language === "zh" ? "1 月" : "Jan", language === "zh" ? "6 月" : "Jun"];
+  return [language === "zh" ? "2025 年" : "2025", language === "zh" ? "演示" : "Demo"];
 }
 
 function InstrumentChart({
@@ -111,7 +125,7 @@ function InstrumentChart({
         viewBox="0 0 1000 360"
         preserveAspectRatio="none"
         role="img"
-        aria-label={`${symbol} ${period} ${chartDescription}. ${chartInteractionHint}`}
+        aria-label={`${symbol} ${displayPeriod(period, language)} ${chartDescription}. ${chartInteractionHint}`}
       >
         <defs>
           <linearGradient id="instrument-chart-fill" x1="0" x2="0" y1="0" y2="1">
@@ -160,7 +174,7 @@ function InstrumentChart({
           style={{ left: `${tooltipLeft}%` }}
         >
           <span>
-            {period} · {chartPointLabel(period, hoverIndex, safePointCount, language)}
+            {displayPeriod(period, language)} · {chartPointLabel(period, hoverIndex, safePointCount, language)}
           </span>
           <strong>{formatPrice(hoveredPoint)}</strong>
           <em className={hoveredPoint - (points[0] ?? hoveredPoint) >= 0 ? "positive" : "negative"}>
@@ -277,7 +291,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
                 data-testid={`instrument-period-${option}`}
                 onClick={() => setZoomPosition(MARKET_PERIODS.indexOf(option))}
               >
-                {option}
+                {displayPeriod(option, language)}
               </button>
             ))}
           </div>
@@ -302,8 +316,8 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
             <span>{formatPrice(Math.min(...chartPoints))}</span>
           </div>
           <div className="instrument-chart-dates" aria-hidden="true">
-            <span>{period === "1D" ? "09:30" : period === "1W" ? "Mon" : period === "1M" ? "Week 1" : period === "6M" ? "Jan" : "2025"}</span>
-            <span>{period === "1D" ? "Now" : period === "1W" ? "Fri" : period === "1M" ? "Now" : period === "6M" ? "Jun" : "Demo"}</span>
+            <span>{chartBoundaryLabels(period, language)[0]}</span>
+            <span>{chartBoundaryLabels(period, language)[1]}</span>
           </div>
         </div>
       </section>

@@ -14,6 +14,8 @@ export interface Copy {
   account: string;
   settings: string;
   totalPortfolioValue: string;
+  showBalance: string;
+  hideBalance: string;
   today: string;
   allTime: string;
   individualBrokerage: string;
@@ -74,6 +76,8 @@ const COPY: Record<Language, Copy> = {
     account: "•••• 1234",
     settings: "Settings",
     totalPortfolioValue: "Total portfolio value",
+    showBalance: "Show portfolio value",
+    hideBalance: "Hide portfolio value",
     today: "Today",
     allTime: "all time",
     individualBrokerage: "Individual brokerage · •••• 1234",
@@ -132,6 +136,8 @@ const COPY: Record<Language, Copy> = {
     account: "•••• 1234",
     settings: "设置",
     totalPortfolioValue: "投资组合总价值",
+    showBalance: "显示组合金额",
+    hideBalance: "隐藏组合金额",
     today: "今日",
     allTime: "全部期间",
     individualBrokerage: "个人证券账户 · •••• 1234",
