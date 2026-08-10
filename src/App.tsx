@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCopy, detectInitialLanguage } from "./i18n";
-import { MOCK_PORTFOLIO } from "./mocks/portfolio";
+import { getMockPortfolio } from "./mocks/portfolio";
 import type { Language, ThemeMode } from "./types";
 import type { AppRoute, NavigationState } from "./navigation";
 import { applyTheme, watchSystemTheme } from "./platform/theme";
@@ -17,6 +17,8 @@ import { OrdersPage } from "./features/orders";
 import { TradePage } from "./features/trade";
 import { SettingsPage } from "./features/settings";
 import { AutomationPage } from "./features/automation";
+import { MOCK_BROKER, MOCK_SCENARIOS } from "./domain/mockBroker";
+import type { MockScenario } from "./domain/contracts";
 
 export function App() {
   const [language, setLanguage] = useState<Language>(() => {
@@ -24,11 +26,16 @@ export function App() {
     return stored === "en" || stored === "zh" ? stored : detectInitialLanguage();
   });
   const [theme, setTheme] = useState<ThemeMode>(() => readStored<ThemeMode>("theme", "system"));
+  const [mockScenario, setMockScenario] = useState<MockScenario>(() => {
+    const stored = readStored<string>("mock-scenario", "healthy");
+    return MOCK_SCENARIOS.includes(stored as MockScenario) ? stored as MockScenario : "healthy";
+  });
   const [searchOpen, setSearchOpen] = useState(false);
   const [navigation, setNavigation] = useState<NavigationState>({ route: "home" });
   const [tradeRequest, setTradeRequest] = useState<{ symbol?: string } | null>(null);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const copy = getCopy(language);
+  const mockPortfolio = getMockPortfolio();
 
   useEffect(() => {
     writeStored("language", language);
@@ -40,6 +47,11 @@ export function App() {
     if (theme !== "system") return undefined;
     return watchSystemTheme(() => applyTheme(theme));
   }, [theme]);
+
+  useEffect(() => {
+    MOCK_BROKER.setScenario(mockScenario);
+    writeStored("mock-scenario", mockScenario);
+  }, [mockScenario]);
 
   useEffect(() => {
     const hasModal = Boolean(searchOpen || tradeRequest || settingsModalOpen);
@@ -102,7 +114,7 @@ export function App() {
       <PortfolioHero
         copy={copy}
         language={language}
-        data={MOCK_PORTFOLIO}
+        data={mockPortfolio}
         onNavigate={navigate}
         onSearch={() => setSearchOpen(true)}
       />
@@ -111,20 +123,20 @@ export function App() {
         <InvestingHeatmap
           copy={copy}
           language={language}
-          entries={MOCK_PORTFOLIO.heatmap}
-          activeDays={MOCK_PORTFOLIO.activeDays}
-          ordersFilled={MOCK_PORTFOLIO.ordersFilled}
-          netChange={MOCK_PORTFOLIO.netChange}
+          entries={mockPortfolio.heatmap}
+          activeDays={mockPortfolio.activeDays}
+          ordersFilled={mockPortfolio.ordersFilled}
+          netChange={mockPortfolio.netChange}
         />
         <aside className="side-stack">
           <PositionsCard
             copy={copy}
             language={language}
-            positions={MOCK_PORTFOLIO.positions}
+            positions={mockPortfolio.positions}
             onOpenInstrument={(symbol) => navigate("instrument", symbol)}
             onViewAll={() => navigate("portfolio")}
           />
-          <ActivityCard copy={copy} activity={MOCK_PORTFOLIO.activity} onViewAll={() => navigate("orders")} />
+          <ActivityCard copy={copy} activity={mockPortfolio.activity} onViewAll={() => navigate("orders")} />
         </aside>
       </section>
     </>
@@ -170,6 +182,8 @@ export function App() {
             onLanguageChange={setLanguage}
             theme={theme}
             onThemeChange={setTheme}
+            mockScenario={mockScenario}
+            onMockScenarioChange={setMockScenario}
             onModalStateChange={setSettingsModalOpen}
           />
         );

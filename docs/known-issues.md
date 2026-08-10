@@ -218,3 +218,16 @@
 - 当前处理：统一 Mock 文案为结构化 key/字段，页面只负责本地化展示。
 - 是否阻塞：不阻塞 API Gate 之外的功能开发。
 - 下一步：领域数据统一后清理残留文案并添加语言快照断言。
+
+### FH-RELEASE-001 — Windows MSI 最后打包阶段被 WiX 权限阻止
+
+- 发现阶段：Windows Release 验证（2026-08-10）
+- 严重程度：P2（外部环境）
+- 现象：`npm run desktop:build` 已完成前端构建和 Tauri release 编译，并生成 `src-tauri/target/release/foliohelm.exe`；最后验证 WiX/NSIS 包时下载/解压工具均返回 `os error 5`（拒绝访问）。
+- 复现步骤：在当前受限 Windows 环境运行 `npm run desktop:build`。
+- 预期：同时生成可分发的 MSI/NSIS 安装包。
+- 实际：独立 EXE 已生成；MSI 和 NSIS bundler 都被工具链目录权限阻止。
+- 影响范围：安装包产出，不影响前端、Rust、独立 EXE 或 Mock 功能。
+- 当前处理：保留已生成的独立 EXE；继续尝试不依赖 WiX 的 Windows bundle 目标，并记录构建哈希。
+- 是否阻塞：不阻塞本地 Mock 体验和独立 EXE 验证；阻塞 MSI 安装包最终验收。
+- 下一步：验证 NSIS/portable 目标；若仍受限，交付 EXE + SHA-256，并把安装包标为待用户本机环境重新构建。

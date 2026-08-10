@@ -8,7 +8,7 @@ import {
   formatSignedPrice,
   MARKET_COPY,
   MARKET_OVERVIEW,
-  MARKET_SECURITIES,
+  getMarketSecurities,
 } from "./marketsData";
 import "./markets.css";
 
@@ -64,26 +64,27 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
   const copy = MARKET_COPY[language];
   const [query, setQuery] = useState("");
   const [moverMode, setMoverMode] = useState<MoverMode>("gainers");
+  const marketSecurities = getMarketSecurities();
 
   const filteredSecurities = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) return MARKET_SECURITIES;
+    if (!normalizedQuery) return marketSecurities;
 
-    return MARKET_SECURITIES.filter((security) =>
+    return marketSecurities.filter((security) =>
       [security.symbol, security.companyEn, security.companyZh]
         .some((value) => value.toLowerCase().includes(normalizedQuery)),
     );
-  }, [query]);
+  }, [marketSecurities, query]);
 
   const movers = useMemo(() => {
-    const sorted = MARKET_SECURITIES
+    const sorted = marketSecurities
       .filter((security) => moverMode === "gainers" ? security.changePct > 0 : security.changePct < 0)
       .sort((left, right) => moverMode === "gainers"
         ? right.changePct - left.changePct
         : left.changePct - right.changePct);
 
     return sorted.slice(0, 3);
-  }, [moverMode]);
+  }, [marketSecurities, moverMode]);
 
   return (
     <div className="markets-page" data-testid="markets-page">

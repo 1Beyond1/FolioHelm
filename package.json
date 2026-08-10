@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
+    "desktop:build:portable": "tauri build --no-bundle",
     "test": "vitest run",
     "test:watch": "vitest"
   },

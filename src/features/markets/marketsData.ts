@@ -1,6 +1,7 @@
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { findMockHolding, findMockQuote } from "../../domain/mockBroker";
+import type { DataStatus } from "../../domain/contracts";
 
 export type MarketPeriod = "1D" | "1W" | "1M" | "6M" | "1Y";
 
@@ -38,6 +39,7 @@ export interface MarketSecurity {
   averageCost: number;
   holdingValue: number;
   holdingPnl: number;
+  status?: DataStatus;
   stats: MarketStats;
   news: readonly MarketStory[];
 }
@@ -612,10 +614,10 @@ function alignSeriesToQuote(points: readonly number[], currentPrice: number): re
  * View data adapter. Chart/news/stat presentation remains local to this
  * feature, while quote and holding facts come from the canonical Mock Broker.
  */
-export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURITIES.map((security) => {
+function adaptMarketSecurity(security: MarketSecurity): MarketSecurity {
   const canonicalQuote = findMockQuote(security.symbol);
   const canonicalHolding = findMockHolding(security.symbol);
-  if (!canonicalQuote) return security;
+  if (!canonicalQuote) return { ...security, status: "no-data" };
 
   const priceValue = decimalToNumber(canonicalQuote.price);
   return {
@@ -631,16 +633,26 @@ export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURI
     averageCost: canonicalHolding ? decimalToNumber(canonicalHolding.averageCost) : 0,
     holdingValue: canonicalHolding ? decimalToNumber(canonicalHolding.marketValue) : 0,
     holdingPnl: canonicalHolding ? decimalToNumber(canonicalHolding.dayPnl) : 0,
+    status: canonicalQuote.status,
   };
-});
+}
+
+/** Stable fixture-shaped export retained for tests; use getMarketSecurities in views. */
+export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURITIES.map(adaptMarketSecurity);
+
+/** Rebuilds the view model from the current local broker scenario. */
+export function getMarketSecurities(): readonly MarketSecurity[] {
+  return MARKET_SECURITIES.map(adaptMarketSecurity);
+}
 
 export function getMarketSecurity(symbol: string): MarketSecurity {
   const normalizedSymbol = symbol.trim().toUpperCase();
-  const match = MARKET_SECURITIES.find((security) => security.symbol === normalizedSymbol);
+  const securities = getMarketSecurities();
+  const match = securities.find((security) => security.symbol === normalizedSymbol);
 
   if (match) return match;
 
-  const fallback = MARKET_SECURITIES[0];
+  const fallback = securities[0] ?? MARKET_SECURITIES[0];
   return {
     ...fallback,
     symbol: normalizedSymbol || "DEMO",

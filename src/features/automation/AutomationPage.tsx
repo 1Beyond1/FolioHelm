@@ -8,7 +8,7 @@ import {
   type AutomationSchedule,
   type AutomationState,
 } from "../../domain/automation";
-import { money, price, quantity, decimalToNumber } from "../../domain/decimal";
+import { decimalCompare, money, price, quantity, decimalToNumber, type Money } from "../../domain/decimal";
 import type { BrokerSymbol } from "../../domain/contracts";
 import type { Language } from "../../types";
 import { readStored, writeStored } from "../../platform/storage";
@@ -124,6 +124,15 @@ function formatMoney(value: string, language: Language): string {
   }).format(decimalToNumber(money(value)));
 }
 
+function safeMoneyInput(value: string, fallback: Money): Money {
+  try {
+    const next = money(value.trim() || "0");
+    return decimalCompare(next, money("0")) < 0 ? fallback : next;
+  } catch {
+    return fallback;
+  }
+}
+
 function persistableState(state: AutomationState): AutomationState {
   return {
     ...state,
@@ -178,7 +187,8 @@ export function AutomationPage({ language }: AutomationPageProps) {
       price: price("100.00"),
       idempotencyKey: `manual-${selectedSymbol}-${state.logs.length + 1}`,
     });
-    setState(result.state);
+    const nextState = result.log.status === "would-run" ? controller.completeTask() : result.state;
+    setState(nextState);
     setLastResult(result.log);
     void appendEvidence("automation_run", {
       mode: result.log.mode,
@@ -233,8 +243,8 @@ export function AutomationPage({ language }: AutomationPageProps) {
 
         <section className="automation-card">
           <div className="automation-card-heading"><div><span>02</span><h2>{copy.guardrails}</h2></div></div>
-          <label className="automation-field"><span>{copy.maxOrder}</span><input inputMode="decimal" value={state.policy.maxOrderValue} onChange={(event) => updatePolicy({ maxOrderValue: money(event.target.value || "0") })} /></label>
-          <label className="automation-field"><span>{copy.maxDaily}</span><input inputMode="decimal" value={state.policy.maxDailyValue} onChange={(event) => updatePolicy({ maxDailyValue: money(event.target.value || "0") })} /></label>
+          <label className="automation-field"><span>{copy.maxOrder}</span><input inputMode="decimal" value={state.policy.maxOrderValue} onChange={(event) => updatePolicy({ maxOrderValue: safeMoneyInput(event.target.value, state.policy.maxOrderValue) })} /></label>
+          <label className="automation-field"><span>{copy.maxDaily}</span><input inputMode="decimal" value={state.policy.maxDailyValue} onChange={(event) => updatePolicy({ maxDailyValue: safeMoneyInput(event.target.value, state.policy.maxDailyValue) })} /></label>
           <label className="automation-field"><span>{copy.maxTasks}</span><input type="number" min="1" step="1" value={state.policy.maxOpenTasks} onChange={(event) => updatePolicy({ maxOpenTasks: Math.max(1, Number(event.target.value) || 1) })} /></label>
           <label className="automation-field"><span>{copy.rate}</span><input type="number" min="1" step="1" value={state.policy.maxActionsPerMinute} onChange={(event) => updatePolicy({ maxActionsPerMinute: Math.max(1, Number(event.target.value) || 1) })} /></label>
           <div className="automation-budget"><div><span>{copy.reserved}</span><strong>{formatMoney(state.reservedToday, language)} / {formatMoney(state.policy.maxDailyValue, language)}</strong></div><div className="automation-progress"><i style={{ width: `${dailyPercent}%` }} /></div></div>

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { decimalAdd, decimalMultiply, decimalSubtract, money, price, quantity } from "../../src/domain/decimal";
-import { AutomationController, DEFAULT_AUTOMATION_STATE } from "../../src/domain/automation";
+import { AutomationController, DEFAULT_AUTOMATION_STATE, FUTURE_LIVE_CANARY_POLICY } from "../../src/domain/automation";
 import { appendEvidence, clearEvidence, exportEvidence, verifyEvidence } from "../../src/domain/evidenceJournal";
 import { MockBroker, MockBrokerError } from "../../src/domain/mockBroker";
 
@@ -58,6 +58,15 @@ describe("Mock Broker safety states", () => {
 });
 
 describe("local automation guardrails", () => {
+  it("keeps the future one-dollar live canary policy immutable in the Mock build", () => {
+    expect(FUTURE_LIVE_CANARY_POLICY.cumulativeNotionalCap).toBe("1");
+    expect(FUTURE_LIVE_CANARY_POLICY.maxNotionalPerOrder).toBe("1");
+    expect(FUTURE_LIVE_CANARY_POLICY.manualLimitOnly).toBe(true);
+    expect(FUTURE_LIVE_CANARY_POLICY.freezeBudgetOnUnknown).toBe(true);
+    expect(FUTURE_LIVE_CANARY_POLICY.allowOtc).toBe(false);
+    expect(FUTURE_LIVE_CANARY_POLICY.allowOptions).toBe(false);
+  });
+
   it("blocks Real Trading, enforces caps, and prevents duplicate idempotency keys", () => {
     const controller = new AutomationController({ ...DEFAULT_AUTOMATION_STATE, enabled: true, mode: "real" });
     const input = { symbol: "SPY" as const, side: "buy" as const, quantity: quantity("1"), price: price("10.00"), idempotencyKey: "one" };

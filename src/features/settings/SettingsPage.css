@@ -219,6 +219,31 @@
   border-top: 1px solid var(--settings-line);
 }
 
+.settings-setting-line--scenario {
+  align-items: flex-start;
+}
+
+.settings-setting-line--scenario > div:first-child {
+  min-width: 0;
+}
+
+.settings-scenario-select {
+  min-width: 180px;
+  min-height: 35px;
+  padding: 0 10px;
+  border: 1px solid var(--settings-line-strong);
+  border-radius: 10px;
+  outline: 0;
+  background: var(--settings-panel-raised);
+  color: var(--settings-text);
+  font-size: 11px;
+}
+
+.settings-scenario-select:focus {
+  border-color: var(--settings-lime);
+  box-shadow: 0 0 0 3px var(--settings-lime-soft);
+}
+
 .settings-setting-line > div:first-child {
   display: grid;
   gap: 6px;
@@ -605,6 +630,10 @@
 
   .settings-setting-line {
     display: grid;
+  }
+
+  .settings-scenario-select {
+    width: 100%;
   }
 
   .settings-language-choice {

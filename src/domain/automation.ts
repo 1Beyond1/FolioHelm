@@ -14,6 +14,38 @@ export interface AutomationPolicy {
   regularSessionOnly: true;
 }
 
+/**
+ * Immutable policy reserved for a future, separately reviewed live canary.
+ * It is data-only in the Mock build: no code path can submit a live order.
+ */
+export interface FutureLiveCanaryPolicy {
+  cumulativeNotionalCap: Money;
+  maxNotionalPerOrder: Money;
+  manualLimitOnly: true;
+  regularSessionOnly: true;
+  userSpecifiedSymbolOnly: true;
+  allowOtc: false;
+  allowOptions: false;
+  allowLeveragedEtf: false;
+  allowShortSelling: false;
+  allowExtendedHours: false;
+  freezeBudgetOnUnknown: true;
+}
+
+export const FUTURE_LIVE_CANARY_POLICY: FutureLiveCanaryPolicy = {
+  cumulativeNotionalCap: money("1.00"),
+  maxNotionalPerOrder: money("1.00"),
+  manualLimitOnly: true,
+  regularSessionOnly: true,
+  userSpecifiedSymbolOnly: true,
+  allowOtc: false,
+  allowOptions: false,
+  allowLeveragedEtf: false,
+  allowShortSelling: false,
+  allowExtendedHours: false,
+  freezeBudgetOnUnknown: true,
+};
+
 export interface AutomationRunLog {
   id: string;
   at: string;
@@ -67,6 +99,16 @@ function cloneState(state: AutomationState): AutomationState {
   };
 }
 
+function safeMoney(value: unknown, fallback: Money): Money {
+  if (typeof value !== "string") return fallback;
+  try {
+    const parsed = money(value);
+    return decimalCompare(parsed, money("0")) < 0 ? fallback : parsed;
+  } catch {
+    return fallback;
+  }
+}
+
 export class AutomationController {
   private state: AutomationState;
 
@@ -89,6 +131,11 @@ export class AutomationController {
 
   resetKillSwitch(): AutomationState {
     this.state = { ...this.state, killSwitchTripped: false };
+    return this.getState();
+  }
+
+  completeTask(): AutomationState {
+    this.state = { ...this.state, openTasks: Math.max(0, this.state.openTasks - 1) };
     return this.getState();
   }
 
@@ -168,12 +215,12 @@ export function normalizeAutomationState(value: unknown): AutomationState {
   return {
     ...cloneState(DEFAULT_AUTOMATION_STATE),
     ...candidate,
-    reservedToday: typeof candidate.reservedToday === "string" ? money(candidate.reservedToday) : DEFAULT_AUTOMATION_STATE.reservedToday,
+    reservedToday: safeMoney(candidate.reservedToday, DEFAULT_AUTOMATION_STATE.reservedToday),
     policy: {
       ...DEFAULT_AUTOMATION_STATE.policy,
       ...policy,
-      maxOrderValue: typeof policy.maxOrderValue === "string" ? money(policy.maxOrderValue) : DEFAULT_AUTOMATION_STATE.policy.maxOrderValue,
-      maxDailyValue: typeof policy.maxDailyValue === "string" ? money(policy.maxDailyValue) : DEFAULT_AUTOMATION_STATE.policy.maxDailyValue,
+      maxOrderValue: safeMoney(policy.maxOrderValue, DEFAULT_AUTOMATION_STATE.policy.maxOrderValue),
+      maxDailyValue: safeMoney(policy.maxDailyValue, DEFAULT_AUTOMATION_STATE.policy.maxDailyValue),
       allowedSymbols: Array.isArray(policy.allowedSymbols) ? policy.allowedSymbols.filter((symbol): symbol is BrokerSymbol => typeof symbol === "string") : DEFAULT_AUTOMATION_STATE.policy.allowedSymbols,
       regularSessionOnly: true,
     },

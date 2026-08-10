@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import type { Language, ThemeMode } from "../../types";
+import type { MockScenario } from "../../domain/contracts";
 import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
 import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
+import { MOCK_SCENARIOS } from "../../domain/mockBroker";
 import "./SettingsPage.css";
 
 export interface SettingsPageProps {
@@ -10,6 +12,8 @@ export interface SettingsPageProps {
   onLanguageChange: (language: Language) => void;
   theme?: ThemeMode;
   onThemeChange?: (theme: ThemeMode) => void;
+  mockScenario?: MockScenario;
+  onMockScenarioChange?: (scenario: MockScenario) => void;
   onModalStateChange?: (open: boolean) => void;
 }
 
@@ -55,6 +59,22 @@ const COPY = {
     system: "System",
     dark: "Dark",
     light: "Light",
+    mockScenario: "Mock scenario",
+    mockScenarioBody: "Choose a deterministic fixture to exercise empty, stale, offline, timeout and Unknown states.",
+    scenarioHealthy: "Healthy snapshot",
+    scenarioEmpty: "Empty account",
+    scenarioLoss: "Loss account",
+    scenarioNoBuyingPower: "No buying power",
+    scenarioInsufficientQuantity: "Insufficient quantity",
+    scenarioMarketClosed: "Market closed",
+    scenarioStaleQuote: "Stale quote",
+    scenarioOffline: "Offline",
+    scenarioReauth: "Reauthorization required",
+    scenarioRequestFailed: "Request failed",
+    scenarioRateLimited: "Rate limited",
+    scenarioTimeout: "Timeout",
+    scenarioUnknown: "Unknown outcome",
+    scenarioReconciliationFailed: "Reconciliation failed",
     tradingSafety: "Trading Safety",
     safetyBody: "Optional guards are on by default. Turning one off requires a deliberate, time-gated risk acknowledgement.",
     on: "On",
@@ -126,6 +146,22 @@ const COPY = {
     system: "跟随系统",
     dark: "深色",
     light: "明亮",
+    mockScenario: "Mock 场景",
+    mockScenarioBody: "选择确定性的 Fixture，用来体验空账户、过期、断网、超时和 Unknown 状态。",
+    scenarioHealthy: "正常快照",
+    scenarioEmpty: "空账户",
+    scenarioLoss: "亏损账户",
+    scenarioNoBuyingPower: "无购买力",
+    scenarioInsufficientQuantity: "数量不足",
+    scenarioMarketClosed: "市场关闭",
+    scenarioStaleQuote: "报价过期",
+    scenarioOffline: "断网",
+    scenarioReauth: "需要重新授权",
+    scenarioRequestFailed: "请求失败",
+    scenarioRateLimited: "触发限流",
+    scenarioTimeout: "请求超时",
+    scenarioUnknown: "未知结果",
+    scenarioReconciliationFailed: "对账失败",
     tradingSafety: "交易安全",
     safetyBody: "可选保护默认开启。关闭任意保护都需要经过有意的、带倒计时的风险确认。",
     on: "开启",
@@ -189,11 +225,33 @@ function getProtectionDefinitions(language: Language): ProtectionDefinition[] {
   ];
 }
 
+function scenarioLabel(scenario: MockScenario, language: Language): string {
+  const labels: Record<MockScenario, [string, string]> = {
+    healthy: ["Healthy snapshot", "正常快照"],
+    "empty-account": ["Empty account", "空账户"],
+    loss: ["Loss account", "亏损账户"],
+    "no-buying-power": ["No buying power", "无购买力"],
+    "insufficient-quantity": ["Insufficient quantity", "数量不足"],
+    "market-closed": ["Market closed", "市场关闭"],
+    "stale-quote": ["Stale quote", "报价过期"],
+    offline: ["Offline", "断网"],
+    "reauth-required": ["Reauthorization required", "需要重新授权"],
+    "request-failed": ["Request failed", "请求失败"],
+    "rate-limited": ["Rate limited", "触发限流"],
+    timeout: ["Timeout", "请求超时"],
+    unknown: ["Unknown outcome", "未知结果"],
+    "reconciliation-failed": ["Reconciliation failed", "对账失败"],
+  };
+  return labels[scenario][language === "zh" ? 1 : 0];
+}
+
 export function SettingsPage({
   language,
   onLanguageChange,
   theme = "dark",
   onThemeChange = () => undefined,
+  mockScenario = "healthy",
+  onMockScenarioChange = () => undefined,
   onModalStateChange = () => undefined,
 }: SettingsPageProps) {
   const copy = COPY[language];
@@ -442,6 +500,20 @@ export function SettingsPage({
                 </button>
               ))}
             </div>
+          </div>
+          <div className="settings-setting-line settings-setting-line--theme settings-setting-line--scenario">
+            <div>
+              <strong>{copy.mockScenario}</strong>
+              <span>{copy.mockScenarioBody}</span>
+            </div>
+            <select
+              className="settings-scenario-select"
+              aria-label={copy.mockScenario}
+              value={mockScenario}
+              onChange={(event) => onMockScenarioChange(event.target.value as MockScenario)}
+            >
+              {MOCK_SCENARIOS.map((scenario) => <option key={scenario} value={scenario}>{scenarioLabel(scenario, language)}</option>)}
+            </select>
           </div>
         </section>
       </div>

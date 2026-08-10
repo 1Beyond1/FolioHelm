@@ -34,35 +34,38 @@ interface AllocationSegment {
   color: string;
 }
 
-const canonicalSnapshot = MOCK_BROKER.getSnapshot();
-const canonicalAccount = canonicalSnapshot.account;
-const canonicalTotalEquity = decimalToNumber(canonicalSnapshot.account.totalEquity);
-const HOLDINGS: PortfolioHolding[] = canonicalSnapshot.holdings.map((holding) => ({
-  symbol: holding.symbol,
-  company: holding.companyEn,
-  shares: decimalToNumber(holding.quantity),
-  avgCost: decimalToNumber(holding.averageCost),
-  last: decimalToNumber(canonicalSnapshot.quotes.find((quote) => quote.symbol === holding.symbol)?.price ?? holding.averageCost),
-  marketValue: decimalToNumber(holding.marketValue),
-  dayPnl: decimalToNumber(holding.dayPnl),
-  totalPnl: decimalToNumber(holding.totalPnl),
-  weight: (decimalToNumber(holding.marketValue) / canonicalTotalEquity) * 100,
-}));
+function buildHoldings(): PortfolioHolding[] {
+  const snapshot = MOCK_BROKER.getSnapshot();
+  const totalEquity = decimalToNumber(snapshot.account.totalEquity);
+  return snapshot.holdings.map((holding) => ({
+    symbol: holding.symbol,
+    company: holding.companyEn,
+    shares: decimalToNumber(holding.quantity),
+    avgCost: decimalToNumber(holding.averageCost),
+    last: decimalToNumber(snapshot.quotes.find((quote) => quote.symbol === holding.symbol)?.price ?? holding.averageCost),
+    marketValue: decimalToNumber(holding.marketValue),
+    dayPnl: decimalToNumber(holding.dayPnl),
+    totalPnl: decimalToNumber(holding.totalPnl),
+    weight: totalEquity > 0 ? (decimalToNumber(holding.marketValue) / totalEquity) * 100 : 0,
+  }));
+}
 
-const ALLOCATION: Record<Language, AllocationSegment[]> = {
-  en: [
-    { label: "Equities", value: 72, color: "#b7ff22" },
-    { label: "Cash", value: 18, color: "#777873" },
-    { label: "Bonds", value: 7, color: "#51534f" },
-    { label: "Alternatives", value: 3, color: "#2f302e" },
-  ],
-  zh: [
-    { label: "股票", value: 72, color: "#b7ff22" },
-    { label: "现金", value: 18, color: "#777873" },
-    { label: "债券", value: 7, color: "#51534f" },
-    { label: "另类资产", value: 3, color: "#2f302e" },
-  ],
-};
+function buildAllocation(language: Language): AllocationSegment[] {
+  const snapshot = MOCK_BROKER.getSnapshot();
+  const totalEquity = decimalToNumber(snapshot.account.totalEquity);
+  const equities = snapshot.holdings.reduce((total, holding) => total + decimalToNumber(holding.marketValue), 0);
+  const labels = language === "zh"
+    ? { equities: "股票", cash: "现金" }
+    : { equities: "Equities", cash: "Cash" };
+
+  if (totalEquity <= 0) return [{ label: labels.cash, value: 100, color: "#777873" }];
+  const equityValue = Math.max(0, Math.min(100, (equities / totalEquity) * 100));
+  const cashValue = Math.max(0, 100 - equityValue);
+  return [
+    { label: labels.equities, value: equityValue, color: "#b7ff22" },
+    { label: labels.cash, value: cashValue, color: "#777873" },
+  ].filter((segment) => segment.value > 0);
+}
 
 const COPY = {
   en: {
@@ -212,13 +215,16 @@ function SortButton({
 
 export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: PortfolioPageProps) {
   const copy = COPY[language];
+  const snapshot = MOCK_BROKER.getSnapshot();
+  const account = snapshot.account;
+  const holdings = buildHoldings();
   const [activeSort, setActiveSort] = useState<{
     key: HoldingSortKey;
     direction: SortDirection;
   }>({ key: "marketValue", direction: "desc" });
 
   const sortedHoldings = useMemo(() => {
-    return [...HOLDINGS].sort((left, right) => {
+    return [...holdings].sort((left, right) => {
       const leftValue = getSortValue(left, activeSort.key);
       const rightValue = getSortValue(right, activeSort.key);
       const comparison =
@@ -228,9 +234,9 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
 
       return activeSort.direction === "asc" ? comparison : -comparison;
     });
-  }, [activeSort]);
+  }, [activeSort, holdings]);
 
-  const allocationSegments = ALLOCATION[language];
+  const allocationSegments = buildAllocation(language);
   let allocationOffset = 0;
   const allocationVisuals = allocationSegments.map((segment) => {
     const visual = { ...segment, offset: allocationOffset };
@@ -270,22 +276,22 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       <section className="fh-summary-grid" aria-label={copy.title}>
         <article className="fh-summary-card fh-summary-card-primary">
           <span>{copy.totalEquity}</span>
-          <strong>{formatMoney(decimalToNumber(canonicalAccount.totalEquity), language)}</strong>
+          <strong>{formatMoney(decimalToNumber(account.totalEquity), language)}</strong>
           <small>USD</small>
         </article>
         <article className="fh-summary-card">
           <span>{copy.todayChange}</span>
-          <strong className={decimalToNumber(canonicalAccount.todayChange) < 0 ? "fh-negative" : "fh-positive"}>{formatMoney(decimalToNumber(canonicalAccount.todayChange), language, true)}</strong>
-          <small className={decimalToNumber(canonicalAccount.todayChangePct) < 0 ? "fh-negative" : "fh-positive"}>{formatPercent(decimalToNumber(canonicalAccount.todayChangePct), language, true)}</small>
+          <strong className={decimalToNumber(account.todayChange) < 0 ? "fh-negative" : "fh-positive"}>{formatMoney(decimalToNumber(account.todayChange), language, true)}</strong>
+          <small className={decimalToNumber(account.todayChangePct) < 0 ? "fh-negative" : "fh-positive"}>{formatPercent(decimalToNumber(account.todayChangePct), language, true)}</small>
         </article>
         <article className="fh-summary-card">
           <span>{copy.cash}</span>
-          <strong>{formatMoney(decimalToNumber(canonicalAccount.cash), language)}</strong>
+          <strong>{formatMoney(decimalToNumber(account.cash), language)}</strong>
           <small>USD</small>
         </article>
         <article className="fh-summary-card">
           <span>{copy.buyingPower}</span>
-          <strong>{formatMoney(decimalToNumber(canonicalAccount.buyingPower), language)}</strong>
+          <strong>{formatMoney(decimalToNumber(account.buyingPower), language)}</strong>
           <small>USD</small>
         </article>
       </section>
@@ -326,7 +332,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                 })}
               </svg>
               <div className="fh-donut-center" aria-hidden="true">
-                <strong>4</strong>
+                <strong>{allocationSegments.length}</strong>
                 <span>{language === "zh" ? "类资产" : "asset groups"}</span>
               </div>
             </div>
@@ -384,7 +390,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <h2 id="fh-holdings-title">{copy.holdings}</h2>
             <p>{copy.holdingsHint}</p>
           </div>
-          <span className="fh-holdings-count">{HOLDINGS.length}</span>
+          <span className="fh-holdings-count">{holdings.length}</span>
         </div>
         <div className="fh-table-scroll">
           <table className="fh-holdings-table" data-testid="portfolio-holdings-table">

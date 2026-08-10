@@ -139,24 +139,25 @@ const LEGACY_ORDERS: OrderRecord[] = [
   },
 ];
 
-const canonicalSnapshot = MOCK_BROKER.getSnapshot();
-void LEGACY_ORDERS;
-const ORDERS: OrderRecord[] = canonicalSnapshot.orders.map((order) => ({
-  id: order.id,
-  symbol: order.symbol,
-  side: order.side === "buy" ? "Buy" : "Sell",
-  type: order.type === "market" ? "Market" : "Limit",
-  qty: decimalToNumber(order.quantity),
-  filled: decimalToNumber(order.filledQuantity),
-  limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
-  status: order.status,
-  submitted: new Intl.DateTimeFormat("en-US", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
-  timeline: order.events.map((event) => ({
-    kind: event.kind,
-    timestamp: new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
-    detail: event.detailEn,
-  })),
-}));
+function readOrders(): OrderRecord[] {
+  void LEGACY_ORDERS;
+  return MOCK_BROKER.getSnapshot().orders.map((order) => ({
+    id: order.id,
+    symbol: order.symbol,
+    side: order.side === "buy" ? "Buy" : "Sell",
+    type: order.type === "market" ? "Market" : "Limit",
+    qty: decimalToNumber(order.quantity),
+    filled: decimalToNumber(order.filledQuantity),
+    limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
+    status: order.status,
+    submitted: new Intl.DateTimeFormat("en-US", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
+    timeline: order.events.map((event) => ({
+      kind: event.kind,
+      timestamp: new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
+      detail: event.detailEn,
+    })),
+  }));
+}
 
 const COPY = {
   en: {
@@ -294,28 +295,31 @@ function formatEventDetail(event: OrderTimelineEvent, language: Language): strin
 
 export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   const copy = COPY[language];
+  // Read the canonical local ledger on every render so a newly consumed Mock
+  // preview appears immediately after the trade modal closes.
+  const orders = readOrders();
   const [activeStatus, setActiveStatus] = useState<OrderStatus>("working");
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
 
   const statusCounts = useMemo(() => {
-    return ORDERS.reduce<Record<OrderStatus, number>>(
+    return orders.reduce<Record<OrderStatus, number>>(
       (counts, order) => {
         counts[order.status] += 1;
         return counts;
       },
       { working: 0, filled: 0, canceled: 0, rejected: 0, unknown: 0 },
     );
-  }, []);
+  }, [orders]);
 
   const visibleOrders = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase();
-    return ORDERS.filter((order) => {
+    return orders.filter((order) => {
       const matchesStatus = order.status === activeStatus;
       const matchesSearch = normalizedQuery.length === 0 || order.symbol.toLowerCase().includes(normalizedQuery);
       return matchesStatus && matchesSearch;
     });
-  }, [activeStatus, searchQuery]);
+  }, [activeStatus, orders, searchQuery]);
 
   function selectStatus(status: OrderStatus) {
     setActiveStatus(status);

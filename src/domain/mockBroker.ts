@@ -47,6 +47,23 @@ export class MockBrokerError extends Error {
   }
 }
 
+export const MOCK_SCENARIOS: readonly MockScenario[] = [
+  "healthy",
+  "empty-account",
+  "loss",
+  "no-buying-power",
+  "insufficient-quantity",
+  "market-closed",
+  "stale-quote",
+  "offline",
+  "reauth-required",
+  "request-failed",
+  "rate-limited",
+  "timeout",
+  "unknown",
+  "reconciliation-failed",
+];
+
 const quote = (
   symbol: BrokerQuote["symbol"],
   companyEn: string,
