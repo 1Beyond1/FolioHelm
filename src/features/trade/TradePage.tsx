@@ -36,22 +36,16 @@ interface DemoReceipt {
 
 const SYMBOLS: readonly TradeSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
 
-const QUOTES: Record<TradeSymbol, Quote> = Object.fromEntries(
-  SYMBOLS.map((symbol) => {
-    const canonicalQuote = findMockQuote(symbol);
-    const canonicalHolding = findMockHolding(symbol);
-    return [symbol, {
-      company: canonicalQuote?.companyEn ?? symbol,
-      price: canonicalQuote?.price ?? price("0"),
-      changePct: canonicalQuote?.changePct ?? ("0" as Percent),
-      heldShares: canonicalHolding?.quantity ?? makeQuantity("0"),
-    } satisfies Quote];
-  }),
-) as Record<TradeSymbol, Quote>;
-
-const DEMO_SNAPSHOT = MOCK_BROKER.getSnapshot();
-const DEMO_ACCOUNT = `Demo brokerage · •••• ${DEMO_SNAPSHOT.account.accountKey.slice(-4)}`;
-const DEMO_BUYING_POWER = DEMO_SNAPSHOT.account.buyingPower;
+function getTradeQuote(symbol: TradeSymbol): Quote {
+  const canonicalQuote = findMockQuote(symbol);
+  const canonicalHolding = findMockHolding(symbol);
+  return {
+    company: canonicalQuote?.companyEn ?? symbol,
+    price: canonicalQuote?.price ?? price("0"),
+    changePct: canonicalQuote?.changePct ?? ("0" as Percent),
+    heldShares: canonicalHolding?.quantity ?? makeQuantity("0"),
+  };
+}
 
 const COPY = {
   en: {
@@ -205,6 +199,9 @@ const ZERO_PRICE = price("0");
 
 export function TradePage({ language, initialSymbol, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
+  const demoSnapshot = MOCK_BROKER.getSnapshot();
+  const demoAccount = `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
+  const demoBuyingPower = demoSnapshot.account.buyingPower;
   const [step, setStep] = useState<TradeStep>("ticket");
   const [symbol, setSymbol] = useState<TradeSymbol>(() =>
     isTradeSymbol(initialSymbol) ? initialSymbol : "AAPL",
@@ -218,7 +215,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const [preview, setPreview] = useState<MockPreview | null>(null);
   const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
 
-  const currentQuote = QUOTES[symbol];
+  const currentQuote = getTradeQuote(symbol);
   const draft = useMemo<OrderDraft | null>(() => {
     if (!WHOLE_QUANTITY_RE.test(quantity.trim())) return null;
     if (orderType === "Limit" && !POSITIVE_PRICE_RE.test(limitPrice.trim())) return null;
@@ -394,7 +391,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
                 >
                   {SYMBOLS.map((option) => (
                     <option key={option} value={option}>
-                      {option} · {QUOTES[option].company}
+                      {option} · {getTradeQuote(option).company}
                     </option>
                   ))}
                 </select>
@@ -530,11 +527,11 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
               <dl className="trade-account-facts">
                 <div>
                   <dt>{copy.account}</dt>
-                  <dd>{DEMO_ACCOUNT}</dd>
+                  <dd>{demoAccount}</dd>
                 </div>
                 <div>
                   <dt>{copy.buyingPower}</dt>
-                  <dd>{formatMoney(DEMO_BUYING_POWER, language)}</dd>
+                  <dd>{formatMoney(demoBuyingPower, language)}</dd>
                 </div>
                 <div>
                   <dt>{copy.positionRisk}</dt>
@@ -585,7 +582,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
             </div>
             <div className="trade-check-row">
               <span className="trade-check-icon" aria-hidden="true">✓</span>
-              <div><strong>{copy.buyingPowerCheck}</strong><span>{copy.available} · {formatMoney(DEMO_BUYING_POWER, language)}</span></div>
+              <div><strong>{copy.buyingPowerCheck}</strong><span>{copy.available} · {formatMoney(demoBuyingPower, language)}</span></div>
               <em>{copy.dollars}</em>
             </div>
             <div className="trade-check-row">

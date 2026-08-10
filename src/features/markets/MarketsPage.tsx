@@ -65,6 +65,13 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
   const [query, setQuery] = useState("");
   const [moverMode, setMoverMode] = useState<MoverMode>("gainers");
   const marketSecurities = getMarketSecurities();
+  const degradedStatus = marketSecurities.some((security) => security.status === "offline")
+    ? language === "zh" ? { title: "数据源离线", note: "展示最近的本地快照" } : { title: "Data source offline", note: "Showing the latest local snapshot" }
+    : marketSecurities.some((security) => security.status === "reauth-required")
+      ? language === "zh" ? { title: "需要重新授权", note: "暂不刷新报价" } : { title: "Reauthorization required", note: "Quotes are not being refreshed" }
+      : marketSecurities.some((security) => security.status === "stale")
+        ? language === "zh" ? { title: "报价已过期", note: "当前页面不是实时行情" } : { title: "Quotes are stale", note: "This page is not live" }
+        : { title: copy.marketStatus, note: copy.marketStatusNote };
 
   const filteredSecurities = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -97,8 +104,8 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
         <div className="markets-status" role="status" aria-live="polite">
           <span className="markets-status-dot" aria-hidden="true" />
           <span className="markets-status-copy">
-            <strong>{copy.marketStatus}</strong>
-            <small>{copy.marketStatusNote}</small>
+            <strong>{degradedStatus.title}</strong>
+            <small>{degradedStatus.note}</small>
           </span>
           <span className="markets-demo-chip">{copy.demo}</span>
         </div>

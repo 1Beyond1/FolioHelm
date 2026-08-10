@@ -188,6 +188,13 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
     periodBlend,
   );
   const isPositive = security.changePct >= 0;
+  const quoteFreshnessValue = security.status === "offline"
+    ? language === "zh" ? "本地快照 · 数据源离线" : "Local snapshot · source offline"
+    : security.status === "reauth-required"
+      ? language === "zh" ? "本地快照 · 需要重新授权" : "Local snapshot · reauthorization required"
+      : security.status === "stale"
+        ? language === "zh" ? "本地快照 · 报价已过期" : "Local snapshot · stale quote"
+        : copy.quoteFreshnessValue;
   const stats = [
     { label: copy.volume, value: security.stats.volume },
     { label: copy.marketCap, value: security.stats.marketCap },
@@ -239,7 +246,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
           </div>
           <div className="instrument-freshness" data-testid="instrument-quote-freshness">
             <span>{copy.quoteFreshness}</span>
-            <strong>{copy.quoteFreshnessValue}</strong>
+            <strong>{quoteFreshnessValue}</strong>
           </div>
         </div>
         <button
