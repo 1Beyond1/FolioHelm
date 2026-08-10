@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible issue in the local Mock build
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, tokens, account numbers, private keys, or real order identifiers.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: 0.1.0 / abc1234
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+    validations:
+      required: true
+  - type: dropdown
+    id: scenario
+    attributes:
+      label: Mock scenario
+      options:
+        - healthy
+        - empty-account
+        - loss
+        - no-buying-power
+        - stale-quote
+        - offline
+        - timeout
+        - unknown
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use fictional data only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+

@@ -14,8 +14,9 @@ FolioHelm 是一个非官方的 Charles Schwab 本地优先 Windows 桌面客户
 - Working / Filled / Canceled / Rejected / Unknown 订单状态与时间线
 - 统一风格的交易模态窗口：Ticket → Safety check → Mock preview → Demo receipt
 - 默认开启的安全保护，以及关闭保护时的风险阅读、倒计时和二次确认
+- 可切换的 Mock 故障场景、动态账户快照、Unknown/对账提示和本地 Dry Run 记录
 
-尚未实现：Schwab OAuth/API、真实行情、真实下单、SQLCipher 持久化和远端证据服务。项目当前不应被描述为具备这些能力。
+明确未实现：Schwab OAuth/API、真实行情、真实下单、SQLCipher 持久化和远端证据服务。当前证据日志仅是本地 Mock 版本的浏览器存储 Hash Chain；项目不应被描述为具备真实券商或完整金融审计能力。
 
 ## 技术栈
 
@@ -31,6 +32,8 @@ FolioHelm 是一个非官方的 Charles Schwab 本地优先 Windows 桌面客户
 - 真实交易默认关闭。
 - 不做自动重试。
 - 遇到 `Unknown` 状态时，先对账，再继续后续操作。
+- 当前自动化只能运行 Mock / Paper Trading / Dry Run；Real Trading 按钮不可用。
+- 任何 API 能力、限流、行情许可和开源分发条件都必须先通过官方 `API Gate`。
 
 ## 开发
 
@@ -61,9 +64,19 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ## 设计资料
 
 - [Luna Max 完整续作交接书](docs/luna-handoff-v1.md)
+- [Luna Max 当前交接书 v2](docs/luna-handoff-v2.md)
 - [实现计划](docs/implementation-plan-v2.md)
 - [用户决策](docs/user-decisions-v1.md)
 - [ADR-0001：双证据日志](docs/architecture-decisions/ADR-0001-dual-evidence-journal.md)
+- [安全策略](SECURITY.md)
+- [贡献指南](CONTRIBUTING.md)
+- [Mock Broker 契约](docs/mock-broker.md)
+- [证据日志说明](docs/evidence-journal.md)
+- [安全模型](docs/security-model.md)
+- [Schwab API Gate](docs/api-gate.md)
+- [测试计划](docs/test-plan.md)
+- [Windows 发布清单](docs/release-checklist.md)
+- [English user guide](docs/user-guide-en.md) · [中文使用说明](docs/user-guide-zh.md)
 
 ## 许可与声明
 

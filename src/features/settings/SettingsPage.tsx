@@ -4,7 +4,8 @@ import type { Language, ThemeMode } from "../../types";
 import type { MockScenario } from "../../domain/contracts";
 import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
 import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
-import { MOCK_SCENARIOS } from "../../domain/mockBroker";
+import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
+import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
 import "./SettingsPage.css";
 
 export interface SettingsPageProps {
@@ -356,6 +357,9 @@ export function SettingsPage({
   function clearLocalData(): void {
     clearFolioHelmStored();
     clearEvidence();
+    MOCK_BROKER.reset();
+    AUTOMATION_CONTROLLER.replaceState(DEFAULT_AUTOMATION_STATE);
+    onMockScenarioChange?.("healthy");
     setProtections({ ...INITIAL_PROTECTIONS });
     setEvidenceStatus({ kind: "valid", text: copy.evidenceEmpty });
     setClearDataDialogOpen(false);

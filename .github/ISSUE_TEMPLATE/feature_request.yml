@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an improvement to the local-first terminal
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Requests that would connect to Schwab, store credentials, or submit orders require an API Gate and security review.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or user need
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: safety
+    attributes:
+      label: Intended profile
+      options:
+        - Mock only
+        - Paper or Dry Run
+        - Read-only broker capability
+        - Preview or live write (requires separate gate)
+    validations:
+      required: true
+

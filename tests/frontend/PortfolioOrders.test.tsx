@@ -2,8 +2,10 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PortfolioPage } from "../../src/features/portfolio/PortfolioPage";
 import { OrdersPage } from "../../src/features/orders/OrdersPage";
+import { MOCK_BROKER } from "../../src/domain/mockBroker";
 
 afterEach(() => {
+  MOCK_BROKER.reset();
   cleanup();
 });
 
@@ -31,6 +33,23 @@ describe("PortfolioPage", () => {
 
     fireEvent.click(screen.getByTestId("portfolio-trade-AAPL"));
     expect(onOpenTrade).toHaveBeenCalledWith("AAPL");
+  });
+});
+
+describe("dynamic Mock snapshot", () => {
+  it("reflects the selected empty-account scenario instead of a page fixture", () => {
+    MOCK_BROKER.setScenario("empty-account");
+
+    render(
+      <PortfolioPage
+        language="en"
+        onOpenInstrument={() => undefined}
+        onOpenTrade={() => undefined}
+      />,
+    );
+
+    expect(screen.getAllByText("$25,000.00")).toHaveLength(3);
+    expect(screen.queryByTestId(/^portfolio-holding-row-/)).not.toBeInTheDocument();
   });
 });
 

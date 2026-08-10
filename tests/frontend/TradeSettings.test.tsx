@@ -2,9 +2,11 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../../src/features/settings/SettingsPage";
 import { TradePage } from "../../src/features/trade/TradePage";
+import { MOCK_BROKER } from "../../src/domain/mockBroker";
 
 afterEach(() => {
   vi.useRealTimers();
+  MOCK_BROKER.reset();
   document.body.innerHTML = "";
 });
 
