@@ -8,6 +8,32 @@ export type BrokerOrderStatus = "working" | "filled" | "canceled" | "rejected" |
 export type BrokerOrderSide = "buy" | "sell";
 export type BrokerOrderType = "market" | "limit";
 export type BrokerPortfolioPeriod = "1D" | "1W" | "1M" | "6M" | "1Y";
+export type MockScenario =
+  | "healthy"
+  | "empty-account"
+  | "loss"
+  | "no-buying-power"
+  | "insufficient-quantity"
+  | "market-closed"
+  | "stale-quote"
+  | "offline"
+  | "reauth-required"
+  | "request-failed"
+  | "rate-limited"
+  | "timeout"
+  | "unknown"
+  | "reconciliation-failed";
+
+export type MockErrorCode =
+  | "offline"
+  | "reauth-required"
+  | "request-failed"
+  | "rate-limited"
+  | "timeout"
+  | "market-closed"
+  | "insufficient-buying-power"
+  | "insufficient-quantity"
+  | "unknown-reconciliation";
 
 export interface BrokerQuote {
   symbol: BrokerSymbol;

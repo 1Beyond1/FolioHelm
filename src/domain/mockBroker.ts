@@ -1,5 +1,6 @@
 import {
   decimalAdd,
+  decimalCompare,
   decimalMultiply,
   decimalToFixed,
   money,
@@ -16,6 +17,8 @@ import type {
   BrokerOrderEvent,
   BrokerQuote,
   BrokerSnapshot,
+  MockErrorCode,
+  MockScenario,
   MockPreview,
   OrderDraft,
 } from "./contracts";
@@ -33,6 +36,16 @@ const capabilities: BrokerCapabilities = {
   cancelOrders: false,
   replaceOrders: false,
 };
+
+export class MockBrokerError extends Error {
+  readonly code: MockErrorCode;
+
+  constructor(code: MockErrorCode, message: string) {
+    super(message);
+    this.name = "MockBrokerError";
+    this.code = code;
+  }
+}
 
 const quote = (
   symbol: BrokerQuote["symbol"],
@@ -268,6 +281,81 @@ function nowIso(): string {
   return AS_OF;
 }
 
+function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): BrokerSnapshot {
+  if (scenario === "healthy" || scenario === "request-failed" || scenario === "rate-limited" || scenario === "timeout" || scenario === "unknown" || scenario === "reconciliation-failed" || scenario === "insufficient-quantity" || scenario === "no-buying-power") {
+    if (scenario === "no-buying-power") {
+      return {
+        ...snapshot,
+        account: { ...snapshot.account, cash: money("0"), buyingPower: money("0"), status: "available" },
+      };
+    }
+    return snapshot;
+  }
+
+  if (scenario === "empty-account") {
+    return {
+      ...snapshot,
+      account: {
+        ...snapshot.account,
+        cash: money("25000.00"),
+        buyingPower: money("25000.00"),
+        totalEquity: money("25000.00"),
+        todayChange: money("0"),
+        todayChangePct: percent("0"),
+        allTimeChange: money("0"),
+      },
+      holdings: [],
+      orders: [],
+      activeDays: 0,
+      ordersFilled: 0,
+      yearNetChange: money("0"),
+    };
+  }
+
+  if (scenario === "loss") {
+    return {
+      ...snapshot,
+      account: { ...snapshot.account, todayChange: money("-1820.34"), todayChangePct: percent("-1.18"), allTimeChange: money("-4210.80") },
+      holdings: snapshot.holdings.map((holding) => ({ ...holding, dayPnl: decimalMultiply(holding.dayPnl, money("-1")) as Money, totalPnl: decimalMultiply(holding.totalPnl, money("-1")) as Money })),
+      yearNetChange: money("-4210.80"),
+    };
+  }
+
+  if (scenario === "market-closed") {
+    return { ...snapshot, quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "stale" as const })) };
+  }
+
+  if (scenario === "stale-quote") {
+    return { ...snapshot, quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "stale" as const })) };
+  }
+
+  if (scenario === "offline") {
+    return {
+      ...snapshot,
+      account: { ...snapshot.account, status: "offline" },
+      quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "offline" as const })),
+    };
+  }
+
+  return {
+    ...snapshot,
+    account: { ...snapshot.account, status: "reauth-required" },
+    quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "reauth-required" as const })),
+  };
+}
+
+function scenarioError(scenario: MockScenario): MockBrokerError | undefined {
+  switch (scenario) {
+    case "offline": return new MockBrokerError("offline", "Mock data source is offline");
+    case "reauth-required": return new MockBrokerError("reauth-required", "Mock session requires reauthorization");
+    case "request-failed": return new MockBrokerError("request-failed", "Mock request failed deterministically");
+    case "rate-limited": return new MockBrokerError("rate-limited", "Mock rate limit reached; no retry is scheduled");
+    case "timeout": return new MockBrokerError("timeout", "Mock request timed out; outcome is not known");
+    case "market-closed": return new MockBrokerError("market-closed", "Mock regular session is closed");
+    default: return undefined;
+  }
+}
+
 export class MockBroker implements BrokerAdapter {
   readonly id = "mock-broker";
   readonly mode = "mock" as const;
@@ -275,17 +363,42 @@ export class MockBroker implements BrokerAdapter {
   private snapshot: BrokerSnapshot = BASE_SNAPSHOT;
   private readonly previews = new Map<string, MockPreview>();
   private sequence = 0;
+  private scenario: MockScenario = "healthy";
 
   getSnapshot(): BrokerSnapshot {
-    return this.snapshot;
+    return scenarioSnapshot(this.snapshot, this.scenario);
+  }
+
+  getScenario(): MockScenario {
+    return this.scenario;
+  }
+
+  setScenario(scenario: MockScenario): void {
+    this.scenario = scenario;
+  }
+
+  reset(): void {
+    this.snapshot = BASE_SNAPSHOT;
+    this.previews.clear();
+    this.sequence = 0;
+    this.scenario = "healthy";
   }
 
   previewOrder(draft: OrderDraft): MockPreview {
+    const fault = scenarioError(this.scenario);
+    if (fault) throw fault;
+
     const quote = this.snapshot.quotes.find((item) => item.symbol === draft.symbol);
     if (!quote) throw new Error(`No mock quote for ${draft.symbol}`);
 
     const unitPrice = draft.limitPrice ?? quote.price;
     const estimatedAmount = decimalMultiply(unitPrice, draft.quantity) as Money;
+    if (this.scenario === "no-buying-power" || decimalCompare(estimatedAmount, this.snapshot.account.buyingPower) > 0) {
+      throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
+    }
+    if (this.scenario === "insufficient-quantity") {
+      throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+    }
     const draftHash = stableDraftHash(draft);
     const previewId = `MOCK-PREVIEW-${draft.symbol}-${++this.sequence}`;
     const createdAt = nowIso();
@@ -304,13 +417,19 @@ export class MockBroker implements BrokerAdapter {
   }
 
   consumePreview(previewId: string, draftHash: string): BrokerOrder {
+    const fault = scenarioError(this.scenario);
+    if (fault) throw fault;
+
     const preview = this.previews.get(previewId);
     if (!preview || preview.status !== "preview") throw new Error("Mock preview is missing, expired, or already consumed");
     if (preview.draftHash !== draftHash) throw new Error("Mock preview does not match the current draft");
     preview.status = "consumed";
 
     const id = `MOCK-ORDER-${++this.sequence}`;
-    const event = orderEvent("accepted", nowIso(), "Accepted by the mock venue; no broker request exists", "模拟场所已接受；不存在券商请求");
+    const unknown = this.scenario === "unknown" || this.scenario === "reconciliation-failed";
+    const event = unknown
+      ? orderEvent("unknown", nowIso(), "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
+      : orderEvent("accepted", nowIso(), "Accepted by the mock venue; no broker request exists", "模拟场所已接受；不存在券商请求");
     const order: BrokerOrder = {
       id,
       symbol: preview.draft.symbol,
@@ -319,7 +438,7 @@ export class MockBroker implements BrokerAdapter {
       quantity: preview.draft.quantity,
       filledQuantity: quantity("0"),
       limitPrice: preview.draft.limitPrice,
-      status: "working",
+      status: unknown ? "unknown" : "working",
       submittedAt: nowIso(),
       events: [
         orderEvent("draft", nowIso(), "Created locally in Mock Broker", "在本地 Mock Broker 中创建"),
@@ -329,6 +448,21 @@ export class MockBroker implements BrokerAdapter {
     };
     this.snapshot = { ...this.snapshot, orders: [order, ...this.snapshot.orders] };
     return order;
+  }
+
+  reconcileOrder(orderId: string): BrokerOrder {
+    const order = this.snapshot.orders.find((item) => item.id === orderId);
+    if (!order) throw new Error(`No mock order ${orderId}`);
+    if (order.status !== "unknown") return order;
+    if (this.scenario === "reconciliation-failed") throw new MockBrokerError("unknown-reconciliation", "Mock reconciliation failed; keep the order locked");
+
+    const reconciled: BrokerOrder = {
+      ...order,
+      status: "working",
+      events: [...order.events, orderEvent("accepted", nowIso(), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
+    };
+    this.snapshot = { ...this.snapshot, orders: this.snapshot.orders.map((item) => item.id === orderId ? reconciled : item) };
+    return reconciled;
   }
 
   invalidatePreview(previewId: string): void {

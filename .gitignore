@@ -8,6 +8,8 @@ src-tauri/gen/
 !.env.example
 *.log
 output/local/
+output/playwright/.playwright-cli/
+.playwright-cli/
 artifacts/
 .idea/
 .vscode/

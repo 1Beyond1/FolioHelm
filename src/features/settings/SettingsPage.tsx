@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { ChangeEvent } from "react";
 import type { Language, ThemeMode } from "../../types";
-import { readStored, writeStored } from "../../platform/storage";
+import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
+import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
 import "./SettingsPage.css";
 
 export interface SettingsPageProps {
@@ -26,6 +28,11 @@ const INITIAL_PROTECTIONS: Record<ProtectionKey, boolean> = {
   autoLock: true,
   accountAllowlist: true,
 };
+
+type EvidenceState =
+  | { kind: "idle"; text: string }
+  | { kind: "valid"; text: string }
+  | { kind: "invalid"; text: string };
 
 const COPY = {
   en: {
@@ -64,6 +71,24 @@ const COPY = {
     previewFreshness: "Preview freshness",
     noWriteRetry: "No write retry",
     unknownReconciliation: "Unknown reconciliation",
+    localData: "Local workspace data",
+    localDataBody: "Preferences, Mock automation state and the tamper-evident local journal stay on this device. No credentials are stored by this build.",
+    evidence: "Evidence journal",
+    verify: "Verify",
+    export: "Export",
+    import: "Import",
+    evidenceEmpty: "No local evidence yet",
+    evidenceValid: (count: number) => `Verified · ${count} local events`,
+    evidenceInvalid: (reason: string) => `Verification failed · ${reason}`,
+    evidenceUnavailable: "Verification unavailable in this environment",
+    clearData: "Clear local demo data",
+    clearDataTitle: "Clear local demo data?",
+    clearDataBody: "This removes local Mock/Paper/Dry Run settings, evidence and safety preferences from this device. It cannot be undone. No brokerage credentials are present in this build.",
+    confirmClear: "Clear data",
+    about: "About",
+    version: "Version",
+    apiGate: "Schwab API gate",
+    apiGateValue: "Pending official portal access",
     disableWarning: "Warning: this optional protection is disabled. The demo will show the risk beside this setting.",
     enableAgain: "Enable again to restore this guard.",
     riskDialogTitle: "Disable optional protection?",
@@ -117,6 +142,24 @@ const COPY = {
     previewFreshness: "预览新鲜度",
     noWriteRetry: "不重试写入",
     unknownReconciliation: "未知状态对账",
+    localData: "本地工作区数据",
+    localDataBody: "偏好、Mock 自动化状态和防篡改本地日志都保存在本机。本版本不会保存凭据。",
+    evidence: "证据日志",
+    verify: "验证",
+    export: "导出",
+    import: "导入",
+    evidenceEmpty: "还没有本地证据",
+    evidenceValid: (count: number) => `验证通过 · ${count} 条本地事件`,
+    evidenceInvalid: (reason: string) => `验证失败 · ${reason}`,
+    evidenceUnavailable: "当前环境无法验证",
+    clearData: "清理本地演示数据",
+    clearDataTitle: "清理本地演示数据？",
+    clearDataBody: "这会删除本机的 Mock/Paper/Dry Run 设置、证据日志和安全偏好，且无法撤销。本版本不存在券商凭据。",
+    confirmClear: "确认清理",
+    about: "关于",
+    version: "版本",
+    apiGate: "嘉信 API 状态",
+    apiGateValue: "等待官方门户访问",
     disableWarning: "警告：此可选保护已关闭。演示会在此设置旁显示风险。",
     enableAgain: "重新开启即可恢复此保护。",
     riskDialogTitle: "关闭可选保护？",
@@ -171,8 +214,11 @@ export function SettingsPage({
   const [confirmIntent, setConfirmIntent] = useState(false);
   const [disablePhrase, setDisablePhrase] = useState("");
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [clearDataDialogOpen, setClearDataDialogOpen] = useState(false);
+  const [evidenceStatus, setEvidenceStatus] = useState<EvidenceState>({ kind: "idle", text: copy.evidenceEmpty });
+  const importInputRef = useRef<HTMLInputElement>(null);
 
-  const settingsModalOpen = connectionDialogOpen || pendingKey !== null;
+  const settingsModalOpen = connectionDialogOpen || pendingKey !== null || clearDataDialogOpen;
 
   useEffect(() => {
     writeStored("protections", protections);
@@ -197,13 +243,65 @@ export function SettingsPage({
       event.preventDefault();
       if (pendingKey !== null) {
         handleCancelDisable();
+      } else if (clearDataDialogOpen) {
+        setClearDataDialogOpen(false);
       } else {
         setConnectionDialogOpen(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [pendingKey, settingsModalOpen]);
+  }, [clearDataDialogOpen, pendingKey, settingsModalOpen]);
+
+  function downloadEvidence(serialized: string): void {
+    const blob = new Blob([serialized], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "foliohelm-evidence-mock.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleVerifyEvidence(): Promise<void> {
+    try {
+      const result = await verifyEvidence();
+      setEvidenceStatus(result.valid
+        ? { kind: "valid", text: result.sequence === 0 ? copy.evidenceEmpty : copy.evidenceValid(result.sequence) }
+        : { kind: "invalid", text: copy.evidenceInvalid(result.reason ?? copy.evidenceUnavailable) });
+    } catch {
+      setEvidenceStatus({ kind: "invalid", text: copy.evidenceUnavailable });
+    }
+  }
+
+  async function handleExportEvidence(): Promise<void> {
+    try {
+      downloadEvidence(await exportEvidence());
+      await handleVerifyEvidence();
+    } catch {
+      setEvidenceStatus({ kind: "invalid", text: copy.evidenceUnavailable });
+    }
+  }
+
+  async function handleImportEvidence(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const result = await importEvidence(await file.text());
+      setEvidenceStatus({ kind: "valid", text: result.sequence === 0 ? copy.evidenceEmpty : copy.evidenceValid(result.sequence) });
+    } catch (error) {
+      setEvidenceStatus({ kind: "invalid", text: copy.evidenceInvalid(error instanceof Error ? error.message : copy.evidenceUnavailable) });
+    }
+  }
+
+  function clearLocalData(): void {
+    clearFolioHelmStored();
+    clearEvidence();
+    setProtections({ ...INITIAL_PROTECTIONS });
+    setEvidenceStatus({ kind: "valid", text: copy.evidenceEmpty });
+    setClearDataDialogOpen(false);
+  }
 
   const pendingDefinition = pendingKey === null
     ? undefined
@@ -398,6 +496,45 @@ export function SettingsPage({
         </div>
       </section>
 
+      <section className="settings-card settings-local-data" aria-labelledby="settings-local-data-title">
+        <div className="settings-card__heading">
+          <div>
+            <p className="settings-card__kicker">04</p>
+            <h2 id="settings-local-data-title">{copy.localData}</h2>
+          </div>
+          <span className="settings-badge settings-badge--lime">{language === "zh" ? "本地" : "Local"}</span>
+        </div>
+        <p className="settings-card__body">{copy.localDataBody}</p>
+        <div className="settings-evidence-row">
+          <div>
+            <strong>{copy.evidence}</strong>
+            <span className={`settings-evidence-status settings-evidence-status--${evidenceStatus.kind}`} role="status">{evidenceStatus.text}</span>
+          </div>
+          <div className="settings-evidence-actions">
+            <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleVerifyEvidence()}>{copy.verify}</button>
+            <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleExportEvidence()}>{copy.export}</button>
+            <button className="settings-button settings-button--secondary" type="button" onClick={() => importInputRef.current?.click()}>{copy.import}</button>
+            <input ref={importInputRef} className="settings-hidden-file" type="file" accept="application/json,.json" onChange={(event) => void handleImportEvidence(event)} />
+          </div>
+        </div>
+        <button className="settings-button settings-button--danger" type="button" onClick={() => setClearDataDialogOpen(true)}>{copy.clearData}</button>
+      </section>
+
+      <section className="settings-card settings-about" aria-labelledby="settings-about-title">
+        <div className="settings-card__heading">
+          <div>
+            <p className="settings-card__kicker">05</p>
+            <h2 id="settings-about-title">{copy.about}</h2>
+          </div>
+          <span className="settings-badge">Apache-2.0</span>
+        </div>
+        <dl className="settings-about-list">
+          <div><dt>{copy.version}</dt><dd>0.1.0</dd></div>
+          <div><dt>{copy.connection}</dt><dd>{language === "zh" ? "未连接券商" : "No brokerage connection"}</dd></div>
+          <div><dt>{copy.apiGate}</dt><dd>{copy.apiGateValue}</dd></div>
+        </dl>
+      </section>
+
       {connectionDialogOpen && (
         <div className="settings-modal-backdrop" role="presentation" onClick={() => setConnectionDialogOpen(false)}>
           <section
@@ -474,6 +611,20 @@ export function SettingsPage({
             <div className="settings-modal__actions">
               <button className="settings-button settings-button--secondary" type="button" onClick={handleCancelDisable}>{copy.cancel}</button>
               <button className="settings-button settings-button--primary" type="button" disabled={!canConfirm} onClick={handleConfirmDisable}>{copy.confirmDisable}</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {clearDataDialogOpen && (
+        <div className="settings-modal-backdrop" role="presentation" onClick={() => setClearDataDialogOpen(false)}>
+          <section className="settings-modal" role="dialog" aria-modal="true" tabIndex={-1} aria-labelledby="settings-clear-data-title" onClick={(event) => event.stopPropagation()}>
+            <span className="settings-badge settings-badge--warning">{copy.clearData}</span>
+            <h2 id="settings-clear-data-title">{copy.clearDataTitle}</h2>
+            <p>{copy.clearDataBody}</p>
+            <div className="settings-modal__actions">
+              <button className="settings-button settings-button--secondary" type="button" onClick={() => setClearDataDialogOpen(false)}>{copy.cancel}</button>
+              <button className="settings-button settings-button--danger" type="button" onClick={clearLocalData}>{copy.confirmClear}</button>
             </div>
           </section>
         </div>
