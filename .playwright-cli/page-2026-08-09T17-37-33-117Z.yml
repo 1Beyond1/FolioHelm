@@ -1,0 +1,185 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - banner [ref=e4]:
+      - button "FolioHelm home" [ref=e5] [cursor=pointer]:
+        - generic [ref=e11]: FolioHelm
+      - navigation "Primary navigation" [ref=e12]:
+        - button "首页" [ref=e13] [cursor=pointer]
+        - button "市场" [ref=e14] [cursor=pointer]
+        - button "交易" [ref=e15] [cursor=pointer]
+        - button "投资组合" [ref=e16] [cursor=pointer]
+        - button "订单" [ref=e17] [cursor=pointer]
+      - button "搜索股票代码或公司" [ref=e18] [cursor=pointer]:
+        - generic [ref=e23]: Ctrl K
+      - generic [ref=e24]:
+        - generic [ref=e25]: 演示数据 · 未连接券商
+        - button "•••• 1234" [ref=e27] [cursor=pointer]
+        - 'button "语言: English" [ref=e30] [cursor=pointer]': EN
+        - button "设置" [ref=e31] [cursor=pointer]
+    - region "系统状态" [ref=e35]:
+      - generic [ref=e36]: 券商：演示模式
+      - generic [ref=e38]: 市场：模拟开放
+      - generic [ref=e40]: 真实交易：已锁定
+      - strong [ref=e42]: 此版本没有券商写入能力
+    - main [ref=e43]:
+      - generic [ref=e820]:
+        - button "返回市场" [ref=e821] [cursor=pointer]
+        - generic [ref=e825]:
+          - generic [ref=e826]:
+            - generic [ref=e827]:
+              - generic [ref=e828]: AAPL
+              - generic [ref=e829]: 虚构证券
+            - heading "苹果公司" [level=1] [ref=e830]
+            - generic [ref=e831]:
+              - strong [ref=e832]: $184.28
+              - generic [ref=e833]: +$2.68
+              - generic [ref=e834]: +1.47%
+              - generic [ref=e835]: 今日
+            - generic [ref=e836]:
+              - generic [ref=e837]: 报价新鲜度
+              - strong [ref=e838]: 演示快照 · 虚构数据
+          - button "交易演示" [ref=e839] [cursor=pointer]:
+            - generic [ref=e841]: ↗
+        - region [ref=e842]:
+          - generic [ref=e843]:
+            - generic [ref=e844]:
+              - generic [ref=e845]: 演示价格历史
+              - heading "价格走势" [level=2] [ref=e846]
+              - paragraph [ref=e847]: 模拟 SVG 图表 · 无实时行情连接
+            - group "价格走势" [ref=e848]:
+              - button "1D" [pressed] [ref=e849] [cursor=pointer]
+              - button "1W" [ref=e850] [cursor=pointer]
+              - button "1M" [ref=e851] [cursor=pointer]
+              - button "6M" [ref=e852] [cursor=pointer]
+              - button "1Y" [ref=e853] [cursor=pointer]
+          - generic [ref=e854]:
+            - img "AAPL 1D 虚构价格图表. 悬浮查看价格 · 滚动调整时间跨度" [ref=e855]
+            - generic: 悬浮查看价格 · 滚动调整时间跨度
+            - generic [ref=e862]:
+              - generic [ref=e863]: $184.28
+              - generic [ref=e864]: $180.40
+            - generic [ref=e865]:
+              - generic [ref=e866]: 09:30
+              - generic [ref=e867]: Now
+        - generic [ref=e868]:
+          - region [ref=e869]:
+            - generic [ref=e871]:
+              - generic [ref=e872]: 你的演示持仓
+              - heading "持仓摘要" [level=2] [ref=e873]
+              - paragraph [ref=e874]: 虚构持仓摘要 · 不是账户对账单。
+            - generic [ref=e875]:
+              - generic [ref=e876]: 持仓市值
+              - strong [ref=e877]: $4,422.72
+              - emphasis [ref=e878]: +$540.00
+            - generic [ref=e879]:
+              - generic [ref=e880]:
+                - term [ref=e881]: 持股数量
+                - definition [ref=e882]: "24"
+              - generic [ref=e883]:
+                - term [ref=e884]: 平均成本
+                - definition [ref=e885]: $161.78
+              - generic [ref=e886]:
+                - term [ref=e887]: 未实现盈亏
+                - definition [ref=e888]: +$540.00
+          - region [ref=e889]:
+            - generic [ref=e891]:
+              - generic [ref=e892]: 证券详情
+              - heading "关键统计" [level=2] [ref=e893]
+            - generic [ref=e894]:
+              - generic [ref=e895]:
+                - term [ref=e896]: 成交量
+                - definition [ref=e897]: 48.2M
+              - generic [ref=e898]:
+                - term [ref=e899]: 市值
+                - definition [ref=e900]: $2.86T
+              - generic [ref=e901]:
+                - term [ref=e902]: 平均成交量
+                - definition [ref=e903]: 52.4M
+              - generic [ref=e904]:
+                - term [ref=e905]: 日内区间
+                - definition [ref=e906]: $181.20 – $185.10
+              - generic [ref=e907]:
+                - term [ref=e908]: 52 周区间
+                - definition [ref=e909]: $142.90 – $198.23
+              - generic [ref=e910]:
+                - term [ref=e911]: 市盈率
+                - definition [ref=e912]: "31.4"
+              - generic [ref=e913]:
+                - term [ref=e914]: 股息率
+                - definition [ref=e915]: 0.52%
+        - region [ref=e916]:
+          - generic [ref=e917]:
+            - generic [ref=e918]:
+              - generic [ref=e919]: 虚构市场背景
+              - heading "背景笔记" [level=2] [ref=e920]
+            - paragraph [ref=e921]: 仅为本界面演示准备的虚构背景卡片。
+          - generic [ref=e922]:
+            - article [ref=e923]:
+              - generic [ref=e924]:
+                - generic [ref=e925]: 虚构背景
+                - time [ref=e926]: 演示笔记 · 无来源
+              - heading "演示中的大型科技股情绪保持积极" [level=3] [ref=e927]
+              - paragraph [ref=e928]: 这条虚构笔记描述了平稳时段，不代表任何真实世界判断。
+              - text: 虚构背景
+            - article [ref=e929]:
+              - generic [ref=e930]:
+                - generic [ref=e931]: 虚构背景
+                - time [ref=e932]: 演示笔记 · 无来源
+              - heading "安静的产品周期占位背景" [level=3] [ref=e933]
+              - paragraph [ref=e934]: 用于演示背景卡如何与报价并列的虚构占位内容。
+              - text: 虚构背景
+    - contentinfo [ref=e599]:
+      - generic [ref=e600]: FolioHelm 演示 · 仅虚构数据 · Apache-2.0
+      - generic [ref=e601]: 此预览仅使用虚构数据。
+  - dialog [ref=e937]:
+    - banner [ref=e938]:
+      - generic [ref=e939]:
+        - paragraph [ref=e940]: 虚构执行流程
+        - heading "交易工作区" [level=1] [ref=e941]
+      - generic [ref=e942]:
+        - button "关闭" [ref=e943] [cursor=pointer]:
+          - generic [ref=e944]: ×
+        - generic [ref=e946]:
+          - strong [ref=e948]: 仅演示
+          - generic [ref=e949]: 未连接券商 · 任何内容都不会发送
+    - navigation "交易进度" [ref=e950]:
+      - list [ref=e951]:
+        - listitem [ref=e952]:
+          - generic [ref=e953]: "1"
+          - generic [ref=e954]: Ticket
+        - listitem [ref=e955]:
+          - generic [ref=e956]: "2"
+          - generic [ref=e957]: Safety check
+        - listitem [ref=e958]:
+          - generic [ref=e959]: "3"
+          - generic [ref=e960]: Mock preview
+        - listitem [ref=e961]:
+          - generic [ref=e962]: "4"
+          - generic [ref=e963]: Demo receipt
+    - generic [ref=e1060]:
+      - generic [ref=e1061]:
+        - generic [ref=e1062]:
+          - paragraph [ref=e1063]: 03 / 04
+          - heading "Mock preview" [level=2] [ref=e1064]
+        - generic [ref=e1065]: 仅演示
+      - paragraph [ref=e1066]: 阅读模拟订单摘要
+      - generic [ref=e1067]:
+        - text: 自然语言摘要
+        - paragraph [ref=e1068]: 买入 1 股 AAPL 按虚构市价.
+      - generic [ref=e1069]:
+        - generic [ref=e1070]:
+          - term [ref=e1071]: 估算金额
+          - definition [ref=e1072]: US$182.40
+        - generic [ref=e1073]:
+          - term [ref=e1074]: 有效期
+          - definition [ref=e1075]: 仅限本次演示会话
+        - generic [ref=e1076]:
+          - term [ref=e1077]: 虚构预览 ID
+          - definition [ref=e1078]: DEMO-PREVIEW-AAPL-MARKET-1
+      - paragraph [ref=e1080]: 市价订单在本演示中可以继续到 Mock preview。真实版本说明：市价订单不会在首次预览时发送。
+      - generic [ref=e1081] [cursor=pointer]:
+        - checkbox "我了解这是模拟订单，且不存在真实请求。" [ref=e1082]
+        - generic [ref=e1083]: 我了解这是模拟订单，且不存在真实请求。
+      - generic [ref=e1084]:
+        - button "返回" [ref=e1085] [cursor=pointer]
+        - button "模拟订单" [disabled] [ref=e1086]

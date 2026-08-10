@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#050505" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23050505'/><rect x='7' y='7' width='7' height='7' rx='2' fill='%23f5f5f1'/><rect x='18' y='7' width='7' height='7' rx='2' fill='%23b7ff22'/><rect x='7' y='18' width='7' height='7' rx='2' fill='%23f5f5f1'/><rect x='18' y='18' width='7' height='7' rx='2' fill='%23f5f5f1'/></svg>" />
+    <title>FolioHelm — Portfolio Home Concept</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="FolioHelm home">
+          <span class="brand-mark" aria-hidden="true">
+            <i></i><i></i><i></i><i></i>
+          </span>
+          <span>FolioHelm</span>
+        </a>
+
+        <nav class="primary-nav" aria-label="Primary navigation">
+          <a class="active" href="#">Home</a>
+          <a href="#">Markets</a>
+          <a href="#">Trade</a>
+          <a href="#">Portfolio</a>
+          <a href="#">Orders</a>
+        </nav>
+
+        <button class="search-pill" type="button" aria-label="Search securities">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="6.5"></circle>
+            <path d="m16 16 4 4"></path>
+          </svg>
+          <span>Search a symbol or company</span>
+          <kbd>⌘ K</kbd>
+        </button>
+
+        <div class="topbar-status">
+          <span class="status-cluster"><i></i>Market open</span>
+          <span class="status-cluster"><i></i>Schwab connected</span>
+          <button class="account-menu" type="button">
+            •••• 1234
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"></path></svg>
+          </button>
+          <button class="icon-button" type="button" aria-label="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3.2"></circle>
+              <path d="M19 13.8v-3.6l-2-.5a7 7 0 0 0-.6-1.4l1.1-1.8L15 4l-1.8 1.1a7 7 0 0 0-1.4-.6l-.5-2H7.8l-.5 2a7 7 0 0 0-1.4.6L4 4 1.5 6.5l1.1 1.8a7 7 0 0 0-.6 1.4l-2 .5v3.6l2 .5a7 7 0 0 0 .6 1.4l-1.1 1.8L4 20l1.8-1.1a7 7 0 0 0 1.4.6l.5 2h3.6l.5-2a7 7 0 0 0 1.4-.6L15 20l2.5-2.5-1.1-1.8a7 7 0 0 0 .6-1.4l2-.5Z" transform="translate(2 0)"></path>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="portfolio-title">
+          <div class="hero-summary">
+            <div class="eyebrow-row">
+              <span id="portfolio-title">Total portfolio value</span>
+              <button class="eye-button" type="button" aria-label="Hide balances">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6Z"></path>
+                  <circle cx="12" cy="12" r="2.7"></circle>
+                </svg>
+              </button>
+            </div>
+
+            <div class="balance-row">
+              <strong>$127,430.82</strong>
+              <button class="currency-selector" type="button">USD <span>⌄</span></button>
+            </div>
+
+            <div class="daily-return">
+              <span>Today</span>
+              <strong>+$1,284.70</strong>
+              <em>+1.02%</em>
+            </div>
+
+            <div class="account-caption">
+              <span>Individual brokerage · •••• 1234</span>
+              <span>Updated just now</span>
+            </div>
+
+            <div class="quick-actions" aria-label="Quick actions">
+              <button type="button">
+                <span class="action-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 17 17 5M8 5h9v9"></path></svg>
+                </span>
+                <b>Trade</b>
+              </button>
+              <button type="button">
+                <span class="action-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6"></circle><path d="m15 15 4.5 4.5"></path></svg>
+                </span>
+                <b>Search</b>
+              </button>
+              <button type="button">
+                <span class="action-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 4.5h11v15l-5.5-3-5.5 3Z"></path></svg>
+                </span>
+                <b>Watchlist</b>
+              </button>
+              <button type="button">
+                <span class="action-icon">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4" width="14" height="16" rx="2"></rect><path d="M8.5 9h7M8.5 13h7M8.5 17h4"></path></svg>
+                </span>
+                <b>Orders</b>
+              </button>
+            </div>
+          </div>
+
+          <div class="performance-panel">
+            <div class="performance-header">
+              <div>
+                <span>Portfolio performance</span>
+                <strong>+$18,742.16 <em>all time</em></strong>
+              </div>
+              <div class="period-switcher" role="group" aria-label="Chart period">
+                <button type="button">1D</button>
+                <button type="button">1W</button>
+                <button class="active" type="button">1M</button>
+                <button type="button">6M</button>
+                <button type="button">1Y</button>
+              </div>
+            </div>
+
+            <div class="chart-wrap" aria-label="Portfolio value chart">
+              <svg class="portfolio-chart" viewBox="0 0 720 260" role="img" aria-label="Portfolio value increased over the selected month">
+                <defs>
+                  <pattern id="dotPattern" width="8" height="8" patternUnits="userSpaceOnUse">
+                    <circle cx="2" cy="2" r="1.1" fill="#b7ff22" opacity="0.48"></circle>
+                  </pattern>
+                  <linearGradient id="fadeDots" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#ffffff" stop-opacity="1"></stop>
+                    <stop offset="1" stop-color="#ffffff" stop-opacity="0"></stop>
+                  </linearGradient>
+                  <mask id="fadeMask">
+                    <rect width="720" height="260" fill="url(#fadeDots)"></rect>
+                  </mask>
+                  <filter id="softGlow" x="-30%" y="-60%" width="160%" height="220%">
+                    <feGaussianBlur stdDeviation="7" result="blur"></feGaussianBlur>
+                    <feMerge><feMergeNode in="blur"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
+                  </filter>
+                </defs>
+
+                <g class="chart-grid">
+                  <path d="M20 42H690M20 100H690M20 158H690M20 216H690"></path>
+                </g>
+
+                <path class="chart-area" mask="url(#fadeMask)" d="M20 205 C52 193,67 198,95 177 S143 164,170 174 S221 133,251 145 S302 127,330 116 S379 137,410 102 S462 89,495 99 S544 65,574 76 S623 43,690 30 L690 238 L20 238 Z" fill="url(#dotPattern)"></path>
+                <path class="chart-glow" d="M20 205 C52 193,67 198,95 177 S143 164,170 174 S221 133,251 145 S302 127,330 116 S379 137,410 102 S462 89,495 99 S544 65,574 76 S623 43,690 30" filter="url(#softGlow)"></path>
+                <path class="chart-line" d="M20 205 C52 193,67 198,95 177 S143 164,170 174 S221 133,251 145 S302 127,330 116 S379 137,410 102 S462 89,495 99 S544 65,574 76 S623 43,690 30"></path>
+
+                <g class="chart-focus">
+                  <line x1="495" y1="32" x2="495" y2="238"></line>
+                  <circle cx="495" cy="99" r="7"></circle>
+                </g>
+              </svg>
+
+              <div class="chart-tooltip">
+                <span>Aug 2</span>
+                <strong>$123,914.68</strong>
+                <em>+$842.12</em>
+              </div>
+
+              <div class="chart-scale" aria-hidden="true">
+                <span>$128k</span><span>$124k</span><span>$120k</span><span>$116k</span>
+              </div>
+              <div class="chart-dates" aria-hidden="true">
+                <span>Jul 10</span><span>Jul 17</span><span>Jul 24</span><span>Aug 1</span><span>Today</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <article class="heatmap-card surface-card">
+            <div class="card-heading">
+              <div>
+                <span class="section-kicker">Activity</span>
+                <h2>Your investing year</h2>
+                <p>Small, consistent decisions add up.</p>
+              </div>
+              <div class="heatmap-controls">
+                <div class="segmented-control" role="group" aria-label="Heatmap metric">
+                  <button class="active" type="button">Activity</button>
+                  <button type="button">Daily return</button>
+                </div>
+                <button class="year-selector" type="button">2026 <span>⌄</span></button>
+              </div>
+            </div>
+
+            <div class="heatmap-frame">
+              <div class="month-labels" aria-hidden="true">
+                <span>Jan</span><span>Feb</span><span>Mar</span><span>Apr</span><span>May</span><span>Jun</span><span>Jul</span><span>Aug</span><span>Sep</span><span>Oct</span><span>Nov</span><span>Dec</span>
+              </div>
+              <div class="weekday-labels" aria-hidden="true"><span>Mon</span><span>Wed</span><span>Fri</span></div>
+              <div id="activity-heatmap" class="activity-heatmap" aria-label="Daily investing activity for 2026"></div>
+              <div id="heatmap-tooltip" class="heatmap-tooltip" role="status">
+                <span>May 14, 2026</span>
+                <strong>3 investing actions</strong>
+                <em>Portfolio +0.72%</em>
+              </div>
+            </div>
+
+            <div class="heatmap-footer">
+              <div class="year-summary">
+                <strong>86</strong><span>active days</span>
+                <strong>42</strong><span>orders filled</span>
+                <strong>+$8,214</strong><span>net change</span>
+              </div>
+              <div class="heatmap-legend" aria-label="Less to more activity">
+                <span>Less</span><i data-level="0"></i><i data-level="1"></i><i data-level="2"></i><i data-level="3"></i><i data-level="4"></i><span>More</span>
+              </div>
+            </div>
+          </article>
+
+          <aside class="side-stack">
+            <article class="positions-card surface-card">
+              <div class="side-heading">
+                <div><span class="section-kicker">Portfolio</span><h2>Your positions</h2></div>
+                <button type="button">View all <span>↗</span></button>
+              </div>
+              <div class="positions-list">
+                <button class="position-row" type="button">
+                  <span class="asset-icon apple">A</span>
+                  <span class="asset-name"><b>AAPL</b><small>Apple · 100 shares</small></span>
+                  <span class="asset-value"><b>$22,634.00</b><small class="positive">+$450.00</small></span>
+                  <span class="chevron">›</span>
+                </button>
+                <button class="position-row" type="button">
+                  <span class="asset-icon nvidia">N</span>
+                  <span class="asset-name"><b>NVDA</b><small>NVIDIA · 50 shares</small></span>
+                  <span class="asset-value"><b>$5,920.00</b><small class="negative">−$105.00</small></span>
+                  <span class="chevron">›</span>
+                </button>
+                <button class="position-row" type="button">
+                  <span class="asset-icon spy">S</span>
+                  <span class="asset-name"><b>SPY</b><small>S&amp;P 500 ETF · 200 shares</small></span>
+                  <span class="asset-value"><b>$108,436.00</b><small class="positive">+$1,436.00</small></span>
+                  <span class="chevron">›</span>
+                </button>
+                <button class="position-row" type="button">
+                  <span class="asset-icon microsoft">M</span>
+                  <span class="asset-name"><b>MSFT</b><small>Microsoft · 28 shares</small></span>
+                  <span class="asset-value"><b>$11,551.40</b><small class="positive">+$182.14</small></span>
+                  <span class="chevron">›</span>
+                </button>
+              </div>
+            </article>
+
+            <article class="activity-card surface-card">
+              <div class="side-heading compact">
+                <div><span class="section-kicker">Today</span><h2>Recent activity</h2></div>
+                <button class="more-button" type="button" aria-label="More activity">•••</button>
+              </div>
+              <div class="activity-list">
+                <div><i class="activity-dot filled"></i><span><b>AAPL limit order filled</b><small>100 shares at $226.34</small></span><time>10:42</time></div>
+                <div><i class="activity-dot pending"></i><span><b>NVDA order pending</b><small>Limit price $116.00</small></span><time>09:18</time></div>
+                <div><i class="activity-dot dividend"></i><span><b>SPY dividend received</b><small>+$184.20 cash</small></span><time>08:05</time></div>
+              </div>
+            </article>
+          </aside>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

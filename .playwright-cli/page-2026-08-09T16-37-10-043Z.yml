@@ -1,0 +1,214 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - button "FolioHelm home" [ref=e5] [cursor=pointer]:
+      - generic [ref=e11]: FolioHelm
+    - navigation "Primary navigation" [ref=e12]:
+      - button "首页" [ref=e13] [cursor=pointer]
+      - button "市场" [active] [ref=e14] [cursor=pointer]
+      - button "交易" [ref=e15] [cursor=pointer]
+      - button "投资组合" [ref=e16] [cursor=pointer]
+      - button "订单" [ref=e17] [cursor=pointer]
+    - button "搜索股票代码或公司" [ref=e18] [cursor=pointer]:
+      - generic [ref=e23]: Ctrl K
+    - generic [ref=e24]:
+      - generic [ref=e25]: 演示数据 · 未连接券商
+      - button "•••• 1234" [ref=e27] [cursor=pointer]
+      - 'button "语言: English" [ref=e30] [cursor=pointer]': EN
+      - button "设置" [ref=e31] [cursor=pointer]
+  - region "系统状态" [ref=e35]:
+    - generic [ref=e36]: 券商：演示模式
+    - generic [ref=e38]: 市场：模拟开放
+    - generic [ref=e40]: 真实交易：已锁定
+    - strong [ref=e42]: 此版本没有券商写入能力
+  - main [ref=e43]:
+    - generic [ref=e680]:
+      - generic [ref=e681]:
+        - generic [ref=e682]:
+          - generic [ref=e683]: 市场工作台
+          - heading "市场" [level=1] [ref=e684]
+          - paragraph [ref=e685]: 用于浏览虚构行情时段的简洁视图。
+        - status [ref=e686]:
+          - generic [ref=e688]:
+            - strong [ref=e689]: 美股时段 · 演示
+            - generic [ref=e690]: 快照模式 · 无实时行情
+          - generic [ref=e691]: 演示
+      - note [ref=e692]:
+        - generic [ref=e693]: ✦
+        - generic [ref=e694]:
+          - strong [ref=e695]: 仅虚构数据
+          - text: 页面中的每个报价都为界面探索而虚构。
+      - region [ref=e696]:
+        - generic [ref=e697]:
+          - generic [ref=e698]:
+            - generic [ref=e699]: 搜索演示市场
+            - heading "搜索股票代码或公司" [level=2] [ref=e700]
+          - generic [ref=e701]: 7 项结果
+        - searchbox "搜索股票代码或公司" [ref=e706]
+        - paragraph [ref=e707]: 试试 AAPL、NVDA、MSFT、SPY 或 TSLA
+      - region [ref=e708]:
+        - generic [ref=e709]:
+          - generic [ref=e710]:
+            - generic [ref=e711]: 市场概览
+            - heading "主要指数" [level=2] [ref=e712]
+          - paragraph [ref=e713]: 指数快照均为虚构演示数值。
+        - generic [ref=e714]:
+          - article [ref=e715]:
+            - generic [ref=e716]:
+              - generic [ref=e717]: SPX
+              - generic [ref=e718]: +0.86%
+            - strong [ref=e719]: 标普 500
+            - generic [ref=e720]:
+              - generic [ref=e721]: 5,248.30
+              - img "SPX 趋势" [ref=e722]
+          - article [ref=e724]:
+            - generic [ref=e725]:
+              - generic [ref=e726]: IXIC
+              - generic [ref=e727]: +1.24%
+            - strong [ref=e728]: 纳斯达克
+            - generic [ref=e729]:
+              - generic [ref=e730]: 16,462.11
+              - img "IXIC 趋势" [ref=e731]
+          - article [ref=e733]:
+            - generic [ref=e734]:
+              - generic [ref=e735]: DJI
+              - generic [ref=e736]: "-0.18%"
+            - strong [ref=e737]: 道琼斯
+            - generic [ref=e738]:
+              - generic [ref=e739]: 39,872.44
+              - img "DJI 趋势" [ref=e740]
+      - generic [ref=e742]:
+        - region [ref=e743]:
+          - generic [ref=e744]:
+            - generic [ref=e745]:
+              - generic [ref=e746]: 演示自选列表
+              - heading "自选列表" [level=2] [ref=e747]
+              - paragraph [ref=e748]: 五个熟悉标的的虚构快照。
+            - generic [ref=e749]: 7 项结果
+          - table [ref=e751]:
+            - rowgroup [ref=e752]:
+              - row [ref=e753]:
+                - columnheader "代码" [ref=e754]
+                - columnheader "公司" [ref=e755]
+                - columnheader "价格" [ref=e756]
+                - columnheader "涨跌" [ref=e757]
+                - columnheader "涨跌幅" [ref=e758]
+                - columnheader "趋势" [ref=e759]
+                - columnheader "操作" [ref=e760]
+            - rowgroup [ref=e761]:
+              - row [ref=e762]:
+                - cell [ref=e763]:
+                  - 'button "打开证券详情: AAPL" [ref=e764] [cursor=pointer]':
+                    - strong [ref=e765]: AAPL
+                - cell "苹果公司" [ref=e768]
+                - cell "$184.28" [ref=e769]
+                - cell "+$2.68" [ref=e770]
+                - cell "+1.47%" [ref=e771]
+                - cell [ref=e772]:
+                  - img "AAPL 趋势" [ref=e773]
+                - cell [ref=e775]:
+                  - button "交易演示" [ref=e776] [cursor=pointer]
+              - row [ref=e777]:
+                - cell [ref=e778]:
+                  - 'button "打开证券详情: NVDA" [ref=e779] [cursor=pointer]':
+                    - strong [ref=e780]: NVDA
+                - cell "英伟达" [ref=e783]
+                - cell "$121.54" [ref=e784]
+                - cell "+$3.12" [ref=e785]
+                - cell "+2.63%" [ref=e786]
+                - cell [ref=e787]:
+                  - img "NVDA 趋势" [ref=e788]
+                - cell [ref=e790]:
+                  - button "交易演示" [ref=e791] [cursor=pointer]
+              - row [ref=e792]:
+                - cell [ref=e793]:
+                  - 'button "打开证券详情: MSFT" [ref=e794] [cursor=pointer]':
+                    - strong [ref=e795]: MSFT
+                - cell "微软" [ref=e798]
+                - cell "$414.72" [ref=e799]
+                - cell "-$1.86" [ref=e800]
+                - cell "-0.45%" [ref=e801]
+                - cell [ref=e802]:
+                  - img "MSFT 趋势" [ref=e803]
+                - cell [ref=e805]:
+                  - button "交易演示" [ref=e806] [cursor=pointer]
+              - row [ref=e807]:
+                - cell [ref=e808]:
+                  - 'button "打开证券详情: SPY" [ref=e809] [cursor=pointer]':
+                    - strong [ref=e810]: SPY
+                - cell "标普 500 ETF" [ref=e813]
+                - cell "$542.18" [ref=e814]
+                - cell "+$1.04" [ref=e815]
+                - cell "+0.19%" [ref=e816]
+                - cell [ref=e817]:
+                  - img "SPY 趋势" [ref=e818]
+                - cell [ref=e820]:
+                  - button "交易演示" [ref=e821] [cursor=pointer]
+              - row [ref=e822]:
+                - cell [ref=e823]:
+                  - 'button "打开证券详情: TSLA" [ref=e824] [cursor=pointer]':
+                    - strong [ref=e825]: TSLA
+                - cell "特斯拉" [ref=e828]
+                - cell "$196.33" [ref=e829]
+                - cell "-$4.72" [ref=e830]
+                - cell "-2.35%" [ref=e831]
+                - cell [ref=e832]:
+                  - img "TSLA 趋势" [ref=e833]
+                - cell [ref=e835]:
+                  - button "交易演示" [ref=e836] [cursor=pointer]
+              - row [ref=e837]:
+                - cell [ref=e838]:
+                  - 'button "打开证券详情: AMD" [ref=e839] [cursor=pointer]':
+                    - strong [ref=e840]: AMD
+                - cell "超威半导体" [ref=e843]
+                - cell "$168.44" [ref=e844]
+                - cell "+$1.94" [ref=e845]
+                - cell "+1.16%" [ref=e846]
+                - cell [ref=e847]:
+                  - img "AMD 趋势" [ref=e848]
+                - cell [ref=e850]:
+                  - button "交易演示" [ref=e851] [cursor=pointer]
+              - row [ref=e852]:
+                - cell [ref=e853]:
+                  - 'button "打开证券详情: AMZN" [ref=e854] [cursor=pointer]':
+                    - strong [ref=e855]: AMZN
+                - cell "亚马逊" [ref=e858]
+                - cell "$181.27" [ref=e859]
+                - cell "-$1.12" [ref=e860]
+                - cell "-0.61%" [ref=e861]
+                - cell [ref=e862]:
+                  - img "AMZN 趋势" [ref=e863]
+                - cell [ref=e865]:
+                  - button "交易演示" [ref=e866] [cursor=pointer]
+        - complementary [ref=e867]:
+          - generic [ref=e869]:
+            - generic [ref=e870]: 涨跌榜
+            - heading "涨幅与跌幅" [level=2] [ref=e871]
+          - group "涨幅与跌幅" [ref=e872]:
+            - button "涨幅榜" [pressed] [ref=e873] [cursor=pointer]
+            - button "跌幅榜" [ref=e874] [cursor=pointer]
+          - generic [ref=e875]:
+            - generic [ref=e876]:
+              - generic [ref=e877]: "01"
+              - 'button "打开证券详情: NVDA" [ref=e878] [cursor=pointer]':
+                - strong [ref=e879]: NVDA
+                - generic [ref=e880]: 英伟达
+              - generic [ref=e881]: +2.63%
+              - 'button "交易演示: NVDA" [ref=e882] [cursor=pointer]': +
+            - generic [ref=e883]:
+              - generic [ref=e884]: "02"
+              - 'button "打开证券详情: AAPL" [ref=e885] [cursor=pointer]':
+                - strong [ref=e886]: AAPL
+                - generic [ref=e887]: 苹果公司
+              - generic [ref=e888]: +1.47%
+              - 'button "交易演示: AAPL" [ref=e889] [cursor=pointer]': +
+            - generic [ref=e890]:
+              - generic [ref=e891]: "03"
+              - 'button "打开证券详情: AMD" [ref=e892] [cursor=pointer]':
+                - strong [ref=e893]: AMD
+                - generic [ref=e894]: 超威半导体
+              - generic [ref=e895]: +1.16%
+              - 'button "交易演示: AMD" [ref=e896] [cursor=pointer]': +
+          - paragraph [ref=e897]: 页面中的每个报价都为界面探索而虚构。
+  - contentinfo [ref=e598]:
+    - generic [ref=e599]: FolioHelm 演示 · 仅虚构数据 · Apache-2.0
+    - generic [ref=e600]: 此预览仅使用虚构数据。

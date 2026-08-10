@@ -1,0 +1,264 @@
+import { useEffect, useMemo, useState } from "react";
+import { appendEvidence } from "../../domain/evidenceJournal";
+import {
+  AutomationController,
+  DEFAULT_AUTOMATION_STATE,
+  normalizeAutomationState,
+  type AutomationMode,
+  type AutomationSchedule,
+  type AutomationState,
+} from "../../domain/automation";
+import { money, price, quantity, decimalToNumber } from "../../domain/decimal";
+import type { BrokerSymbol } from "../../domain/contracts";
+import type { Language } from "../../types";
+import { readStored, writeStored } from "../../platform/storage";
+import "./automation.css";
+
+interface AutomationPageProps {
+  language: Language;
+}
+
+const SYMBOLS: readonly BrokerSymbol[] = ["SPY", "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "TSLA"];
+
+const COPY = {
+  en: {
+    title: "Automation",
+    eyebrow: "Mock / Paper / Dry Run only",
+    unavailable: "Real Trading unavailable",
+    unavailableBody: "Schwab API is not connected. This page cannot send, cancel, replace, or schedule a real broker request.",
+    mode: "Execution mode",
+    mock: "Mock",
+    paper: "Paper Trading",
+    dryRun: "Dry Run",
+    real: "Real Trading",
+    enabled: "Automation enabled",
+    enabledBody: "Runs remain local and produce only simulation records.",
+    schedule: "Schedule",
+    manual: "Manual only",
+    five: "Every 5 minutes",
+    fifteen: "Every 15 minutes",
+    hourly: "Hourly",
+    daily: "Daily",
+    strategy: "Strategy label",
+    strategyPlaceholder: "e.g. Weekly index review",
+    guardrails: "Guardrails",
+    maxOrder: "Max order value",
+    maxDaily: "Max daily value",
+    maxTasks: "Max concurrent tasks",
+    rate: "Max actions / minute",
+    allowlist: "Explicit symbol allowlist",
+    session: "Regular session only",
+    sessionBody: "This rule is fixed and cannot be disabled.",
+    killSwitch: "Kill switch",
+    armed: "Armed",
+    tripped: "Tripped · automation locked",
+    trip: "Trip kill switch",
+    rearm: "Re-arm automation",
+    runNow: "Run one local simulation",
+    selectSymbol: "Simulation symbol",
+    result: "Latest run",
+    noRuns: "No runs recorded.",
+    logs: "Run log",
+    reset: "Reset local automation state",
+    resetBody: "This clears only Mock/Paper/Dry Run settings and logs. It does not touch credentials or broker data.",
+    wouldRun: "Would run",
+    blocked: "Blocked",
+    duplicate: "Duplicate prevented",
+    reserved: "Reserved today",
+    noReal: "No real request exists",
+  },
+  zh: {
+    title: "自动化",
+    eyebrow: "仅 Mock / Paper / Dry Run",
+    unavailable: "真实交易不可用",
+    unavailableBody: "嘉信 API 尚未连接。本页面不能发送、撤销、替换或调度真实券商请求。",
+    mode: "执行模式",
+    mock: "Mock",
+    paper: "Paper Trading",
+    dryRun: "Dry Run",
+    real: "真实交易",
+    enabled: "启用自动化",
+    enabledBody: "所有运行都留在本地，只产生模拟记录。",
+    schedule: "调度",
+    manual: "仅手动",
+    five: "每 5 分钟",
+    fifteen: "每 15 分钟",
+    hourly: "每小时",
+    daily: "每天",
+    strategy: "策略名称",
+    strategyPlaceholder: "例如：每周指数复核",
+    guardrails: "风险边界",
+    maxOrder: "单笔最大金额",
+    maxDaily: "每日最大金额",
+    maxTasks: "最大并发任务",
+    rate: "每分钟最大操作数",
+    allowlist: "明确的证券允许列表",
+    session: "仅常规交易时段",
+    sessionBody: "此规则固定开启，不能关闭。",
+    killSwitch: "紧急停止",
+    armed: "已布防",
+    tripped: "已触发 · 自动化已锁定",
+    trip: "触发紧急停止",
+    rearm: "重新启用自动化",
+    runNow: "运行一次本地模拟",
+    selectSymbol: "模拟证券",
+    result: "最近一次运行",
+    noRuns: "还没有运行记录。",
+    logs: "运行日志",
+    reset: "重置本地自动化状态",
+    resetBody: "只清除 Mock/Paper/Dry Run 设置和日志，不会触碰凭据或券商数据。",
+    wouldRun: "将会运行",
+    blocked: "已阻止",
+    duplicate: "已阻止重复运行",
+    reserved: "今日已预留",
+    noReal: "不存在真实请求",
+  },
+} as const;
+
+function formatMoney(value: string, language: Language): string {
+  return new Intl.NumberFormat(language === "zh" ? "zh-CN" : "en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(decimalToNumber(money(value)));
+}
+
+function persistableState(state: AutomationState): AutomationState {
+  return {
+    ...state,
+    reservedToday: money(state.reservedToday),
+    policy: {
+      ...state.policy,
+      maxOrderValue: money(state.policy.maxOrderValue),
+      maxDailyValue: money(state.policy.maxDailyValue),
+    },
+  };
+}
+
+export function AutomationPage({ language }: AutomationPageProps) {
+  const copy = COPY[language];
+  const [state, setState] = useState<AutomationState>(() => normalizeAutomationState(readStored("automation", DEFAULT_AUTOMATION_STATE)));
+  const [selectedMode, setSelectedMode] = useState<AutomationMode>(state.mode);
+  const [selectedSymbol, setSelectedSymbol] = useState<BrokerSymbol>(state.policy.allowedSymbols[0] ?? "SPY");
+  const [lastResult, setLastResult] = useState<AutomationState["logs"][number] | null>(null);
+
+  useEffect(() => {
+    writeStored("automation", persistableState(state));
+  }, [state]);
+
+  const dailyPercent = useMemo(() => {
+    const cap = decimalToNumber(state.policy.maxDailyValue);
+    return cap <= 0 ? 0 : Math.min(100, (decimalToNumber(state.reservedToday) / cap) * 100);
+  }, [state.policy.maxDailyValue, state.reservedToday]);
+
+  function updateState(patch: Partial<AutomationState>): void {
+    setState((current) => ({ ...current, ...patch }));
+  }
+
+  function updatePolicy(patch: Partial<AutomationState["policy"]>): void {
+    setState((current) => ({ ...current, policy: { ...current.policy, ...patch } }));
+  }
+
+  function toggleSymbol(symbol: BrokerSymbol): void {
+    const allowed = state.policy.allowedSymbols.includes(symbol);
+    const next = allowed
+      ? state.policy.allowedSymbols.filter((item) => item !== symbol)
+      : [...state.policy.allowedSymbols, symbol];
+    updatePolicy({ allowedSymbols: next });
+    if (allowed && selectedSymbol === symbol) setSelectedSymbol(next[0] ?? "SPY");
+  }
+
+  function runNow(): void {
+    const controller = new AutomationController({ ...state, mode: selectedMode });
+    const result = controller.run({
+      symbol: selectedSymbol,
+      side: "buy",
+      quantity: quantity("1"),
+      price: price("100.00"),
+      idempotencyKey: `manual-${selectedSymbol}-${state.logs.length + 1}`,
+    });
+    setState(result.state);
+    setLastResult(result.log);
+    void appendEvidence("automation_run", {
+      mode: result.log.mode,
+      symbol: result.log.symbol,
+      status: result.log.status,
+      amount: result.log.amount,
+      reason: result.log.reason,
+    }).catch(() => undefined);
+  }
+
+  function reset(): void {
+    setState({ ...DEFAULT_AUTOMATION_STATE, policy: { ...DEFAULT_AUTOMATION_STATE.policy, allowedSymbols: [...DEFAULT_AUTOMATION_STATE.policy.allowedSymbols] }, logs: [] });
+    setSelectedMode(DEFAULT_AUTOMATION_STATE.mode);
+    setSelectedSymbol(DEFAULT_AUTOMATION_STATE.policy.allowedSymbols[0] ?? "SPY");
+    setLastResult(null);
+  }
+
+  return (
+    <main className="automation-page" data-testid="automation-page">
+      <header className="automation-header">
+        <div>
+          <p className="automation-eyebrow">{copy.eyebrow}</p>
+          <h1>{copy.title}</h1>
+        </div>
+        <span className="automation-badge automation-badge--warning">{copy.unavailable}</span>
+      </header>
+
+      <section className="automation-callout" role="note">
+        <strong>{copy.unavailable}</strong>
+        <p>{copy.unavailableBody}</p>
+        <span>{copy.noReal}</span>
+      </section>
+
+      <div className="automation-grid">
+        <section className="automation-card">
+          <div className="automation-card-heading"><div><span>01</span><h2>{copy.mode}</h2></div></div>
+          <div className="automation-mode-grid" role="group" aria-label={copy.mode}>
+            {(["mock", "paper", "dry-run"] as const).map((mode) => (
+              <button key={mode} type="button" className={selectedMode === mode ? "is-selected" : ""} aria-pressed={selectedMode === mode} onClick={() => { setSelectedMode(mode); updateState({ mode }); }}>
+                {mode === "mock" ? copy.mock : mode === "paper" ? copy.paper : copy.dryRun}
+              </button>
+            ))}
+            <button type="button" className="is-disabled" disabled title={copy.unavailableBody}>{copy.real}</button>
+          </div>
+          <div className="automation-setting-row">
+            <div><strong>{copy.enabled}</strong><span>{copy.enabledBody}</span></div>
+            <button type="button" role="switch" aria-checked={state.enabled} className={`automation-switch ${state.enabled ? "is-on" : ""}`} disabled={state.killSwitchTripped || selectedMode === "real"} onClick={() => updateState({ enabled: !state.enabled })}>{state.enabled ? "ON" : "OFF"}</button>
+          </div>
+          <label className="automation-field"><span>{copy.strategy}</span><input value={state.strategyName} placeholder={copy.strategyPlaceholder} onChange={(event) => updateState({ strategyName: event.target.value })} /></label>
+          <label className="automation-field"><span>{copy.schedule}</span><select value={state.schedule} onChange={(event) => updateState({ schedule: event.target.value as AutomationSchedule })}><option value="manual">{copy.manual}</option><option value="5m">{copy.five}</option><option value="15m">{copy.fifteen}</option><option value="hourly">{copy.hourly}</option><option value="daily">{copy.daily}</option></select></label>
+        </section>
+
+        <section className="automation-card">
+          <div className="automation-card-heading"><div><span>02</span><h2>{copy.guardrails}</h2></div></div>
+          <label className="automation-field"><span>{copy.maxOrder}</span><input inputMode="decimal" value={state.policy.maxOrderValue} onChange={(event) => updatePolicy({ maxOrderValue: money(event.target.value || "0") })} /></label>
+          <label className="automation-field"><span>{copy.maxDaily}</span><input inputMode="decimal" value={state.policy.maxDailyValue} onChange={(event) => updatePolicy({ maxDailyValue: money(event.target.value || "0") })} /></label>
+          <label className="automation-field"><span>{copy.maxTasks}</span><input type="number" min="1" step="1" value={state.policy.maxOpenTasks} onChange={(event) => updatePolicy({ maxOpenTasks: Math.max(1, Number(event.target.value) || 1) })} /></label>
+          <label className="automation-field"><span>{copy.rate}</span><input type="number" min="1" step="1" value={state.policy.maxActionsPerMinute} onChange={(event) => updatePolicy({ maxActionsPerMinute: Math.max(1, Number(event.target.value) || 1) })} /></label>
+          <div className="automation-budget"><div><span>{copy.reserved}</span><strong>{formatMoney(state.reservedToday, language)} / {formatMoney(state.policy.maxDailyValue, language)}</strong></div><div className="automation-progress"><i style={{ width: `${dailyPercent}%` }} /></div></div>
+        </section>
+      </div>
+
+      <section className="automation-card automation-card--wide">
+        <div className="automation-card-heading"><div><span>03</span><h2>{copy.allowlist}</h2></div><span className="automation-fixed">{copy.session}</span></div>
+        <p className="automation-muted">{copy.sessionBody}</p>
+        <div className="automation-symbols">{SYMBOLS.map((symbol) => <label key={symbol}><input type="checkbox" checked={state.policy.allowedSymbols.includes(symbol)} onChange={() => toggleSymbol(symbol)} /><span>{symbol}</span></label>)}</div>
+        <div className="automation-run-row"><label className="automation-field"><span>{copy.selectSymbol}</span><select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value as BrokerSymbol)}>{SYMBOLS.map((symbol) => <option key={symbol} value={symbol} disabled={!state.policy.allowedSymbols.includes(symbol)}>{symbol}</option>)}</select></label><button className="automation-primary" type="button" onClick={runNow}>{copy.runNow}</button></div>
+      </section>
+
+      <section className={`automation-kill ${state.killSwitchTripped ? "is-tripped" : ""}`}>
+        <div><span className="automation-kill-label">{copy.killSwitch}</span><strong>{state.killSwitchTripped ? copy.tripped : copy.armed}</strong></div>
+        {state.killSwitchTripped ? <button type="button" className="automation-secondary" onClick={() => updateState({ killSwitchTripped: false })}>{copy.rearm}</button> : <button type="button" className="automation-danger" onClick={() => updateState({ killSwitchTripped: true, enabled: false })}>{copy.trip}</button>}
+      </section>
+
+      <section className="automation-card automation-card--wide">
+        <div className="automation-card-heading"><div><span>04</span><h2>{copy.logs}</h2></div><button type="button" className="automation-link" onClick={reset}>{copy.reset}</button></div>
+        <p className="automation-muted">{copy.resetBody}</p>
+        {lastResult && <div className={`automation-result automation-result--${lastResult.status}`}><strong>{lastResult.status === "would-run" ? copy.wouldRun : lastResult.status === "duplicate" ? copy.duplicate : copy.blocked}</strong><span>{lastResult.reason}</span></div>}
+        <div className="automation-log-list">{state.logs.length === 0 ? <p className="automation-muted">{copy.noRuns}</p> : state.logs.map((log) => <div className="automation-log" key={log.id}><strong>{log.id} · {log.symbol}</strong><span>{log.mode} · {log.status} · {formatMoney(log.amount, language)}</span><small>{log.reason}</small></div>)}</div>
+      </section>
+    </main>
+  );
+}
