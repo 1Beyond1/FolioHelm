@@ -75,8 +75,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 设计资料
 
-- [Luna Max 完整续作交接书](docs/luna-handoff-v1.md)
-- [Luna Max 当前交接书 v2](docs/luna-handoff-v2.md)
 - [实现计划](docs/implementation-plan-v2.md)
 - [用户决策](docs/user-decisions-v1.md)
 - [ADR-0001：双证据日志](docs/architecture-decisions/ADR-0001-dual-evidence-journal.md)
