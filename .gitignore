@@ -9,6 +9,7 @@ src-tauri/gen/
 *.log
 output/local/
 output/playwright/.playwright-cli/
+output/playwright/*.png
 .playwright-cli/
 artifacts/
 .idea/

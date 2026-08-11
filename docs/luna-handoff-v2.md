@@ -4,7 +4,7 @@
 
 ## 任务边界
 
-继续 `D:\Code-D\FolioHelm` 的 Windows Mock/Paper/Dry Run 版本。不要访问
+继续 `<repo-root>` 的 Windows Mock/Paper/Dry Run 版本。不要访问
 Schwab Developer Portal，不要添加 OAuth、App Key、Secret、Access Token、
 Refresh Token，不要抓取网页，不要实现或调用 Place/Cancel/Replace。
 
@@ -21,8 +21,9 @@ Refresh Token，不要抓取网页，不要实现或调用 Place/Cancel/Replace�
 开始工作前先运行：
 
 ```powershell
-git -c safe.directory=D:/Code-D/FolioHelm status --short --branch
-git -c safe.directory=D:/Code-D/FolioHelm log --oneline -8
+$repoRoot = (Get-Location).Path
+git -c safe.directory="$repoRoot" status --short --branch
+git -c safe.directory="$repoRoot" log --oneline -8
 npm test
 npm run build
 ```
@@ -30,9 +31,10 @@ npm run build
 每个稳定阶段都要：
 
 ```powershell
-git -c safe.directory=D:/Code-D/FolioHelm diff --check
-git -c safe.directory=D:/Code-D/FolioHelm add -A
-git -c safe.directory=D:/Code-D/FolioHelm commit -m "checkpoint: describe stage"
+$repoRoot = (Get-Location).Path
+git -c safe.directory="$repoRoot" diff --check
+git -c safe.directory="$repoRoot" add -A
+git -c safe.directory="$repoRoot" commit -m "checkpoint: describe stage"
 ```
 
 不推送远程，不创建远程仓库，不提交凭据和构建私密材料。

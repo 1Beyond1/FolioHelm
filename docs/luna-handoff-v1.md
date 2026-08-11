@@ -9,7 +9,7 @@
 把下面整段原样交给 Luna：
 
 ~~~text
-你正在继续 D:\Code-D\FolioHelm 项目。先完整阅读：
+你正在继续 `<repo-root>` 项目。先完整阅读：
 1. docs/luna-handoff-v1.md
 2. docs/user-decisions-v1.md
 3. docs/implementation-plan-v2.md
@@ -18,8 +18,8 @@
 6. docs/security/evidence-threat-model-v1.md
 
 先做只读检查，不要立刻重构：
-- 确认 cwd 是 D:\Code-D\FolioHelm。
-- 用 rg --files 查看结构；不要广泛扫描 C:\Users\16873。
+- 确认 cwd 是 `<repo-root>`。
+- 用 rg --files 查看结构；不要广泛扫描 `<user-profile>`。
 - 运行 npm test、npm run build、cargo fmt --check、cargo test --locked、cargo clippy --locked --all-targets --all-features -- -D warnings。
 - 检查 src-tauri\target\release\foliohelm.exe 是否存在。
 - 汇报实际结果、失败命令和当前文件状态。
@@ -80,7 +80,7 @@ FolioHelm 是一个非官方、开源、本地优先的 Charles Schwab Windows �
 
 当前 Release：
 
-- 路径：`D:\Code-D\FolioHelm\src-tauri\target\release\foliohelm.exe`
+- 路径：`<repo-root>\src-tauri\target\release\foliohelm.exe`
 - 大小：8,679,936 bytes
 - 构建时间：2026-08-10 00:52:07
 - SHA-256：`06CE2019D66A76CA4A8C7760E2B340E21EBF52B55C2033F2179277E98F13B1DF`
@@ -168,7 +168,7 @@ FolioHelm 是一个非官方、开源、本地优先的 Charles Schwab Windows �
 
 ## 5. 标准验证命令
 
-所有命令在 `D:\Code-D\FolioHelm` 的 PowerShell 执行。
+所有命令在 `<repo-root>` 的 PowerShell 执行。
 
 ~~~powershell
 npm test
@@ -215,7 +215,7 @@ if ($listener) {
 }
 ~~~
 
-只有命令行明确属于 `D:\Code-D\FolioHelm\node_modules\...\vite` 时，才可以：
+只有命令行明确属于 `<repo-root>\node_modules\...\vite` 时，才可以：
 
 ~~~powershell
 Stop-Process -Id <已核验 PID>
@@ -228,7 +228,7 @@ Get-CimInstance Win32_Process -Filter "Name='foliohelm.exe'" |
   Select-Object ProcessId,ExecutablePath,CommandLine
 ~~~
 
-只停止路径明确位于 `D:\Code-D\FolioHelm\src-tauri\target\debug` 或 `release` 的进程。禁止 `Stop-Process -Name node -Force` 这种宽泛操作。
+只停止路径明确位于 `<repo-root>\src-tauri\target\debug` 或 `release` 的进程。禁止 `Stop-Process -Name node -Force` 这种宽泛操作。
 
 ## 7. 工作包 FH-LUNA-101：独立 Release 启动验收
 
@@ -242,7 +242,7 @@ Get-CimInstance Win32_Process -Filter "Name='foliohelm.exe'" |
 2. 重新构建 Release。
 3. 按第 6 节精确识别并停止 FolioHelm 开发 Vite 进程；不要停止其他 Node。
 4. 确认 `http://127.0.0.1:1420` 已不可访问。
-5. 启动 `D:\Code-D\FolioHelm\src-tauri\target\release\foliohelm.exe`。
+5. 启动 `<repo-root>\src-tauri\target\release\foliohelm.exe`。
 6. 等待窗口可响应，确认标题为 FolioHelm。
 7. 在不启动 Vite 的情况下人工点击：首页 → 市场 → AAPL → 交易；首页 → 投资组合；订单；设置。
 8. 关闭保护只检查弹窗，不实际关闭。

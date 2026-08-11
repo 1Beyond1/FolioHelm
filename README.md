@@ -18,6 +18,18 @@ FolioHelm 是一个非官方的 Charles Schwab 本地优先 Windows 桌面客户
 
 明确未实现：Schwab OAuth/API、真实行情、真实下单、SQLCipher 持久化和远端证据服务。当前证据日志仅是本地 Mock 版本的浏览器存储 Hash Chain；项目不应被描述为具备真实券商或完整金融审计能力。
 
+## 界面预览
+
+以下截图来自本地 Mock 演示，统一采用 16:9 比例；其中的行情、持仓和订单内容均为虚构数据。
+
+![首页](docs/images/home-16x9.jpg)
+
+![市场页](docs/images/market-16x9.jpg)
+
+![个股详情与图表悬浮](docs/images/instrument-hover-16x9.jpg)
+
+![交易工作区弹窗](docs/images/trade-modal-16x9.jpg)
+
 ## 技术栈
 
 - Tauri 2
