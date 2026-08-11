@@ -75,8 +75,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 设计资料
 
-- [实现计划](docs/implementation-plan-v2.md)
-- [用户决策](docs/user-decisions-v1.md)
 - [ADR-0001：双证据日志](docs/architecture-decisions/ADR-0001-dual-evidence-journal.md)
 - [安全策略](SECURITY.md)
 - [贡献指南](CONTRIBUTING.md)

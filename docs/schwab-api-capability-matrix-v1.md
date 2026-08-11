@@ -144,7 +144,7 @@ FolioHelm 支持“看起来实时”的行情界面；自动化和高频交易�
 
 ## 7. Phase 0 官方核验清单
 
-用户的 Developer App 获批后，由主模型执行并归档脱敏结果：
+用户的 Developer App 获批后，由项目维护者执行并归档脱敏结果：
 
 - [ ] Product 名称、Individual / Commercial 定义和开源分发条件。
 - [ ] 所有 MVP Endpoint、HTTP Method、Host、Schema 和错误结构。
