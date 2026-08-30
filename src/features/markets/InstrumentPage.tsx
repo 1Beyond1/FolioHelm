@@ -235,7 +235,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
   }, []);
 
   return (
-    <div className="instrument-page" data-testid="instrument-page">
+    <main className="instrument-page" data-testid="instrument-page">
       <button type="button" className="instrument-back-button" data-testid="instrument-back" onClick={onBack}>
         <BackIcon />
         <span>{copy.backToMarkets}</span>
@@ -394,6 +394,6 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
           ))}
         </div>
       </section>
-    </div>
+    </main>
   );
 }

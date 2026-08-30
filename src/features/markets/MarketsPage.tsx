@@ -94,7 +94,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
   }, [marketSecurities, moverMode]);
 
   return (
-    <div className="markets-page" data-testid="markets-page">
+    <main className="markets-page" data-testid="markets-page">
       <header className="markets-heading">
         <div className="markets-heading-copy">
           <span className="markets-kicker">{copy.marketDesk}</span>
@@ -320,6 +320,6 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
           <p className="markets-movers-note">{copy.fictionalDataDescription}</p>
         </aside>
       </div>
-    </div>
+    </main>
   );
 }

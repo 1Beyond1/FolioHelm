@@ -2,6 +2,7 @@ import { useMemo, useState, type KeyboardEvent } from "react";
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { MOCK_BROKER } from "../../domain/mockBroker";
+import { DataStateNotice } from "../../components/DataStateNotice";
 import "./portfolio.css";
 
 export interface PortfolioPageProps {
@@ -466,6 +467,11 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                   </td>
                 </tr>
               ))}
+              {sortedHoldings.length === 0 && (
+                <tr className="fh-empty-row">
+                  <td colSpan={9}><DataStateNotice language={language} status="no-data" compact /></td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

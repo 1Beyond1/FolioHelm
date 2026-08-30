@@ -13,6 +13,8 @@ interface AppShellProps {
   onLanguageChange: (language: Language) => void;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  persistenceWarning?: string;
+  onDismissPersistenceWarning?: () => void;
   children: ReactNode;
 }
 
@@ -23,6 +25,8 @@ export function AppShell({
   onLanguageChange,
   onNavigate,
   onSearch,
+  persistenceWarning,
+  onDismissPersistenceWarning,
   children,
 }: AppShellProps) {
   return (
@@ -36,7 +40,13 @@ export function AppShell({
         onSearch={onSearch}
       />
       <SystemStatusBar copy={copy} />
-      <main>{children}</main>
+      {persistenceWarning && (
+        <section className="persistence-warning" role="alert">
+          <span>{persistenceWarning}</span>
+          <button type="button" onClick={onDismissPersistenceWarning}>{copy.dismiss}</button>
+        </section>
+      )}
+      <div className="app-content">{children}</div>
       <Footer copy={copy} />
     </div>
   );

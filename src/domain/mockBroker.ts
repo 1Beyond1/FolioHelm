@@ -379,6 +379,7 @@ export class MockBroker implements BrokerAdapter {
   readonly capabilities = capabilities;
   private snapshot: BrokerSnapshot = BASE_SNAPSHOT;
   private readonly previews = new Map<string, MockPreview>();
+  private readonly listeners = new Set<() => void>();
   private sequence = 0;
   private scenario: MockScenario = "healthy";
 
@@ -390,8 +391,19 @@ export class MockBroker implements BrokerAdapter {
     return this.scenario;
   }
 
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notify(): void {
+    for (const listener of [...this.listeners]) listener();
+  }
+
   setScenario(scenario: MockScenario): void {
+    if (this.scenario === scenario) return;
     this.scenario = scenario;
+    this.notify();
   }
 
   reset(): void {
@@ -399,6 +411,7 @@ export class MockBroker implements BrokerAdapter {
     this.previews.clear();
     this.sequence = 0;
     this.scenario = "healthy";
+    this.notify();
   }
 
   previewOrder(draft: OrderDraft): MockPreview {
@@ -464,6 +477,7 @@ export class MockBroker implements BrokerAdapter {
       ],
     };
     this.snapshot = { ...this.snapshot, orders: [order, ...this.snapshot.orders] };
+    this.notify();
     return order;
   }
 
@@ -479,6 +493,7 @@ export class MockBroker implements BrokerAdapter {
       events: [...order.events, orderEvent("accepted", nowIso(), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
     };
     this.snapshot = { ...this.snapshot, orders: this.snapshot.orders.map((item) => item.id === orderId ? reconciled : item) };
+    this.notify();
     return reconciled;
   }
 

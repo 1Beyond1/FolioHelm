@@ -59,6 +59,8 @@ export interface Copy {
   noData: string;
   dataAvailable: string;
   demoFooter: string;
+  localStorageWarning: string;
+  dismiss: string;
 }
 
 const COPY: Record<Language, Copy> = {
@@ -121,6 +123,8 @@ const COPY: Record<Language, Copy> = {
     noData: "No data",
     dataAvailable: "Mock data",
     demoFooter: "FolioHelm demo · Fictional data only · Apache-2.0",
+    localStorageWarning: "Local changes cannot be saved right now. The app will keep working in memory, but changes may be lost when it closes.",
+    dismiss: "Dismiss",
   },
   zh: {
     home: "首页",
@@ -181,6 +185,8 @@ const COPY: Record<Language, Copy> = {
     noData: "暂无数据",
     dataAvailable: "模拟数据",
     demoFooter: "FolioHelm 演示 · 仅虚构数据 · Apache-2.0",
+    localStorageWarning: "当前无法保存本地更改。应用仍可在内存中继续运行，但关闭后更改可能丢失。",
+    dismiss: "知道了",
   },
 };
 

@@ -146,6 +146,7 @@ export interface BrokerAdapter {
   readonly mode: BrokerMode;
   readonly capabilities: BrokerCapabilities;
   getSnapshot(): BrokerSnapshot;
+  subscribe(listener: () => void): () => void;
   previewOrder(draft: OrderDraft): MockPreview;
   consumePreview(previewId: string, draftHash: string): BrokerOrder;
 }

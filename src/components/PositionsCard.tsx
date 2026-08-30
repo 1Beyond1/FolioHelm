@@ -1,6 +1,7 @@
 import type { Copy } from "../i18n";
 import { formatCurrency, formatSignedCurrency } from "../formatters";
 import type { Language, Position } from "../types";
+import { DataStateNotice } from "./DataStateNotice";
 
 interface PositionsCardProps {
   copy: Copy;
@@ -18,7 +19,9 @@ export function PositionsCard({ copy, language, positions, onOpenInstrument, onV
         <button type="button" onClick={onViewAll}>{copy.viewAll} <span>↗</span></button>
       </div>
       <div className="positions-list">
-        {positions.map((position) => (
+        {positions.length === 0 ? (
+          <DataStateNotice language={language} status="no-data" compact />
+        ) : positions.map((position) => (
           <button className="position-row" type="button" key={position.ticker} onClick={() => onOpenInstrument(position.ticker)}>
             <span className={`asset-icon ${position.iconClass}`}>{position.ticker.slice(0, 1)}</span>
             <span className="asset-name"><b>{position.ticker}</b><small>{position.company}</small></span>

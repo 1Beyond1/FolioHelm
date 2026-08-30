@@ -6,6 +6,7 @@ import { clearFolioHelmStored, readStored, writeStored } from "../../platform/st
 import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
+import { Modal } from "../../components/Modal";
 import "./SettingsPage.css";
 
 export interface SettingsPageProps {
@@ -286,31 +287,6 @@ export function SettingsPage({
   useEffect(() => {
     onModalStateChange(settingsModalOpen);
   }, [onModalStateChange, settingsModalOpen]);
-
-  useEffect(() => {
-    if (!settingsModalOpen) return undefined;
-    const dialog = document.querySelector<HTMLElement>(".settings-modal[role='dialog']");
-    dialog?.focus();
-    return undefined;
-  }, [settingsModalOpen]);
-
-  useEffect(() => {
-    if (!settingsModalOpen) return undefined;
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      if (pendingKey !== null) {
-        handleCancelDisable();
-      } else if (clearDataDialogOpen) {
-        setClearDataDialogOpen(false);
-      } else {
-        setConnectionDialogOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [clearDataDialogOpen, pendingKey, settingsModalOpen]);
 
   function downloadEvidence(serialized: string): void {
     const blob = new Blob([serialized], { type: "application/json" });
@@ -612,98 +588,95 @@ export function SettingsPage({
       </section>
 
       {connectionDialogOpen && (
-        <div className="settings-modal-backdrop" role="presentation" onClick={() => setConnectionDialogOpen(false)}>
-          <section
-            className="settings-modal"
-            role="dialog"
-            aria-modal="true"
-            tabIndex={-1}
-            aria-labelledby="settings-connection-dialog-title"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <span className="settings-badge settings-badge--lime">{copy.demoOnly}</span>
-            <h2 id="settings-connection-dialog-title">{copy.connectionDialogTitle}</h2>
-            <p>{copy.connectionDialogBody}</p>
-            <button className="settings-button settings-button--primary" type="button" onClick={() => setConnectionDialogOpen(false)}>{copy.close}</button>
-          </section>
-        </div>
+        <Modal
+          className="settings-modal"
+          backdropClassName="settings-modal-backdrop"
+          labelledBy="settings-connection-dialog-title"
+          onClose={() => setConnectionDialogOpen(false)}
+        >
+          <span className="settings-badge settings-badge--lime">{copy.demoOnly}</span>
+          <h2 id="settings-connection-dialog-title">{copy.connectionDialogTitle}</h2>
+          <p>{copy.connectionDialogBody}</p>
+          <button className="settings-button settings-button--primary" type="button" onClick={() => setConnectionDialogOpen(false)}>{copy.close}</button>
+        </Modal>
       )}
 
       {pendingKey !== null && pendingDefinition && (
-        <div className="settings-modal-backdrop settings-risk-backdrop" role="presentation">
-          <section
-            className="settings-modal settings-risk-modal"
-            role="dialog"
-            aria-modal="true"
-            tabIndex={-1}
-            aria-labelledby="settings-risk-dialog-title"
-          >
-            <span className="settings-badge settings-badge--warning">{copy.riskDialogIntro}</span>
-            <h2 id="settings-risk-dialog-title">{copy.riskDialogTitle}</h2>
-            <p>{copy.riskDialogBody}</p>
-            <p className="settings-risk-modal__target"><strong>{pendingDefinition.label}</strong></p>
+        <Modal
+          className="settings-modal settings-risk-modal"
+          backdropClassName="settings-modal-backdrop settings-risk-backdrop"
+          labelledBy="settings-risk-dialog-title"
+          closeOnBackdrop={false}
+          onClose={handleCancelDisable}
+        >
+          <span className="settings-badge settings-badge--warning">{copy.riskDialogIntro}</span>
+          <h2 id="settings-risk-dialog-title">{copy.riskDialogTitle}</h2>
+          <p>{copy.riskDialogBody}</p>
+          <p className="settings-risk-modal__target"><strong>{pendingDefinition.label}</strong></p>
 
-            <div className="settings-risk-scroll" role="region" aria-label={copy.riskDetails} tabIndex={0}>
-              <h3>{copy.riskDetails}</h3>
-              <p>{copy.riskDetailOne}</p>
-              <p>{copy.riskDetailTwo}</p>
-              <p>{copy.riskDetailThree}</p>
-            </div>
+          <div className="settings-risk-scroll" role="region" aria-label={copy.riskDetails} tabIndex={0}>
+            <h3>{copy.riskDetails}</h3>
+            <p>{copy.riskDetailOne}</p>
+            <p>{copy.riskDetailTwo}</p>
+            <p>{copy.riskDetailThree}</p>
+          </div>
 
-            <label className="settings-check-line">
+          <label className="settings-check-line">
+            <input
+              type="checkbox"
+              checked={readToBottom}
+              onChange={(event) => setReadToBottom(event.target.checked)}
+            />
+            <span>{copy.readDetails}</span>
+          </label>
+
+          <p className="settings-countdown" aria-live="polite" data-testid="disable-countdown">{countdownText}</p>
+
+          {needsDisablePhrase && (
+            <label className="settings-field">
+              <span>{copy.typeDisable}</span>
               <input
-                type="checkbox"
-                checked={readToBottom}
-                onChange={(event) => setReadToBottom(event.target.checked)}
+                type="text"
+                value={disablePhrase}
+                aria-label={copy.typeDisable}
+                autoComplete="off"
+                onChange={(event) => setDisablePhrase(event.target.value)}
               />
-              <span>{copy.readDetails}</span>
             </label>
+          )}
 
-            <p className="settings-countdown" aria-live="polite" data-testid="disable-countdown">{countdownText}</p>
+          <label className="settings-check-line">
+            <input
+              type="checkbox"
+              data-testid="confirm-disable-intent"
+              checked={confirmIntent}
+              onChange={(event) => setConfirmIntent(event.target.checked)}
+            />
+            <span>{copy.confirmIntent}</span>
+          </label>
 
-            {needsDisablePhrase && (
-              <label className="settings-field">
-                <span>{copy.typeDisable}</span>
-                <input
-                  type="text"
-                  value={disablePhrase}
-                  aria-label={copy.typeDisable}
-                  autoComplete="off"
-                  onChange={(event) => setDisablePhrase(event.target.value)}
-                />
-              </label>
-            )}
-
-            <label className="settings-check-line">
-              <input
-                type="checkbox"
-                data-testid="confirm-disable-intent"
-                checked={confirmIntent}
-                onChange={(event) => setConfirmIntent(event.target.checked)}
-              />
-              <span>{copy.confirmIntent}</span>
-            </label>
-
-            <div className="settings-modal__actions">
-              <button className="settings-button settings-button--secondary" type="button" onClick={handleCancelDisable}>{copy.cancel}</button>
-              <button className="settings-button settings-button--primary" type="button" disabled={!canConfirm} onClick={handleConfirmDisable}>{copy.confirmDisable}</button>
-            </div>
-          </section>
-        </div>
+          <div className="settings-modal__actions">
+            <button className="settings-button settings-button--secondary" type="button" onClick={handleCancelDisable}>{copy.cancel}</button>
+            <button className="settings-button settings-button--primary" type="button" disabled={!canConfirm} onClick={handleConfirmDisable}>{copy.confirmDisable}</button>
+          </div>
+        </Modal>
       )}
 
       {clearDataDialogOpen && (
-        <div className="settings-modal-backdrop" role="presentation" onClick={() => setClearDataDialogOpen(false)}>
-          <section className="settings-modal" role="dialog" aria-modal="true" tabIndex={-1} aria-labelledby="settings-clear-data-title" onClick={(event) => event.stopPropagation()}>
-            <span className="settings-badge settings-badge--warning">{copy.clearData}</span>
-            <h2 id="settings-clear-data-title">{copy.clearDataTitle}</h2>
-            <p>{copy.clearDataBody}</p>
-            <div className="settings-modal__actions">
-              <button className="settings-button settings-button--secondary" type="button" onClick={() => setClearDataDialogOpen(false)}>{copy.cancel}</button>
-              <button className="settings-button settings-button--danger" type="button" onClick={clearLocalData}>{copy.confirmClear}</button>
-            </div>
-          </section>
-        </div>
+        <Modal
+          className="settings-modal"
+          backdropClassName="settings-modal-backdrop"
+          labelledBy="settings-clear-data-title"
+          onClose={() => setClearDataDialogOpen(false)}
+        >
+          <span className="settings-badge settings-badge--warning">{copy.clearData}</span>
+          <h2 id="settings-clear-data-title">{copy.clearDataTitle}</h2>
+          <p>{copy.clearDataBody}</p>
+          <div className="settings-modal__actions">
+            <button className="settings-button settings-button--secondary" type="button" onClick={() => setClearDataDialogOpen(false)}>{copy.cancel}</button>
+            <button className="settings-button settings-button--danger" type="button" onClick={clearLocalData}>{copy.confirmClear}</button>
+          </div>
+        </Modal>
       )}
     </main>
   );

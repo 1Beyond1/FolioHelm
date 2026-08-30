@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../../src/features/settings/SettingsPage";
 import { TradePage } from "../../src/features/trade/TradePage";
 import { MOCK_BROKER } from "../../src/domain/mockBroker";
+import { Modal } from "../../src/components/Modal";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -13,7 +14,16 @@ afterEach(() => {
 describe("TradePage", () => {
   it("provides an explicit close action and Escape shortcut without simulating anything", () => {
     const onClose = vi.fn();
-    render(<TradePage language="en" initialSymbol="AAPL" onClose={onClose} onViewOrders={() => undefined} />);
+    render(
+      <Modal
+        className="trade-modal-window"
+        backdropClassName="trade-modal-backdrop"
+        labelledBy="trade-page-title"
+        onClose={onClose}
+      >
+        <TradePage language="en" initialSymbol="AAPL" onClose={onClose} onViewOrders={() => undefined} />
+      </Modal>,
+    );
 
     fireEvent.click(screen.getByTestId("trade-close"));
     expect(onClose).toHaveBeenCalledTimes(1);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
 import { decimalCompare, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
@@ -233,15 +233,6 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const stepOrder: readonly TradeStep[] = ["ticket", "safety", "preview", "receipt"];
   const activeStepIndex = stepOrder.indexOf(step);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
-
   function invalidateCurrentPreview(): void {
     if (preview) MOCK_BROKER.invalidatePreview(preview.previewId);
     setPreview(null);
@@ -324,8 +315,6 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
     <section
       className="trade-page"
       data-testid="trade-page"
-      role="dialog"
-      aria-modal="true"
       aria-labelledby="trade-page-title"
     >
       <header className="trade-page__header">
