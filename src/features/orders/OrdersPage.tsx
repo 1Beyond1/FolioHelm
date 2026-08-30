@@ -155,7 +155,7 @@ function readOrders(language: Language): OrderRecord[] {
     timeline: order.events.map((event) => ({
       kind: event.kind,
       timestamp: new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
-      detail: event.detailEn,
+      detail: language === "zh" ? event.detailZh : event.detailEn,
     })),
   }));
 }
@@ -209,15 +209,6 @@ const COPY = {
       rejected: "Rejected",
       unknown: "Status unknown",
     },
-    eventDetails: {
-      draft: "Created from the trade ticket",
-      preview: "Estimated cost and buying power checked",
-      accepted: "Accepted by the demo venue",
-      fill: "Fill confirmed",
-      canceled: "Canceled by the account owner",
-      rejected: "Demo venue rejected the order",
-      unknown: "Venue acknowledgement is incomplete",
-    },
     doNotResubmit: "Do not resubmit",
   },
   zh: {
@@ -268,15 +259,6 @@ const COPY = {
       rejected: "已拒绝",
       unknown: "状态未知",
     },
-    eventDetails: {
-      draft: "从交易单创建",
-      preview: "已检查预计金额和购买力",
-      accepted: "模拟交易场所已接受",
-      fill: "已确认成交",
-      canceled: "账户所有者撤销",
-      rejected: "模拟交易场所拒绝了订单",
-      unknown: "交易场所确认信息不完整",
-    },
     doNotResubmit: "先对账，禁止重下",
   },
 } as const;
@@ -288,10 +270,6 @@ function formatMoney(value: number, language: Language): string {
 
 function formatQuantity(value: number, language: Language): string {
   return value.toLocaleString(language === "zh" ? "zh-CN" : "en-US", { maximumFractionDigits: 2 });
-}
-
-function formatEventDetail(event: OrderTimelineEvent, language: Language): string {
-  return COPY[language].eventDetails[event.kind];
 }
 
 export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
@@ -328,7 +306,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   }
 
   return (
-    <main className="fh-page fh-orders-page">
+    <main className="fh-page fh-orders-page" data-testid="orders-page">
       <header className="fh-page-header">
         <div>
           <p className="fh-eyebrow">{copy.eyebrow}</p>
@@ -521,7 +499,7 @@ function OrderRows({
                       <strong>{copy.eventKinds[event.kind]}</strong>
                       <time>{event.timestamp}</time>
                     </div>
-                    <p>{formatEventDetail(event, language)}</p>
+                    <p>{event.detail}</p>
                   </div>
                 </li>
               ))}

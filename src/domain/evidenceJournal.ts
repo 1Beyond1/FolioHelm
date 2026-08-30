@@ -3,6 +3,17 @@ import { readStored, removeStored, writeStored } from "../platform/storage";
 const SCHEMA_VERSION = 1;
 const GENESIS_HASH = "0".repeat(64);
 const STORAGE_KEY = "evidence-journal";
+const EVIDENCE_KINDS = [
+  "order_intent",
+  "user_confirmation",
+  "preview_created",
+  "mock_response",
+  "state_changed",
+  "reconciliation",
+  "automation_run",
+  "safety_setting_changed",
+] as const;
+const HASH_RE = /^[0-9a-f]{64}$/;
 
 export type LocalEvidenceKind =
   | "order_intent"
@@ -41,6 +52,14 @@ export interface EvidenceExportBundle {
   records: LocalEvidenceRecord[];
 }
 
+let appendQueue: Promise<void> = Promise.resolve();
+
+function enqueueJournalOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const next = appendQueue.then(operation);
+  appendQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === "object") {
@@ -71,8 +90,20 @@ function storedRecords(): LocalEvidenceRecord[] {
   return Array.isArray(records) ? records as LocalEvidenceRecord[] : [];
 }
 
+function isEvidenceKind(value: unknown): value is LocalEvidenceKind {
+  return typeof value === "string" && EVIDENCE_KINDS.includes(value as LocalEvidenceKind);
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.values(value as Record<string, unknown>).every((item) => typeof item === "string");
+}
+
 function rejectSensitiveFields(payload: Record<string, string>): void {
   const forbidden = /(secret|token|authorization|cookie|password|private.?key|app.?key|client.?id)/i;
+  if (!isStringRecord(payload)) throw new Error("Evidence payload must be a flat string map");
   for (const [key, value] of Object.entries(payload)) {
     if (forbidden.test(key) || forbidden.test(value)) {
       throw new Error(`Sensitive evidence field rejected: ${key}`);
@@ -93,13 +124,27 @@ function entryMaterial(record: Omit<LocalEvidenceRecord, "entryHash">): string {
   });
 }
 
-export async function verifyEvidence(records: readonly LocalEvidenceRecord[] = storedRecords()): Promise<EvidenceVerification> {
+async function verifyEvidenceNow(records: readonly LocalEvidenceRecord[]): Promise<EvidenceVerification> {
   let previousHash = GENESIS_HASH;
 
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index];
     if (!record || record.schemaVersion !== SCHEMA_VERSION) {
       return { valid: false, sequence: index, headHash: previousHash, reason: "Unsupported evidence schema" };
+    }
+    if (
+      typeof record.eventId !== "string"
+      || record.eventId.trim() === ""
+      || typeof record.occurredAtUtc !== "string"
+      || !Number.isFinite(Date.parse(record.occurredAtUtc))
+      || typeof record.appVersion !== "string"
+      || record.appVersion.trim() === ""
+      || !isEvidenceKind(record.kind)
+      || !isStringRecord(record.payload)
+      || !HASH_RE.test(record.previousHash)
+      || !HASH_RE.test(record.entryHash)
+    ) {
+      return { valid: false, sequence: index + 1, headHash: previousHash, reason: "Invalid evidence record shape" };
     }
     if (record.sequence !== index + 1) {
       return { valid: false, sequence: index + 1, headHash: previousHash, reason: "Sequence gap or reorder detected" };
@@ -122,7 +167,12 @@ export async function verifyEvidence(records: readonly LocalEvidenceRecord[] = s
   return { valid: true, sequence: records.length, headHash: previousHash };
 }
 
-export async function appendEvidence(
+/** Serialize verification with writes so a caller never verifies a half-written chain. */
+export function verifyEvidence(records?: readonly LocalEvidenceRecord[]): Promise<EvidenceVerification> {
+  return enqueueJournalOperation(() => verifyEvidenceNow(records ?? storedRecords()));
+}
+
+async function appendEvidenceNow(
   kind: LocalEvidenceKind,
   payload: Record<string, string>,
   appVersion = "0.1.0-mock",
@@ -130,7 +180,7 @@ export async function appendEvidence(
 ): Promise<LocalEvidenceRecord> {
   rejectSensitiveFields(payload);
   const records = storedRecords();
-  const verification = await verifyEvidence(records);
+  const verification = await verifyEvidenceNow(records);
   if (!verification.valid) throw new Error(`Evidence journal is invalid: ${verification.reason ?? "unknown error"}`);
 
   const sequence = records.length + 1;
@@ -145,13 +195,25 @@ export async function appendEvidence(
     previousHash: verification.headHash,
   };
   const record: LocalEvidenceRecord = { ...unsigned, entryHash: await sha256Hex(entryMaterial(unsigned)) };
-  writeStored(STORAGE_KEY, [...records, record]);
+  if (!writeStored(STORAGE_KEY, [...records, record])) {
+    throw new Error("Evidence journal could not be persisted; operation aborted");
+  }
   return record;
 }
 
-export async function exportEvidence(): Promise<string> {
+/** Serialize appends in this process so concurrent UI actions cannot fork the chain. */
+export function appendEvidence(
+  kind: LocalEvidenceKind,
+  payload: Record<string, string>,
+  appVersion = "0.1.0-mock",
+  occurredAtUtc = new Date().toISOString(),
+): Promise<LocalEvidenceRecord> {
+  return enqueueJournalOperation(() => appendEvidenceNow(kind, payload, appVersion, occurredAtUtc));
+}
+
+async function exportEvidenceNow(): Promise<string> {
   const records = storedRecords();
-  const verification = await verifyEvidence(records);
+  const verification = await verifyEvidenceNow(records);
   if (!verification.valid) throw new Error(`Evidence journal is invalid: ${verification.reason ?? "unknown error"}`);
 
   const bundle: EvidenceExportBundle = {
@@ -164,19 +226,32 @@ export async function exportEvidence(): Promise<string> {
   return JSON.stringify(bundle, null, 2);
 }
 
-export async function importEvidence(serialized: string): Promise<EvidenceVerification> {
+/** Wait for pending appends before taking an evidence snapshot for export. */
+export function exportEvidence(): Promise<string> {
+  return enqueueJournalOperation(exportEvidenceNow);
+}
+
+async function importEvidenceNow(serialized: string): Promise<EvidenceVerification> {
   const parsed = JSON.parse(serialized) as Partial<EvidenceExportBundle>;
   if (parsed.format !== "foliohelm-local-evidence" || parsed.schemaVersion !== SCHEMA_VERSION || parsed.mode !== "mock" || !Array.isArray(parsed.records)) {
     throw new Error("Unsupported FolioHelm evidence bundle");
   }
-  const verification = await verifyEvidence(parsed.records);
+  const verification = await verifyEvidenceNow(parsed.records);
   if (!verification.valid) throw new Error(`Imported evidence is invalid: ${verification.reason ?? "unknown error"}`);
-  writeStored(STORAGE_KEY, parsed.records);
+  if (!writeStored(STORAGE_KEY, parsed.records)) {
+    throw new Error("Evidence journal could not be persisted; import aborted");
+  }
   return verification;
 }
 
-export function clearEvidence(): void {
-  removeStored(STORAGE_KEY);
+/** Serialize imports with appends so an imported chain cannot be overwritten by a queued append. */
+export function importEvidence(serialized: string): Promise<EvidenceVerification> {
+  return enqueueJournalOperation(() => importEvidenceNow(serialized));
+}
+
+/** Clear only after earlier journal work settles, preventing a queued append from resurrecting data. */
+export function clearEvidence(): Promise<boolean> {
+  return enqueueJournalOperation(async () => removeStored(STORAGE_KEY));
 }
 
 export function evidenceCount(): number {

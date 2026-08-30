@@ -67,6 +67,9 @@ export function parseLocationHash(hash: string): AppLocation {
   const symbol = decodeSegment(symbolValue);
 
   if (route !== "trade") {
+    // An instrument route without a decodable symbol must not silently fall
+    // back to AAPL in the view layer. Return to the symbol picker instead.
+    if (route === "instrument" && !symbol) return { route: "markets" };
     return {
       route,
       symbol: route === "instrument" ? symbol : undefined,
@@ -96,6 +99,6 @@ export function sameLocation(left: AppLocation, right: AppLocation): boolean {
   return serializeLocation(left) === serializeLocation(right);
 }
 
-export function primaryRoute(route: AppRoute): Exclude<AppRoute, "instrument" | "settings"> | "markets" {
-  return route === "instrument" ? "markets" : route === "settings" ? "home" : route;
+export function primaryRoute(route: AppRoute): Exclude<AppRoute, "instrument" | "settings"> | "markets" | null {
+  return route === "instrument" ? "markets" : route === "settings" ? null : route;
 }

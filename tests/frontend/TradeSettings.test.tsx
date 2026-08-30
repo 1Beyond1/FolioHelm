@@ -1,9 +1,11 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../../src/features/settings/SettingsPage";
 import { TradePage } from "../../src/features/trade/TradePage";
+import { detectInitialLanguage } from "../../src/i18n";
 import { MOCK_BROKER } from "../../src/domain/mockBroker";
 import { Modal } from "../../src/components/Modal";
+import { STORAGE_PREFIX } from "../../src/platform/storage";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -84,6 +86,60 @@ describe("TradePage", () => {
     expect(screen.getByRole("heading", { name: "Ticket" })).toBeInTheDocument();
   });
 
+  it("keeps a stale-quote failure on the safety step instead of attaching it to quantity", () => {
+    MOCK_BROKER.setScenario("stale-quote");
+    render(<TradePage language="en" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("Quantity (whole shares)"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to Mock preview" }));
+
+    expect(screen.getByTestId("trade-safety")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/preview was blocked/i);
+    expect(screen.queryByTestId("trade-quantity-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("trade-check-quote")).toHaveAttribute("data-state", "blocked");
+  });
+
+  it("does not present an Unknown Mock outcome as a successful receipt", () => {
+    MOCK_BROKER.setScenario("unknown");
+    render(<TradePage language="en" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("Quantity (whole shares)"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to Mock preview" }));
+    fireEvent.click(screen.getByLabelText(/I understand this is a simulated order/));
+    fireEvent.click(screen.getByRole("button", { name: "Simulate order" }));
+
+    expect(screen.getByTestId("trade-receipt")).toHaveTextContent("Simulation result is unknown");
+    expect(screen.getByTestId("trade-receipt")).toHaveTextContent(/Do not resubmit/i);
+    expect(screen.getByTestId("trade-receipt")).not.toHaveTextContent("Simulation complete");
+  });
+
+  it("does not silently fall back to AAPL for an unsupported trade deep link", () => {
+    const onClose = vi.fn();
+    render(<TradePage language="en" initialSymbol="GOOG" onClose={onClose} onViewOrders={() => undefined} />);
+
+    expect(screen.getByTestId("trade-no-data")).toBeInTheDocument();
+    expect(screen.getByTestId("trade-no-data")).toHaveTextContent("No demo data for this symbol");
+    expect(screen.queryByLabelText("Quantity (whole shares)")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Simulate order" })).not.toBeInTheDocument();
+    expect(screen.queryByText("$226.34")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("trade-close"));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the actual buying-power gate before the Mock preview", () => {
+    MOCK_BROKER.setScenario("no-buying-power");
+    render(<TradePage language="en" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("Quantity (whole shares)"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    expect(screen.getByTestId("trade-check-buying-power")).toHaveAttribute("data-state", "blocked");
+    expect(screen.getByTestId("trade-check-buying-power")).toHaveTextContent(/Insufficient buying power/i);
+  });
+
   it("uses localized step labels in the Chinese trade workspace", () => {
     render(<TradePage language="zh" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
 
@@ -99,6 +155,31 @@ describe("TradePage", () => {
 });
 
 describe("SettingsPage", () => {
+  it("does not treat malformed persisted protection values as enabled", () => {
+    window.localStorage.setItem(`${STORAGE_PREFIX}protections`, JSON.stringify({
+      maxOrderValue: "false",
+      priceDeviation: 0,
+      autoLock: null,
+      accountAllowlist: "yes",
+    }));
+
+    render(<SettingsPage language="en" onLanguageChange={() => undefined} />);
+
+    expect(screen.getByRole("switch", { name: /Max order value: On/i })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: /Price deviation: On/i })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: /Auto lock: On/i })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: /Account allowlist: On/i })).toBeInTheDocument();
+  });
+
+  it("recovers when the persisted protection object is not an object", () => {
+    window.localStorage.setItem(`${STORAGE_PREFIX}protections`, JSON.stringify(null));
+
+    render(<SettingsPage language="en" onLanguageChange={() => undefined} />);
+
+    expect(screen.getByRole("switch", { name: /Max order value: On/i })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: /Account allowlist: On/i })).toBeInTheDocument();
+  });
+
   it("starts all optional protections on, exposes core rules, and forwards language changes", () => {
     const onLanguageChange = vi.fn();
     render(<SettingsPage language="en" onLanguageChange={onLanguageChange} />);
@@ -142,7 +223,7 @@ describe("SettingsPage", () => {
     fireEvent.click(confirmButton);
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByText(/optional protection is disabled/i)).toBeInTheDocument();
+    expect(screen.getByText(/optional protection preference is disabled/i)).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: /Max order value: Off/i })).toHaveAttribute("aria-checked", "false");
 
     fireEvent.click(screen.getByRole("switch", { name: /Max order value: Off/i }));
@@ -167,5 +248,43 @@ describe("SettingsPage", () => {
     expect(confirmButton).toBeEnabled();
     fireEvent.click(confirmButton);
     expect(screen.getByRole("switch", { name: /Price deviation: Off/i })).toBeInTheDocument();
+  });
+
+  it("resets in-memory preferences when local demo data is cleared", async () => {
+    const onLanguageChange = vi.fn();
+    const onThemeChange = vi.fn();
+
+    render(
+      <SettingsPage
+        language="en"
+        theme="dark"
+        onLanguageChange={onLanguageChange}
+        onThemeChange={onThemeChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear local demo data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear data" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(onLanguageChange).toHaveBeenCalledWith(detectInitialLanguage());
+    expect(onThemeChange).toHaveBeenCalledWith("system");
+  });
+
+  it("clears the parent modal state when the settings page unmounts", () => {
+    const onModalStateChange = vi.fn();
+    const { unmount } = render(
+      <SettingsPage
+        language="en"
+        onLanguageChange={() => undefined}
+        onModalStateChange={onModalStateChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(onModalStateChange).toHaveBeenLastCalledWith(true);
+
+    unmount();
+    expect(onModalStateChange).toHaveBeenLastCalledWith(false);
   });
 });

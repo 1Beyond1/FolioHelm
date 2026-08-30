@@ -1,5 +1,11 @@
-import { decimalAdd, decimalCompare, decimalMultiply, money, type Money, type Price, type Quantity } from "./decimal";
+import { decimalAdd, decimalCompare, decimalMultiply, money, price, quantity, type Money, type Price, type Quantity } from "./decimal";
 import type { BrokerOrderSide, BrokerSymbol } from "./contracts";
+
+const AUTOMATION_MODES: readonly AutomationMode[] = ["mock", "paper", "dry-run", "real"];
+const AUTOMATION_SCHEDULES: readonly AutomationSchedule[] = ["manual", "5m", "15m", "hourly", "daily"];
+const BROKER_SYMBOLS: readonly BrokerSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
+const ZERO_MONEY = money("0");
+const RATE_WINDOW_MS = 60_000;
 
 export type AutomationMode = "mock" | "paper" | "dry-run" | "real";
 export type AutomationSchedule = "manual" | "5m" | "15m" | "hourly" | "daily";
@@ -72,6 +78,26 @@ export interface AutomationState {
   logs: readonly AutomationRunLog[];
 }
 
+function isAutomationMode(value: unknown): value is AutomationMode {
+  return typeof value === "string" && AUTOMATION_MODES.includes(value as AutomationMode);
+}
+
+function isAutomationSchedule(value: unknown): value is AutomationSchedule {
+  return typeof value === "string" && AUTOMATION_SCHEDULES.includes(value as AutomationSchedule);
+}
+
+function isBrokerSymbol(value: unknown): value is BrokerSymbol {
+  return typeof value === "string" && BROKER_SYMBOLS.includes(value as BrokerSymbol);
+}
+
+function isBrokerOrderSide(value: unknown): value is BrokerOrderSide {
+  return value === "buy" || value === "sell";
+}
+
+function isAutomationRunStatus(value: unknown): value is AutomationRunStatus {
+  return value === "would-run" || value === "blocked" || value === "duplicate";
+}
+
 export const DEFAULT_AUTOMATION_STATE: AutomationState = {
   enabled: false,
   mode: "dry-run",
@@ -95,7 +121,7 @@ function cloneState(state: AutomationState): AutomationState {
   return {
     ...state,
     policy: { ...state.policy, allowedSymbols: [...state.policy.allowedSymbols] },
-    logs: [...state.logs],
+    logs: state.logs.map((log) => ({ ...log })),
   };
 }
 
@@ -109,11 +135,69 @@ function safeMoney(value: unknown, fallback: Money): Money {
   }
 }
 
+function safeInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return fallback;
+  return value < minimum || value > maximum ? fallback : value;
+}
+
+function normalizeLog(value: unknown): AutomationRunLog | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<AutomationRunLog>;
+  if (
+    typeof candidate.id !== "string"
+    || candidate.id.trim() === ""
+    || typeof candidate.at !== "string"
+    || !Number.isFinite(Date.parse(candidate.at))
+    || !isBrokerSymbol(candidate.symbol)
+    || !isBrokerOrderSide(candidate.side)
+    || !isAutomationMode(candidate.mode)
+    || !isAutomationRunStatus(candidate.status)
+    || typeof candidate.reason !== "string"
+    || typeof candidate.idempotencyKey !== "string"
+    || candidate.idempotencyKey.trim() === ""
+    || typeof candidate.quantity !== "string"
+    || typeof candidate.price !== "string"
+    || typeof candidate.amount !== "string"
+  ) return null;
+
+  try {
+    const normalizedQuantity = quantity(candidate.quantity);
+    const normalizedPrice = price(candidate.price);
+    const normalizedAmount = money(candidate.amount);
+    if (decimalCompare(normalizedQuantity, ZERO_MONEY) <= 0 || decimalCompare(normalizedPrice, ZERO_MONEY) <= 0) return null;
+    if (decimalCompare(normalizedAmount, decimalMultiply(normalizedQuantity, normalizedPrice)) !== 0) return null;
+    return {
+      id: candidate.id.trim().slice(0, 100),
+      at: new Date(candidate.at).toISOString(),
+      symbol: candidate.symbol,
+      side: candidate.side,
+      quantity: normalizedQuantity,
+      price: normalizedPrice,
+      amount: normalizedAmount,
+      mode: candidate.mode,
+      status: candidate.status,
+      reason: candidate.reason.slice(0, 500),
+      idempotencyKey: candidate.idempotencyKey.trim().slice(0, 200),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function nextLogId(logs: readonly AutomationRunLog[]): string {
+  const highest = logs.reduce((currentHighest, log) => {
+    const match = /^AUTO-(\d+)$/.exec(log.id);
+    const number = match ? Number(match[1]) : 0;
+    return Number.isSafeInteger(number) ? Math.max(currentHighest, number) : currentHighest;
+  }, 0);
+  return `AUTO-${String(highest + 1).padStart(5, "0")}`;
+}
+
 export class AutomationController {
   private state: AutomationState;
 
   constructor(initial: AutomationState = DEFAULT_AUTOMATION_STATE) {
-    this.state = cloneState(initial);
+    this.state = normalizeAutomationState(initial);
   }
 
   getState(): AutomationState {
@@ -121,7 +205,7 @@ export class AutomationController {
   }
 
   replaceState(next: AutomationState): void {
-    this.state = cloneState(next);
+    this.state = normalizeAutomationState(next);
   }
 
   tripKillSwitch(): AutomationState {
@@ -150,14 +234,31 @@ export class AutomationController {
     },
   ): { log: AutomationRunLog; state: AutomationState } {
     const at = input.at ?? new Date().toISOString();
-    const amount = decimalMultiply(input.quantity, input.price) as Money;
-    const existing = this.state.logs.find((log) => log.idempotencyKey === input.idempotencyKey);
+    const idempotencyKey = typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : "";
+    const symbol = isBrokerSymbol(input.symbol) ? input.symbol : "SPY";
+    const side = isBrokerOrderSide(input.side) ? input.side : "buy";
+    let normalizedQuantity = quantity("0");
+    let normalizedPrice = price("0");
+    let amount = ZERO_MONEY;
+    let validAmount = true;
+    try {
+      normalizedQuantity = quantity(input.quantity);
+      normalizedPrice = price(input.price);
+      amount = decimalMultiply(normalizedQuantity, normalizedPrice) as Money;
+      validAmount = decimalCompare(normalizedQuantity, ZERO_MONEY) > 0 && decimalCompare(normalizedPrice, ZERO_MONEY) > 0;
+    } catch {
+      validAmount = false;
+    }
+    const existing = idempotencyKey === "" ? undefined : this.state.logs.find((log) => log.idempotencyKey === idempotencyKey);
     let status: AutomationRunStatus = "would-run";
     let reason = "Recorded locally; no broker write exists in this build";
 
     if (existing) {
       status = "duplicate";
       reason = "Idempotency key was already processed; no second action was created";
+    } else if (idempotencyKey === "" || !isBrokerSymbol(input.symbol) || !isBrokerOrderSide(input.side)) {
+      status = "blocked";
+      reason = "Order input is invalid; action was blocked";
     } else if (!this.state.enabled) {
       status = "blocked";
       reason = "Automation is disabled";
@@ -167,6 +268,9 @@ export class AutomationController {
     } else if (this.state.mode === "real") {
       status = "blocked";
       reason = "Real Trading is unavailable until the Schwab API gate is completed";
+    } else if (!validAmount) {
+      status = "blocked";
+      reason = "Quantity and price must be positive decimals";
     } else if (!this.state.policy.allowedSymbols.includes(input.symbol)) {
       status = "blocked";
       reason = "Symbol is not on the explicit automation allowlist";
@@ -176,23 +280,29 @@ export class AutomationController {
     } else if (decimalCompare(decimalAdd(this.state.reservedToday, amount), this.state.policy.maxDailyValue) > 0) {
       status = "blocked";
       reason = "Daily value cap would be exceeded; remaining budget is frozen";
+    } else if (!Number.isFinite(Date.parse(at))) {
+      status = "blocked";
+      reason = "Run timestamp is invalid; action was blocked";
+    } else if (this.recentActionCount(Date.parse(at)) >= this.state.policy.maxActionsPerMinute) {
+      status = "blocked";
+      reason = "Maximum actions per minute reached; no new action was created";
     } else if (this.state.openTasks >= this.state.policy.maxOpenTasks) {
       status = "blocked";
       reason = "Backpressure: maximum concurrent task count reached";
     }
 
     const log: AutomationRunLog = {
-      id: `AUTO-${String(this.state.logs.length + 1).padStart(5, "0")}`,
+      id: nextLogId(this.state.logs),
       at,
-      symbol: input.symbol,
-      side: input.side,
-      quantity: input.quantity,
-      price: input.price,
+      symbol,
+      side,
+      quantity: normalizedQuantity,
+      price: normalizedPrice,
       amount,
       mode: this.state.mode,
       status,
       reason,
-      idempotencyKey: input.idempotencyKey,
+      idempotencyKey: idempotencyKey || `invalid-${nextLogId(this.state.logs)}`,
     };
 
     this.state = {
@@ -204,6 +314,15 @@ export class AutomationController {
 
     return { log, state: this.getState() };
   }
+
+  private recentActionCount(atMs: number): number {
+    const windowStart = atMs - RATE_WINDOW_MS;
+    return this.state.logs.filter((log) => {
+      if (log.status !== "would-run") return false;
+      const logAt = Date.parse(log.at);
+      return Number.isFinite(logAt) && logAt > windowStart && logAt <= atMs;
+    }).length;
+  }
 }
 
 export const AUTOMATION_CONTROLLER = new AutomationController();
@@ -212,18 +331,29 @@ export function normalizeAutomationState(value: unknown): AutomationState {
   if (!value || typeof value !== "object") return cloneState(DEFAULT_AUTOMATION_STATE);
   const candidate = value as Partial<AutomationState>;
   const policy = candidate.policy && typeof candidate.policy === "object" ? candidate.policy as Partial<AutomationPolicy> : {};
+  const allowedSymbols = Array.isArray(policy.allowedSymbols)
+    ? [...new Set(policy.allowedSymbols.filter(isBrokerSymbol))]
+    : [...DEFAULT_AUTOMATION_STATE.policy.allowedSymbols];
   return {
-    ...cloneState(DEFAULT_AUTOMATION_STATE),
-    ...candidate,
+    enabled: typeof candidate.enabled === "boolean" ? candidate.enabled : DEFAULT_AUTOMATION_STATE.enabled,
+    mode: isAutomationMode(candidate.mode) ? candidate.mode : DEFAULT_AUTOMATION_STATE.mode,
+    schedule: isAutomationSchedule(candidate.schedule) ? candidate.schedule : DEFAULT_AUTOMATION_STATE.schedule,
+    strategyName: typeof candidate.strategyName === "string" && candidate.strategyName.trim() !== ""
+      ? candidate.strategyName.trim().slice(0, 200)
+      : DEFAULT_AUTOMATION_STATE.strategyName,
+    killSwitchTripped: typeof candidate.killSwitchTripped === "boolean" ? candidate.killSwitchTripped : DEFAULT_AUTOMATION_STATE.killSwitchTripped,
     reservedToday: safeMoney(candidate.reservedToday, DEFAULT_AUTOMATION_STATE.reservedToday),
+    openTasks: safeInteger(candidate.openTasks, DEFAULT_AUTOMATION_STATE.openTasks, 0, 100_000),
     policy: {
-      ...DEFAULT_AUTOMATION_STATE.policy,
-      ...policy,
       maxOrderValue: safeMoney(policy.maxOrderValue, DEFAULT_AUTOMATION_STATE.policy.maxOrderValue),
       maxDailyValue: safeMoney(policy.maxDailyValue, DEFAULT_AUTOMATION_STATE.policy.maxDailyValue),
-      allowedSymbols: Array.isArray(policy.allowedSymbols) ? policy.allowedSymbols.filter((symbol): symbol is BrokerSymbol => typeof symbol === "string") : DEFAULT_AUTOMATION_STATE.policy.allowedSymbols,
+      maxOpenTasks: safeInteger(policy.maxOpenTasks, DEFAULT_AUTOMATION_STATE.policy.maxOpenTasks, 1, 100_000),
+      maxActionsPerMinute: safeInteger(policy.maxActionsPerMinute, DEFAULT_AUTOMATION_STATE.policy.maxActionsPerMinute, 1, 100_000),
+      allowedSymbols,
       regularSessionOnly: true,
     },
-    logs: Array.isArray(candidate.logs) ? candidate.logs as AutomationRunLog[] : [],
+    logs: Array.isArray(candidate.logs)
+      ? candidate.logs.map(normalizeLog).filter((log): log is AutomationRunLog => log !== null).slice(0, 100)
+      : [],
   };
 }

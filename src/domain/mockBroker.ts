@@ -2,6 +2,7 @@ import {
   decimalAdd,
   decimalCompare,
   decimalMultiply,
+  decimalSubtract,
   decimalToFixed,
   money,
   percent,
@@ -25,6 +26,8 @@ import type {
 
 const AS_OF = "2026-08-10T16:00:00Z";
 const PREVIEW_EXPIRY_MS = 60_000;
+const ZERO_PRICE = price("0");
+const ZERO_QUANTITY = quantity("0");
 
 const capabilities: BrokerCapabilities = {
   readQuotes: true,
@@ -294,35 +297,56 @@ function stableDraftHash(draft: OrderDraft): string {
   return [draft.symbol, draft.side, draft.type, draft.quantity, draft.limitPrice ?? "market"].join(":");
 }
 
-function nowIso(): string {
-  return AS_OF;
+function nowIso(clock: () => number = () => Date.now()): string {
+  const timestamp = clock();
+  const date = new Date(timestamp);
+  return Number.isFinite(timestamp) && Number.isFinite(date.getTime()) ? date.toISOString() : AS_OF;
 }
 
 function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): BrokerSnapshot {
   if (scenario === "healthy" || scenario === "request-failed" || scenario === "rate-limited" || scenario === "timeout" || scenario === "unknown" || scenario === "reconciliation-failed" || scenario === "insufficient-quantity" || scenario === "no-buying-power") {
     if (scenario === "no-buying-power") {
+      const holdingsValue = snapshot.holdings.reduce<Money>((total, holding) => decimalAdd(total, holding.marketValue) as Money, money("0"));
       return {
         ...snapshot,
-        account: { ...snapshot.account, cash: money("0"), buyingPower: money("0"), status: "available" },
+        account: { ...snapshot.account, cash: money("0"), buyingPower: money("0"), totalEquity: holdingsValue, status: "available" },
       };
     }
     return snapshot;
   }
 
   if (scenario === "empty-account") {
+    const cashOnlyValue = money("25000.00");
+    const portfolioChart: BrokerSnapshot["portfolioChart"] = {
+      "1D": snapshot.portfolioChart["1D"].map(() => cashOnlyValue),
+      "1W": snapshot.portfolioChart["1W"].map(() => cashOnlyValue),
+      "1M": snapshot.portfolioChart["1M"].map(() => cashOnlyValue),
+      "6M": snapshot.portfolioChart["6M"].map(() => cashOnlyValue),
+      "1Y": snapshot.portfolioChart["1Y"].map(() => cashOnlyValue),
+    };
+    const heatmap = snapshot.heatmap.map((entry) => ({
+      ...entry,
+      status: "no-data" as const,
+      activityLevel: 0 as const,
+      actions: 0,
+      dailyReturnPct: null,
+      dailyReturnUsd: null,
+    }));
     return {
       ...snapshot,
       account: {
         ...snapshot.account,
-        cash: money("25000.00"),
-        buyingPower: money("25000.00"),
-        totalEquity: money("25000.00"),
+        cash: cashOnlyValue,
+        buyingPower: cashOnlyValue,
+        totalEquity: cashOnlyValue,
         todayChange: money("0"),
         todayChangePct: percent("0"),
         allTimeChange: money("0"),
       },
       holdings: [],
       orders: [],
+      portfolioChart,
+      heatmap,
       activeDays: 0,
       ordersFilled: 0,
       yearNetChange: money("0"),
@@ -330,10 +354,24 @@ function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): Bro
   }
 
   if (scenario === "loss") {
+    const reverseAndAnchor = (points: readonly Money[]): readonly Money[] => {
+      const reversed = [...points].reverse();
+      if (reversed.length === 0) return reversed;
+      const offset = decimalSubtract(snapshot.account.totalEquity, reversed[reversed.length - 1]!) as Money;
+      return reversed.map((point) => decimalAdd(point, offset) as Money);
+    };
+    const portfolioChart: BrokerSnapshot["portfolioChart"] = {
+      "1D": reverseAndAnchor(snapshot.portfolioChart["1D"]),
+      "1W": reverseAndAnchor(snapshot.portfolioChart["1W"]),
+      "1M": reverseAndAnchor(snapshot.portfolioChart["1M"]),
+      "6M": reverseAndAnchor(snapshot.portfolioChart["6M"]),
+      "1Y": reverseAndAnchor(snapshot.portfolioChart["1Y"]),
+    };
     return {
       ...snapshot,
       account: { ...snapshot.account, todayChange: money("-1820.34"), todayChangePct: percent("-1.18"), allTimeChange: money("-4210.80") },
       holdings: snapshot.holdings.map((holding) => ({ ...holding, dayPnl: decimalMultiply(holding.dayPnl, money("-1")) as Money, totalPnl: decimalMultiply(holding.totalPnl, money("-1")) as Money })),
+      portfolioChart,
       yearNetChange: money("-4210.80"),
     };
   }
@@ -368,9 +406,46 @@ function scenarioError(scenario: MockScenario): MockBrokerError | undefined {
     case "request-failed": return new MockBrokerError("request-failed", "Mock request failed deterministically");
     case "rate-limited": return new MockBrokerError("rate-limited", "Mock rate limit reached; no retry is scheduled");
     case "timeout": return new MockBrokerError("timeout", "Mock request timed out; outcome is not known");
+    case "stale-quote": return new MockBrokerError("stale-quote", "Mock quote is stale; preview is blocked");
     case "market-closed": return new MockBrokerError("market-closed", "Mock regular session is closed");
     default: return undefined;
   }
+}
+
+function cloneSnapshot(snapshot: BrokerSnapshot): BrokerSnapshot {
+  return {
+    ...snapshot,
+    account: { ...snapshot.account },
+    quotes: snapshot.quotes.map((item) => ({ ...item })),
+    holdings: snapshot.holdings.map((item) => ({ ...item })),
+    orders: snapshot.orders.map((order) => ({
+      ...order,
+      events: order.events.map((event) => ({ ...event })),
+    })),
+    portfolioChart: {
+      "1D": [...snapshot.portfolioChart["1D"]],
+      "1W": [...snapshot.portfolioChart["1W"]],
+      "1M": [...snapshot.portfolioChart["1M"]],
+      "6M": [...snapshot.portfolioChart["6M"]],
+      "1Y": [...snapshot.portfolioChart["1Y"]],
+    },
+    heatmap: snapshot.heatmap.map((entry) => ({ ...entry })),
+  };
+}
+
+function clonePreview(preview: MockPreview): MockPreview {
+  return {
+    ...preview,
+    draft: { ...preview.draft },
+    quote: { ...preview.quote },
+  };
+}
+
+function cloneOrder(order: BrokerOrder): BrokerOrder {
+  return {
+    ...order,
+    events: order.events.map((event) => ({ ...event })),
+  };
 }
 
 export class MockBroker implements BrokerAdapter {
@@ -379,12 +454,15 @@ export class MockBroker implements BrokerAdapter {
   readonly capabilities = capabilities;
   private snapshot: BrokerSnapshot = BASE_SNAPSHOT;
   private readonly previews = new Map<string, MockPreview>();
+  private readonly previewIssuedAt = new Map<string, number>();
   private readonly listeners = new Set<() => void>();
   private sequence = 0;
   private scenario: MockScenario = "healthy";
 
+  constructor(private readonly clock: () => number = () => Date.now()) {}
+
   getSnapshot(): BrokerSnapshot {
-    return scenarioSnapshot(this.snapshot, this.scenario);
+    return cloneSnapshot(scenarioSnapshot(this.snapshot, this.scenario));
   }
 
   getScenario(): MockScenario {
@@ -409,6 +487,7 @@ export class MockBroker implements BrokerAdapter {
   reset(): void {
     this.snapshot = BASE_SNAPSHOT;
     this.previews.clear();
+    this.previewIssuedAt.clear();
     this.sequence = 0;
     this.scenario = "healthy";
     this.notify();
@@ -418,20 +497,44 @@ export class MockBroker implements BrokerAdapter {
     const fault = scenarioError(this.scenario);
     if (fault) throw fault;
 
-    const quote = this.snapshot.quotes.find((item) => item.symbol === draft.symbol);
+    try {
+      const validSide = draft.side === "buy" || draft.side === "sell";
+      const validType = draft.type === "market" || draft.type === "limit";
+      const validQuantity = decimalCompare(draft.quantity, ZERO_QUANTITY) > 0;
+      const validLimit = draft.limitPrice === null || decimalCompare(draft.limitPrice, ZERO_PRICE) > 0;
+      const typeMatchesPrice = draft.type === "market" ? draft.limitPrice === null : draft.limitPrice !== null;
+      if (!validSide || !validType || !validQuantity || !validLimit || !typeMatchesPrice) {
+        throw new MockBrokerError("invalid-order", "Mock order input is invalid; preview was blocked");
+      }
+    } catch (error) {
+      if (error instanceof MockBrokerError) throw error;
+      throw new MockBrokerError("invalid-order", "Mock order input is invalid; preview was blocked");
+    }
+
+    const snapshot = this.getSnapshot();
+    const quote = snapshot.quotes.find((item) => item.symbol === draft.symbol);
     if (!quote) throw new Error(`No mock quote for ${draft.symbol}`);
+    if (quote.status !== "available") {
+      throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
+    }
 
     const unitPrice = draft.limitPrice ?? quote.price;
     const estimatedAmount = decimalMultiply(unitPrice, draft.quantity) as Money;
-    if (this.scenario === "no-buying-power" || decimalCompare(estimatedAmount, this.snapshot.account.buyingPower) > 0) {
+    if (draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
     if (this.scenario === "insufficient-quantity") {
       throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
     }
+    if (draft.side === "sell") {
+      const holding = snapshot.holdings.find((item) => item.symbol === draft.symbol);
+      if (!holding || decimalCompare(draft.quantity, holding.quantity) > 0) {
+        throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+      }
+    }
     const draftHash = stableDraftHash(draft);
     const previewId = `MOCK-PREVIEW-${draft.symbol}-${++this.sequence}`;
-    const createdAt = nowIso();
+    const createdAt = nowIso(this.clock);
     const preview: MockPreview = {
       previewId,
       draftHash,
@@ -443,7 +546,12 @@ export class MockBroker implements BrokerAdapter {
       status: "preview",
     };
     this.previews.set(previewId, preview);
-    return preview;
+    const issuedAt = this.clock();
+    this.previewIssuedAt.set(
+      previewId,
+      Number.isFinite(issuedAt) && Number.isFinite(new Date(issuedAt).getTime()) ? issuedAt : Date.parse(createdAt),
+    );
+    return clonePreview(preview);
   }
 
   consumePreview(previewId: string, draftHash: string): BrokerOrder {
@@ -452,14 +560,44 @@ export class MockBroker implements BrokerAdapter {
 
     const preview = this.previews.get(previewId);
     if (!preview || preview.status !== "preview") throw new Error("Mock preview is missing, expired, or already consumed");
+    const issuedAt = this.previewIssuedAt.get(previewId);
+    if (issuedAt !== undefined && this.clock() - issuedAt >= PREVIEW_EXPIRY_MS) {
+      preview.status = "invalidated";
+      this.previewIssuedAt.delete(previewId);
+      throw new MockBrokerError("preview-expired", "Mock preview expired; create a new preview before continuing");
+    }
     if (preview.draftHash !== draftHash) throw new Error("Mock preview does not match the current draft");
+
+    // The account and quote can change while a preview is on screen. Recheck
+    // the same local gates at consumption time so a stale preview cannot
+    // bypass a newly selected safety scenario.
+    const snapshot = this.getSnapshot();
+    const quote = snapshot.quotes.find((item) => item.symbol === preview.draft.symbol);
+    if (!quote || quote.status !== "available") {
+      throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
+    }
+    const estimatedAmount = decimalMultiply(preview.draft.limitPrice ?? quote.price, preview.draft.quantity) as Money;
+    if (preview.draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
+      throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
+    }
+    if (this.scenario === "insufficient-quantity") {
+      throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+    }
+    if (preview.draft.side === "sell") {
+      const holding = snapshot.holdings.find((item) => item.symbol === preview.draft.symbol);
+      if (!holding || decimalCompare(preview.draft.quantity, holding.quantity) > 0) {
+        throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+      }
+    }
     preview.status = "consumed";
+    this.previewIssuedAt.delete(previewId);
 
     const id = `MOCK-ORDER-${++this.sequence}`;
     const unknown = this.scenario === "unknown" || this.scenario === "reconciliation-failed";
+    const eventAt = nowIso(this.clock);
     const event = unknown
-      ? orderEvent("unknown", nowIso(), "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
-      : orderEvent("accepted", nowIso(), "Accepted by the mock venue; no broker request exists", "模拟场所已接受；不存在券商请求");
+      ? orderEvent("unknown", eventAt, "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
+      : orderEvent("accepted", eventAt, "Accepted by the mock venue; no broker request exists", "模拟场所已接受；不存在券商请求");
     const order: BrokerOrder = {
       id,
       symbol: preview.draft.symbol,
@@ -469,37 +607,40 @@ export class MockBroker implements BrokerAdapter {
       filledQuantity: quantity("0"),
       limitPrice: preview.draft.limitPrice,
       status: unknown ? "unknown" : "working",
-      submittedAt: nowIso(),
+      submittedAt: eventAt,
       events: [
-        orderEvent("draft", nowIso(), "Created locally in Mock Broker", "在本地 Mock Broker 中创建"),
-        orderEvent("preview", nowIso(), "Preview checked and consumed once", "已检查预览并且只消费一次"),
+        orderEvent("draft", eventAt, "Created locally in Mock Broker", "在本地 Mock Broker 中创建"),
+        orderEvent("preview", eventAt, "Preview checked and consumed once", "已检查预览并且只消费一次"),
         event,
       ],
     };
     this.snapshot = { ...this.snapshot, orders: [order, ...this.snapshot.orders] };
     this.notify();
-    return order;
+    return cloneOrder(order);
   }
 
   reconcileOrder(orderId: string): BrokerOrder {
     const order = this.snapshot.orders.find((item) => item.id === orderId);
     if (!order) throw new Error(`No mock order ${orderId}`);
-    if (order.status !== "unknown") return order;
+    if (order.status !== "unknown") return cloneOrder(order);
     if (this.scenario === "reconciliation-failed") throw new MockBrokerError("unknown-reconciliation", "Mock reconciliation failed; keep the order locked");
 
     const reconciled: BrokerOrder = {
       ...order,
       status: "working",
-      events: [...order.events, orderEvent("accepted", nowIso(), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
+      events: [...order.events, orderEvent("accepted", nowIso(this.clock), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
     };
     this.snapshot = { ...this.snapshot, orders: this.snapshot.orders.map((item) => item.id === orderId ? reconciled : item) };
     this.notify();
-    return reconciled;
+    return cloneOrder(reconciled);
   }
 
   invalidatePreview(previewId: string): void {
     const preview = this.previews.get(previewId);
-    if (preview?.status === "preview") preview.status = "invalidated";
+    if (preview?.status === "preview") {
+      preview.status = "invalidated";
+      this.previewIssuedAt.delete(previewId);
+    }
   }
 }
 

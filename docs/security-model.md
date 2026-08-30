@@ -25,6 +25,7 @@ live-account assets and cannot move money.
 - default profile is Mock and live writes are absent;
 - financial calculations use integer-scaled Decimal values;
 - preview binds a draft to a hash and is single-use;
+- malformed or inconsistent order drafts are rejected before a preview exists;
 - writes will never be retried automatically;
 - Unknown is a locked state, not a failure that may be replayed;
 - automation is bounded by mode, allowlist, session, value, concurrency,
@@ -51,4 +52,3 @@ This model does not promise zero defects, zero loss, broker correctness, market
 data accuracy, or protection against a fully compromised operating system. It
 does require the application to fail closed when it cannot establish the facts
 needed for a safe action.
-

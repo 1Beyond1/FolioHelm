@@ -242,6 +242,32 @@
   box-shadow: 0 22px 65px rgba(0, 0, 0, 0.18);
 }
 
+.trade-empty-state {
+  max-width: 650px;
+  margin: 54px auto 0;
+  padding: clamp(28px, 5vw, 58px);
+  border: 1px solid var(--trade-line);
+  border-radius: 24px;
+  background: var(--trade-panel);
+  text-align: center;
+}
+
+.trade-empty-state h2 {
+  margin: 22px 0 12px;
+}
+
+.trade-empty-state p {
+  max-width: 500px;
+  margin: 0 auto;
+  color: var(--trade-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.trade-empty-state .trade-button {
+  margin-top: 26px;
+}
+
 .trade-card__heading {
   display: flex;
   align-items: flex-start;
@@ -589,6 +615,16 @@
   font-weight: 900;
 }
 
+.trade-check-row.is-blocked .trade-check-icon {
+  background: color-mix(in srgb, var(--trade-error) 12%, transparent);
+  color: var(--trade-error);
+}
+
+.trade-check-row.is-blocked strong,
+.trade-check-row.is-blocked em {
+  color: var(--trade-error);
+}
+
 .trade-check-row div {
   display: grid;
   gap: 4px;
@@ -710,6 +746,11 @@
   font-weight: 900;
 }
 
+.trade-receipt--unknown .trade-receipt__mark {
+  background: var(--trade-warning);
+  color: var(--trade-ink);
+}
+
 .trade-receipt .trade-section-lede {
   margin-right: auto;
   margin-left: auto;
@@ -728,6 +769,11 @@
 
 .trade-receipt__highlight strong {
   font-size: 12px;
+}
+
+.trade-receipt--unknown .trade-receipt__highlight {
+  background: rgba(255, 202, 117, 0.12);
+  color: var(--trade-warning);
 }
 
 .trade-receipt .trade-preview-facts {

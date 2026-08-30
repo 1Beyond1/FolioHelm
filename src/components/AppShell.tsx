@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Copy } from "../i18n";
 import type { Language } from "../types";
 import type { AppRoute } from "../navigation";
+import type { DisplayDataStatus } from "./DataStateNotice";
 import { Footer } from "./Footer";
 import { SystemStatusBar } from "./SystemStatusBar";
 import { TopBar } from "./TopBar";
@@ -13,6 +14,7 @@ interface AppShellProps {
   onLanguageChange: (language: Language) => void;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  dataStatus?: DisplayDataStatus | null;
   persistenceWarning?: string;
   onDismissPersistenceWarning?: () => void;
   children: ReactNode;
@@ -25,6 +27,7 @@ export function AppShell({
   onLanguageChange,
   onNavigate,
   onSearch,
+  dataStatus = null,
   persistenceWarning,
   onDismissPersistenceWarning,
   children,
@@ -38,8 +41,9 @@ export function AppShell({
         onLanguageChange={onLanguageChange}
         onNavigate={onNavigate}
         onSearch={onSearch}
+        dataStatus={dataStatus}
       />
-      <SystemStatusBar copy={copy} />
+      <SystemStatusBar copy={copy} dataStatus={dataStatus} />
       {persistenceWarning && (
         <section className="persistence-warning" role="alert">
           <span>{persistenceWarning}</span>

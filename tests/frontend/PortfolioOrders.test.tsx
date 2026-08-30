@@ -38,6 +38,19 @@ describe("PortfolioPage", () => {
 });
 
 describe("dynamic Mock snapshot", () => {
+  it("localizes holding companies in the portfolio view", () => {
+    render(
+      <PortfolioPage
+        language="zh"
+        onOpenInstrument={() => undefined}
+        onOpenTrade={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("苹果公司")).toBeInTheDocument();
+    expect(screen.queryByText("Apple Inc.")).not.toBeInTheDocument();
+  });
+
   it("reflects the selected empty-account scenario instead of a page fixture", () => {
     MOCK_BROKER.setScenario("empty-account");
 
@@ -51,6 +64,21 @@ describe("dynamic Mock snapshot", () => {
 
     expect(screen.getAllByText("$25,000.00")).toHaveLength(3);
     expect(screen.queryByTestId(/^portfolio-holding-row-/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("portfolio-return-stat")).toHaveTextContent("0.0%");
+  });
+
+  it("keeps the return curve negative in the loss scenario", () => {
+    MOCK_BROKER.setScenario("loss");
+
+    render(
+      <PortfolioPage
+        language="en"
+        onOpenInstrument={() => undefined}
+        onOpenTrade={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId("portfolio-return-stat")).toHaveTextContent(/^-/);
   });
 
   it("localizes Mock activity content for Chinese users", () => {
@@ -94,6 +122,7 @@ describe("OrdersPage", () => {
 
     expect(screen.getByTestId("orders-timeline-ORD-1044")).toHaveTextContent("草稿");
     expect(screen.getByTestId("orders-timeline-ORD-1044")).toHaveTextContent("成交");
+    expect(screen.getByTestId("orders-timeline-ORD-1044")).toHaveTextContent("按模拟报价成交 8 股");
 
     fireEvent.click(screen.getByTestId("orders-new-order"));
     expect(onOpenTrade).toHaveBeenCalledTimes(1);

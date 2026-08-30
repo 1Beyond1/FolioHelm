@@ -1,6 +1,7 @@
 import type { Copy } from "../i18n";
 import type { Language } from "../types";
 import type { AppRoute } from "../navigation";
+import type { DisplayDataStatus } from "./DataStateNotice";
 import { primaryRoute } from "../navigation";
 import { Icon } from "./Icons";
 
@@ -11,10 +12,28 @@ interface TopBarProps {
   onLanguageChange: (language: Language) => void;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  dataStatus?: DisplayDataStatus | null;
 }
 
-export function TopBar({ copy, language, activeRoute, onLanguageChange, onNavigate, onSearch }: TopBarProps) {
+function marketStatusLabel(language: Language, status: DisplayDataStatus | null | undefined, openLabel: string): string {
+  if (!status) return openLabel;
+  if (language === "zh") {
+    return status === "stale" ? "行情快照已过期"
+      : status === "offline" ? "行情数据源离线"
+        : status === "reauth-required" ? "行情需要重新授权"
+          : status === "no-data" ? "暂无行情快照"
+            : "行情数据异常";
+  }
+  return status === "stale" ? "Market snapshot stale"
+    : status === "offline" ? "Market source offline"
+      : status === "reauth-required" ? "Market reauthorization required"
+        : status === "no-data" ? "No market snapshot"
+          : "Market data error";
+}
+
+export function TopBar({ copy, language, activeRoute, onLanguageChange, onNavigate, onSearch, dataStatus = null }: TopBarProps) {
   const activePrimaryRoute = primaryRoute(activeRoute);
+  const degraded = dataStatus !== null;
 
   return (
     <header className="topbar">
@@ -55,7 +74,7 @@ export function TopBar({ copy, language, activeRoute, onLanguageChange, onNaviga
       </button>
 
       <div className="topbar-status">
-        <span className="status-cluster"><i />{copy.marketOpen}</span>
+        <span className={`status-cluster ${degraded ? "is-degraded" : ""}`}><i />{marketStatusLabel(language, dataStatus, copy.marketOpen)}</span>
         <span className="status-cluster demo-status" data-testid="demo-status"><i />{copy.demoNotice}</span>
         <button className="account-menu" type="button" onClick={() => onNavigate("portfolio")}>
           {copy.account}

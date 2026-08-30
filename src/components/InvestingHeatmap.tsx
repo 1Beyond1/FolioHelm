@@ -15,7 +15,7 @@ interface InvestingHeatmapProps {
 const legendLevels: HeatLevel[] = [0, 1, 2, 3, 4];
 
 function returnLevel(dailyReturnPct: number | null): HeatLevel {
-  if (dailyReturnPct === null || dailyReturnPct === 0) return 0;
+  if (dailyReturnPct === null || !Number.isFinite(dailyReturnPct) || dailyReturnPct === 0) return 0;
   return Math.min(4, Math.max(1, Math.ceil(Math.abs(dailyReturnPct) / 0.28))) as HeatLevel;
 }
 
@@ -38,8 +38,10 @@ export function InvestingHeatmap({
   const [focusIndex, setFocusIndex] = useState(0);
   const cellRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
-  const availableEntries = entries.filter((entry) => entry.dataStatus === "available" && entry.dailyReturnPct !== null);
-  const bestDay = availableEntries.reduce((best, entry) => Math.max(best, entry.dailyReturnPct ?? Number.NEGATIVE_INFINITY), Number.NEGATIVE_INFINITY);
+  const availableEntries = entries.filter((entry) => entry.dataStatus === "available" && entry.dailyReturnPct !== null && Number.isFinite(entry.dailyReturnPct));
+  const bestDay = availableEntries.length === 0
+    ? null
+    : availableEntries.reduce((best, entry) => Math.max(best, entry.dailyReturnPct ?? Number.NEGATIVE_INFINITY), Number.NEGATIVE_INFINITY);
   const downDays = availableEntries.filter((entry) => (entry.dailyReturnPct ?? 0) < 0).length;
   const isReturnMode = mode === "return";
   const months = language === "zh"
@@ -207,7 +209,7 @@ export function InvestingHeatmap({
       <div className="heatmap-footer">
         {isReturnMode ? (
           <div className="year-summary return-summary">
-            <strong>{formatSignedPercent(bestDay, language)}</strong><span>{copy.bestDay}</span>
+            <strong data-testid="heatmap-best-day">{bestDay === null ? copy.noData : formatSignedPercent(bestDay, language)}</strong><span>{copy.bestDay}</span>
             <strong>{downDays}</strong><span>{copy.downDays}</span>
             <strong>{formatSignedCurrency(netChange, language)}</strong><span>{copy.netChange}</span>
           </div>

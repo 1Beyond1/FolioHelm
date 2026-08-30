@@ -12,6 +12,11 @@
   --fh-lime-soft: var(--lime-soft);
   --fh-red: var(--negative);
   --fh-ink: var(--ink-on-lime);
+  --fh-chart-grid: color-mix(in srgb, var(--fh-text) 13%, transparent);
+  --fh-hover-surface: color-mix(in srgb, var(--fh-text) 4%, transparent);
+  --fh-warning: var(--warning);
+  --fh-warning-soft: color-mix(in srgb, var(--fh-warning) 9%, transparent);
+  --fh-warning-line: color-mix(in srgb, var(--fh-warning) 34%, var(--fh-line));
   box-sizing: border-box;
   min-height: 100%;
   padding: 38px clamp(18px, 4vw, 64px) 56px;
@@ -212,7 +217,7 @@
 }
 
 .fh-donut-track {
-  stroke: #292b28;
+  stroke: var(--fh-chart-grid);
 }
 
 .fh-donut-segment {
@@ -290,7 +295,7 @@
 }
 
 .fh-chart-grid-line {
-  stroke: #292b28;
+  stroke: var(--fh-chart-grid);
   stroke-width: 1;
 }
 
@@ -351,7 +356,7 @@
 .fh-holdings-table th,
 .fh-holdings-table td {
   padding: 14px 13px;
-  border-bottom: 1px solid rgba(41, 43, 40, 0.72);
+  border-bottom: 1px solid var(--fh-line);
   vertical-align: middle;
   text-align: left;
   white-space: nowrap;
@@ -416,7 +421,7 @@
 
 .fh-holding-row:hover,
 .fh-holding-row:focus-visible {
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--fh-hover-surface);
 }
 
 .fh-holding-row:last-child th,
@@ -481,10 +486,10 @@
   max-width: 1440px;
   margin: 12px auto 0;
   padding: 13px 16px;
-  border: 1px solid #3b392f;
+  border: 1px solid var(--fh-warning-line);
   border-radius: 14px;
-  background: rgba(166, 140, 74, 0.08);
-  color: #d8c99c;
+  background: var(--fh-warning-soft);
+  color: var(--fh-warning);
 }
 
 .fh-quality-mark {
@@ -493,9 +498,9 @@
   width: 19px;
   height: 19px;
   place-items: center;
-  border: 1px solid #a58b57;
+  border: 1px solid var(--fh-warning-line);
   border-radius: 50%;
-  color: #d8c99c;
+  color: var(--fh-warning);
   font-size: 11px;
   font-weight: 750;
 }
@@ -503,20 +508,20 @@
 .fh-data-quality strong {
   display: block;
   margin-bottom: 3px;
-  color: #eee4bf;
+  color: var(--fh-text);
   font-size: 11px;
 }
 
 .fh-data-quality p {
   margin: 0;
-  color: #bdb28d;
+  color: var(--fh-muted-strong);
   font-size: 10px;
   line-height: 1.4;
 }
 
 .fh-quality-tag {
   margin-left: auto;
-  color: #aa9e78;
+  color: var(--fh-warning);
   font-size: 9px;
   letter-spacing: 0.06em;
   text-transform: uppercase;

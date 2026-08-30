@@ -166,9 +166,18 @@ function automationReasonLabel(reason: string, language: Language): string {
     "Symbol is not on the explicit automation allowlist": "该证券不在明确的自动化允许列表中",
     "Order value exceeds the configured per-order cap": "订单金额超过单笔上限",
     "Daily value cap would be exceeded; remaining budget is frozen": "将超过每日金额上限；剩余预算已冻结",
+    "Maximum actions per minute reached; no new action was created": "已达到每分钟最大操作数；没有创建新操作",
+    "Run timestamp is invalid; action was blocked": "运行时间无效；操作已阻止",
+    "Quantity and price must be positive decimals": "数量和价格必须是正数",
+    "Order input is invalid; action was blocked": "订单输入无效；操作已阻止",
     "Backpressure: maximum concurrent task count reached": "已达到最大并发任务数",
   };
   return labels[reason] ?? reason;
+}
+
+function createRunIdempotencyKey(symbol: BrokerSymbol): string {
+  const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `manual-${symbol}-${suffix}`;
 }
 
 export function AutomationPage({ language }: AutomationPageProps) {
@@ -211,7 +220,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
       side: "buy",
       quantity: quantity("1"),
       price: price("100.00"),
-      idempotencyKey: `manual-${selectedSymbol}-${state.logs.length + 1}`,
+      idempotencyKey: createRunIdempotencyKey(selectedSymbol),
     });
     const nextState = result.log.status === "would-run" ? controller.completeTask() : result.state;
     setState(nextState);

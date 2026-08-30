@@ -35,12 +35,12 @@ interface AllocationSegment {
   color: string;
 }
 
-function buildHoldings(): PortfolioHolding[] {
+function buildHoldings(language: Language): PortfolioHolding[] {
   const snapshot = MOCK_BROKER.getSnapshot();
   const totalEquity = decimalToNumber(snapshot.account.totalEquity);
   return snapshot.holdings.map((holding) => ({
     symbol: holding.symbol,
-    company: holding.companyEn,
+    company: language === "zh" ? holding.companyZh : holding.companyEn,
     shares: decimalToNumber(holding.quantity),
     avgCost: decimalToNumber(holding.averageCost),
     last: decimalToNumber(snapshot.quotes.find((quote) => quote.symbol === holding.symbol)?.price ?? holding.averageCost),
@@ -137,25 +137,41 @@ const COPY = {
   },
 } as const;
 
-const RETURN_POINTS = [
-  [12, 121],
-  [56, 112],
-  [100, 116],
-  [144, 96],
-  [188, 104],
-  [232, 82],
-  [276, 87],
-  [320, 65],
-  [364, 72],
-  [408, 46],
-  [452, 53],
-  [496, 27],
-] as const;
+interface ReturnChartData {
+  line: string;
+  area: string;
+  endpointY: number;
+  changePercent: number;
+}
 
-const RETURN_LINE = RETURN_POINTS.map(([x, y]) => `${x},${y}`).join(" ");
-const RETURN_AREA = `M ${RETURN_POINTS[0]?.[0] ?? 0} ${RETURN_POINTS[0]?.[1] ?? 0} L ${RETURN_POINTS
-  .map(([x, y]) => `${x} ${y}`)
-  .join(" L ")} L 496 148 L 12 148 Z`;
+function buildReturnChart(values: readonly number[]): ReturnChartData {
+  const startX = 12;
+  const endX = 496;
+  const topY = 27;
+  const bottomY = 148;
+  const first = values[0] ?? 0;
+  const last = values.at(-1) ?? first;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const denominator = Math.max(values.length - 1, 1);
+  const points = values.map((value, index) => {
+    const x = startX + (index / denominator) * (endX - startX);
+    const y = topY + ((max - value) / range) * (bottomY - topY);
+    return { x, y };
+  });
+  const line = points.map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+  const area = points.length === 0
+    ? ""
+    : `M ${points[0]!.x.toFixed(2)} ${points[0]!.y.toFixed(2)} L ${points.slice(1).map(({ x, y }) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ")} L ${endX} ${bottomY} L ${startX} ${bottomY} Z`;
+
+  return {
+    line,
+    area,
+    endpointY: points.at(-1)?.y ?? bottomY,
+    changePercent: first === 0 ? 0 : ((last - first) / Math.abs(first)) * 100,
+  };
+}
 
 function formatMoney(value: number, language: Language, withSign = false): string {
   const locale = language === "zh" ? "zh-CN" : "en-US";
@@ -218,7 +234,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const copy = COPY[language];
   const snapshot = MOCK_BROKER.getSnapshot();
   const account = snapshot.account;
-  const holdings = buildHoldings();
+  const holdings = buildHoldings(language);
+  const returnChart = buildReturnChart((snapshot.portfolioChart["1Y"] ?? []).map(decimalToNumber));
   const [activeSort, setActiveSort] = useState<{
     key: HoldingSortKey;
     direction: SortDirection;
@@ -355,7 +372,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
               <h2>{copy.returnCurve}</h2>
               <p>{copy.returnHint}</p>
             </div>
-            <span className="fh-return-stat">+18.6%</span>
+            <span className={`fh-return-stat ${returnChart.changePercent < 0 ? "fh-negative" : "fh-positive"}`} data-testid="portfolio-return-stat">{formatPercent(returnChart.changePercent, language, true)}</span>
           </div>
           <svg
             className="fh-return-chart"
@@ -374,9 +391,9 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <line className="fh-chart-grid-line" x1="12" x2="496" y1="27" y2="27" />
             <line className="fh-chart-grid-line" x1="12" x2="496" y1="87" y2="87" />
             <line className="fh-chart-grid-line" x1="12" x2="496" y1="148" y2="148" />
-            <path className="fh-return-area" d={RETURN_AREA} fill="url(#fh-return-fill)" />
-            <polyline className="fh-return-line" points={RETURN_LINE} />
-            <circle className="fh-return-endpoint" cx="496" cy="27" r="4" />
+            <path className="fh-return-area" d={returnChart.area} fill="url(#fh-return-fill)" />
+            <polyline className="fh-return-line" points={returnChart.line} />
+            <circle className="fh-return-endpoint" cx="496" cy={returnChart.endpointY} r="4" />
           </svg>
           <div className="fh-chart-axis" aria-hidden="true">
             <span>{language === "zh" ? "12个月前" : "12 months ago"}</span>

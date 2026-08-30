@@ -13,11 +13,27 @@
   --markets-negative: var(--negative, #ff5b8f);
   --markets-line: var(--line, rgba(255, 255, 255, 0.065));
   --markets-line-strong: var(--line-strong, rgba(255, 255, 255, 0.1));
+  --markets-on-lime: var(--ink-on-lime, #090909);
+  --markets-chart-surface: rgba(0, 0, 0, 0.21);
+  --markets-chart-grid: rgba(255, 255, 255, 0.06);
+  --markets-chart-focus: rgba(255, 255, 255, 0.2);
+  --markets-chart-glow: rgba(183, 255, 34, 0.2);
+  --markets-chart-accent: rgba(183, 255, 34, 0.1);
   width: 100%;
   max-width: 1408px;
   margin: 0 auto;
   padding: 8px 0 32px;
   color: var(--markets-text);
+}
+
+:root[data-theme="light"] .markets-page,
+:root[data-theme="light"] .instrument-page {
+  --markets-on-lime: #11150b;
+  --markets-chart-surface: rgba(18, 21, 15, 0.055);
+  --markets-chart-grid: rgba(18, 21, 15, 0.11);
+  --markets-chart-focus: rgba(18, 21, 15, 0.22);
+  --markets-chart-glow: rgba(108, 159, 0, 0.22);
+  --markets-chart-accent: rgba(108, 159, 0, 0.13);
 }
 
 .markets-page *,
@@ -170,7 +186,7 @@
   place-items: center;
   border-radius: 50%;
   background: var(--markets-lime);
-  color: #090909;
+  color: var(--markets-on-lime);
   font-size: 12px;
 }
 
@@ -711,6 +727,39 @@
   align-items: flex-end;
 }
 
+.instrument-heading--empty {
+  align-items: flex-start;
+}
+
+.instrument-no-data-card {
+  min-height: 210px;
+  padding: 28px 24px;
+  border: 1px solid var(--markets-line);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 80% 22%, var(--markets-chart-accent), transparent 36%),
+    var(--markets-surface);
+}
+
+.instrument-no-data-card h2 {
+  margin: 8px 0 0;
+  color: var(--markets-text);
+  font-size: clamp(22px, 3vw, 32px);
+  letter-spacing: -0.045em;
+}
+
+.instrument-no-data-card p {
+  max-width: 620px;
+  margin: 10px 0 20px;
+  color: var(--markets-muted-strong);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.instrument-back-button--card {
+  padding-left: 0;
+}
+
 .instrument-symbol-row {
   display: flex;
   align-items: center;
@@ -798,7 +847,7 @@
   border: 0;
   border-radius: 999px;
   background: var(--markets-lime);
-  color: #090909;
+  color: var(--markets-on-lime);
   cursor: pointer;
   font-size: 11px;
   font-weight: 780;
@@ -841,8 +890,8 @@
   overscroll-behavior: contain;
   border-radius: 16px;
   background:
-    radial-gradient(circle at 72% 32%, rgba(183, 255, 34, 0.1), transparent 34%),
-    rgba(0, 0, 0, 0.21);
+    radial-gradient(circle at 72% 32%, var(--markets-chart-accent), transparent 34%),
+    var(--markets-chart-surface);
 }
 
 .instrument-chart {
@@ -860,7 +909,7 @@
 
 .instrument-chart-grid path {
   fill: none;
-  stroke: rgba(255, 255, 255, 0.06);
+  stroke: var(--markets-chart-grid);
   stroke-width: 1;
 }
 
@@ -877,7 +926,7 @@
 }
 
 .instrument-chart-glow {
-  stroke: rgba(183, 255, 34, 0.2);
+  stroke: var(--markets-chart-glow);
   stroke-width: 10;
 }
 
@@ -887,7 +936,7 @@
 }
 
 .instrument-chart-marker {
-  stroke: rgba(255, 255, 255, 0.2);
+  stroke: var(--markets-chart-focus);
   stroke-dasharray: 3 5;
   stroke-width: 1;
 }

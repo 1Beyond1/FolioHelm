@@ -1,9 +1,9 @@
 import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
-import { decimalCompare, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
-import { findMockHolding, findMockQuote, MOCK_BROKER, mockDraftHash } from "../../domain/mockBroker";
-import type { BrokerOrder, BrokerSymbol, MockPreview, OrderDraft } from "../../domain/contracts";
+import { decimalCompare, decimalMultiply, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
+import { findMockHolding, findMockQuote, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
+import type { BrokerOrder, BrokerOrderStatus, BrokerSymbol, DataStatus, MockPreview, OrderDraft } from "../../domain/contracts";
 import "./TradePage.css";
 
 export type TradeSymbol = BrokerSymbol;
@@ -25,6 +25,7 @@ interface Quote {
   price: Price;
   changePct: Percent;
   heldShares: Quantity;
+  status: DataStatus;
 }
 
 interface DemoReceipt {
@@ -32,6 +33,7 @@ interface DemoReceipt {
   orderId: string;
   draftHash: string;
   estimatedAmount: Money;
+  status: BrokerOrderStatus;
 }
 
 const SYMBOLS: readonly TradeSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
@@ -44,6 +46,7 @@ function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
     price: canonicalQuote?.price ?? price("0"),
     changePct: canonicalQuote?.changePct ?? ("0" as Percent),
     heldShares: canonicalHolding?.quantity ?? makeQuantity("0"),
+    status: canonicalQuote?.status ?? "no-data",
   };
 }
 
@@ -81,8 +84,18 @@ const COPY = {
     quoteAgeValue: "12 seconds old",
     buyingPowerCheck: "Buying power",
     available: "Available in this mock",
+    insufficientBuyingPower: "Insufficient buying power",
+    positionAvailable: "Available to sell",
+    positionInsufficient: "Insufficient position",
     positionRisk: "Position / risk limit",
     withinLimit: "Within fictional limit",
+    executionGate: "Mock preview gate",
+    executionReady: "Local Mock preview is available",
+    executionBlocked: "Local Mock preview is currently blocked",
+    checkPassed: "Passed",
+    checkBlocked: "Blocked",
+    accountUnavailable: "Demo account data is unavailable",
+    quoteUnavailable: "Quote is not fresh enough for a preview",
     noRequestTitle: "No request exists",
     noRequestBody:
       "This check is local-only. Nothing is queued, sent, retried, or persisted; the request does not exist outside this screen.",
@@ -105,13 +118,20 @@ const COPY = {
     receiptId: "Fictional receipt ID",
     status: "Status",
     simulated: "Simulated only",
+    unknownReceiptTitle: "Simulation result is unknown",
+    unknownReceiptBody: "The local Mock ledger could not determine a final outcome. Do not resubmit; review Orders and reconcile the existing record. No brokerage request or money changed.",
+    unknownReceiptStatus: "Unknown · reconcile before any retry",
     viewOrders: "View orders",
     another: "Create another",
     close: "Close",
+    unsupportedTitle: "No demo data for this symbol",
+    unsupportedBody: "This trade window only supports symbols with local fictional quotes. Return to Markets and choose a listed symbol. No order or brokerage request is available.",
     invalidQuantity: "Enter a whole-share quantity greater than 0.",
     invalidLimitPrice: "Enter a limit price greater than 0 with at most two decimal places.",
     previewFailed: "The local Mock preview could not be created. Review the ticket and try again.",
+    previewBlocked: "The local Mock preview was blocked by a safety gate. No request was sent; review the account, quote, and position before trying again.",
     simulationFailed: "The local Mock simulation could not be completed. Do not repeat it until the preview state is reviewed.",
+    previewExpired: "The local preview expired. Review the ticket and create a new preview.",
     quoteChange: "today",
   },
   zh: {
@@ -147,8 +167,18 @@ const COPY = {
     quoteAgeValue: "12 秒前",
     buyingPowerCheck: "购买力",
     available: "演示中的可用金额",
+    insufficientBuyingPower: "购买力不足",
+    positionAvailable: "可卖数量",
+    positionInsufficient: "持仓数量不足",
     positionRisk: "持仓 / 风险限制",
     withinLimit: "在虚构限制内",
+    executionGate: "模拟预览门槛",
+    executionReady: "本地 Mock 预览可用",
+    executionBlocked: "本地 Mock 预览当前被阻止",
+    checkPassed: "通过",
+    checkBlocked: "已阻止",
+    accountUnavailable: "演示账户数据不可用",
+    quoteUnavailable: "报价不够新鲜，不能创建预览",
     noRequestTitle: "不存在请求",
     noRequestBody:
       "此检查仅在本地进行。没有内容会排队、发送、重试或持久化；请求不会存在于此页面之外。",
@@ -169,13 +199,20 @@ const COPY = {
     receiptId: "虚构回执 ID",
     status: "状态",
     simulated: "仅模拟",
+    unknownReceiptTitle: "模拟结果未知",
+    unknownReceiptBody: "本地 Mock 账本无法确定最终结果。不要重下；请进入订单页对账现有记录。没有创建券商请求，资金也没有变化。",
+    unknownReceiptStatus: "未知 · 任何重试前先对账",
     viewOrders: "查看订单",
     another: "创建另一个",
     close: "关闭",
+    unsupportedTitle: "此代码暂无演示数据",
+    unsupportedBody: "此交易窗口只支持有本地虚构报价的代码。请返回市场页选择列表中的代码；当前没有订单或券商请求可用。",
     invalidQuantity: "请输入大于 0 的整数数量。",
     invalidLimitPrice: "请输入大于 0 且最多两位小数的限价价格。",
     previewFailed: "本地 Mock 预览创建失败。请检查交易单后再试。",
+    previewBlocked: "本地 Mock 预览被安全门槛阻止。没有发送请求；请先检查账户、报价和持仓，再决定是否重试。",
     simulationFailed: "本地 Mock 模拟未完成。在确认预览状态前不要重复操作。",
+    previewExpired: "本地预览已过期。请返回检查订单，再创建新的预览。",
     quoteChange: "今日",
   },
 } as const;
@@ -199,6 +236,8 @@ const ZERO_PRICE = price("0");
 
 export function TradePage({ language, initialSymbol, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
+  const hasUnsupportedInitialSymbol = initialSymbol !== undefined && !isTradeSymbol(initialSymbol);
+  const unsupportedSymbol = initialSymbol?.trim().toUpperCase() || "—";
   const demoSnapshot = MOCK_BROKER.getSnapshot();
   const demoAccount = language === "zh"
     ? `演示券商 · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
@@ -216,6 +255,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const [acknowledged, setAcknowledged] = useState(false);
   const [preview, setPreview] = useState<MockPreview | null>(null);
   const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
 
   const currentQuote = getTradeQuote(symbol, language);
   const draft = useMemo<OrderDraft | null>(() => {
@@ -232,11 +272,65 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const stepNames = [copy.ticket, copy.safety, copy.preview, copy.receipt];
   const stepOrder: readonly TradeStep[] = ["ticket", "safety", "preview", "receipt"];
   const activeStepIndex = stepOrder.indexOf(step);
+  const accountReady = demoSnapshot.account.status === "available";
+  const quoteReady = currentQuote.status === "available";
+  const requestedAmount = draft === null
+    ? null
+    : decimalMultiply(draft.quantity, draft.limitPrice ?? currentQuote.price) as Money;
+  const buyingPowerReady = side === "Buy"
+    && accountReady
+    && quoteReady
+    && requestedAmount !== null
+    && decimalCompare(requestedAmount, demoBuyingPower) <= 0;
+  const positionReady = side === "Sell"
+    && accountReady
+    && quoteReady
+    && draft !== null
+    && decimalCompare(draft.quantity, currentQuote.heldShares) <= 0;
+  const previewBlockedScenarios = ["offline", "reauth-required", "request-failed", "rate-limited", "timeout", "stale-quote", "market-closed", "insufficient-quantity"] as const;
+  const executionReady = !previewBlockedScenarios.includes(MOCK_BROKER.getScenario() as (typeof previewBlockedScenarios)[number]);
+  const safetyChecks = [
+    {
+      key: "account",
+      passed: accountReady,
+      title: copy.accountMatch,
+      detail: accountReady ? copy.matchedDemo : copy.accountUnavailable,
+      suffix: copy.demoOnly,
+    },
+    {
+      key: "quote",
+      passed: quoteReady,
+      title: copy.quoteAge,
+      detail: quoteReady ? copy.quoteAgeValue : copy.quoteUnavailable,
+      suffix: copy.quote,
+    },
+    {
+      key: side === "Buy" ? "buying-power" : "position",
+      passed: side === "Buy" ? buyingPowerReady : positionReady,
+      title: side === "Buy" ? copy.buyingPowerCheck : copy.positionRisk,
+      detail: side === "Buy"
+        ? buyingPowerReady
+          ? `${copy.available} · ${formatMoney(demoBuyingPower, language)}`
+          : `${copy.insufficientBuyingPower} · ${formatMoney(demoBuyingPower, language)} available`
+        : positionReady
+          ? `${copy.positionAvailable} · ${currentQuote.heldShares} ${copy.shares}`
+          : `${copy.positionInsufficient} · ${currentQuote.heldShares} ${copy.shares}`,
+      suffix: side === "Buy" ? copy.dollars : copy.shares,
+    },
+    {
+      key: "execution",
+      passed: executionReady,
+      title: copy.executionGate,
+      detail: executionReady ? copy.executionReady : copy.executionBlocked,
+      suffix: copy.demoOnly,
+    },
+  ];
 
   function invalidateCurrentPreview(): void {
     if (preview) MOCK_BROKER.invalidatePreview(preview.previewId);
     setPreview(null);
     setAcknowledged(false);
+    setFlowError(null);
   }
 
   function clearTicketErrors(): void {
@@ -259,6 +353,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
 
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length === 0) {
+      setFlowError(null);
       setStep("safety");
     }
   }
@@ -270,14 +365,18 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       return;
     }
 
+    if (preview) MOCK_BROKER.invalidatePreview(preview.previewId);
+
     try {
       setPreview(MOCK_BROKER.previewOrder(draft));
       setAcknowledged(false);
       setErrors({});
+      setFlowError(null);
       setStep("preview");
     } catch {
-      setErrors({ quantity: copy.previewFailed });
-      setStep("ticket");
+      setErrors({});
+      setFlowError(copy.previewBlocked);
+      setStep("safety");
     }
   }
 
@@ -293,10 +392,15 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
         orderId: simulatedOrder.id,
         draftHash: currentDraftHash,
         estimatedAmount: preview.estimatedAmount,
+        status: simulatedOrder.status,
       });
       setStep("receipt");
-    } catch {
-      setErrors({ quantity: copy.simulationFailed });
+    } catch (error) {
+      MOCK_BROKER.invalidatePreview(preview.previewId);
+      setPreview(null);
+      setAcknowledged(false);
+      setFlowError(error instanceof MockBrokerError && error.code === "preview-expired" ? copy.previewExpired : copy.simulationFailed);
+      setStep("safety");
     }
   }
 
@@ -307,8 +411,47 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
     setLimitPrice("");
     setErrors({});
     setAcknowledged(false);
+    setFlowError(null);
     setPreview(null);
     setReceipt(null);
+  }
+
+  if (hasUnsupportedInitialSymbol) {
+    return (
+      <section className="trade-page trade-page--empty" data-testid="trade-page" aria-labelledby="trade-page-title">
+        <header className="trade-page__header">
+          <div>
+            <p className="trade-page__eyebrow">{copy.eyebrow}</p>
+            <h1 id="trade-page-title">{copy.title}</h1>
+          </div>
+          <div className="trade-page__header-actions">
+            <button
+              type="button"
+              className="trade-page__close"
+              data-testid="trade-close"
+              aria-label={copy.close}
+              title={copy.close}
+              onClick={onClose}
+            >
+              <span aria-hidden="true">×</span>
+              <span>{copy.close}</span>
+            </button>
+            <div className="trade-page__demo-state">
+              <span className="trade-page__demo-dot" aria-hidden="true" />
+              <strong>{copy.demoOnly}</strong>
+              <span>{copy.noConnection}</span>
+            </div>
+          </div>
+        </header>
+
+        <section className="trade-empty-state" data-testid="trade-no-data" aria-labelledby="trade-no-data-title">
+          <span className="trade-badge trade-badge--quiet">{unsupportedSymbol}</span>
+          <h2 id="trade-no-data-title">{copy.unsupportedTitle}</h2>
+          <p>{copy.unsupportedBody}</p>
+          <button className="trade-button trade-button--secondary" type="button" onClick={onClose}>{copy.close}</button>
+        </section>
+      </section>
+    );
   }
 
   return (
@@ -561,26 +704,18 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
           </div>
 
           <div className="trade-check-list">
-            <div className="trade-check-row">
-              <span className="trade-check-icon" aria-hidden="true">✓</span>
-              <div><strong>{copy.accountMatch}</strong><span>{copy.matchedDemo}</span></div>
-              <em>{copy.demoOnly}</em>
-            </div>
-            <div className="trade-check-row">
-              <span className="trade-check-icon" aria-hidden="true">✓</span>
-              <div><strong>{copy.quoteAge}</strong><span>{copy.quoteAgeValue}</span></div>
-              <em>{copy.quote}</em>
-            </div>
-            <div className="trade-check-row">
-              <span className="trade-check-icon" aria-hidden="true">✓</span>
-              <div><strong>{copy.buyingPowerCheck}</strong><span>{copy.available} · {formatMoney(demoBuyingPower, language)}</span></div>
-              <em>{copy.dollars}</em>
-            </div>
-            <div className="trade-check-row">
-              <span className="trade-check-icon" aria-hidden="true">✓</span>
-              <div><strong>{copy.positionRisk}</strong><span>{copy.withinLimit}</span></div>
-              <em>{currentQuote.heldShares} {copy.shares}</em>
-            </div>
+            {safetyChecks.map((check) => (
+              <div
+                className={`trade-check-row ${check.passed ? "is-passed" : "is-blocked"}`}
+                data-testid={`trade-check-${check.key}`}
+                data-state={check.passed ? "passed" : "blocked"}
+                key={check.key}
+              >
+                <span className="trade-check-icon" aria-hidden="true">{check.passed ? "✓" : "!"}</span>
+                <div><strong>{check.title}</strong><span>{check.detail}</span></div>
+                <em>{check.passed ? check.suffix : copy.checkBlocked}</em>
+              </div>
+            ))}
           </div>
 
           <div className="trade-callout trade-callout--risk">
@@ -593,6 +728,8 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
               <p>{copy.marketPreviewNote}</p>
             </div>
           )}
+
+          {flowError && <p className="trade-error trade-flow-error" role="alert">{flowError}</p>}
 
           <div className="trade-card__footer">
             <button className="trade-button trade-button--secondary" type="button" onClick={() => setStep("ticket")}>{copy.back}</button>
@@ -652,14 +789,15 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       )}
 
       {step === "receipt" && receipt && (
-        <section className="trade-card trade-receipt" data-testid="trade-receipt">
-          <div className="trade-receipt__mark" aria-hidden="true">✓</div>
+        <section className={`trade-card trade-receipt ${receipt.status === "unknown" ? "trade-receipt--unknown" : ""}`} data-testid="trade-receipt">
+          <div className="trade-receipt__mark" aria-hidden="true">{receipt.status === "unknown" ? "!" : "✓"}</div>
           <p className="trade-card__kicker">04 / 04</p>
-          <h2>{copy.receiptTitle}</h2>
-          <p className="trade-section-lede">{copy.receiptBody}</p>
+          <h2>{receipt.status === "unknown" ? copy.unknownReceiptTitle : copy.receiptTitle}</h2>
+          <p className="trade-section-lede">{receipt.status === "unknown" ? copy.unknownReceiptBody : copy.receiptBody}</p>
+          {receipt.status === "unknown" && <div className="trade-callout trade-callout--risk" role="alert"><p>{copy.unknownReceiptStatus}</p></div>}
           <div className="trade-receipt__highlight">
             <span>{copy.status}</span>
-            <strong>{copy.simulated}</strong>
+            <strong>{receipt.status === "unknown" ? copy.unknownReceiptStatus : copy.simulated}</strong>
           </div>
           <dl className="trade-preview-facts">
             <div><dt>{copy.symbol}</dt><dd>{symbol}</dd></div>

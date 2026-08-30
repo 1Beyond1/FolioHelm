@@ -17,18 +17,28 @@ stub. No method in this profile can reach Schwab.
 
 Page adapters must derive their view models from this snapshot. They must not
 create a second account fixture with competing values.
+All snapshot, preview, and order results are defensive copies; mutating a
+returned object must not mutate the canonical local ledger.
 
 ## Order flow
 
 1. `previewOrder(draft)` validates the local policy and creates a preview ID,
-   normalized draft hash, estimated amount, quote, and expiry.
+   normalized draft hash, estimated amount, quote, and expiry. Malformed,
+   non-positive, or type/limit-price-inconsistent drafts are rejected before a
+   preview is created.
 2. Any changed ticket field produces a different draft hash. The old preview
    cannot be consumed for the new draft.
-3. `consumePreview(previewId, draftHash)` consumes the preview once and creates
-   a local fictional order. There is no broker request.
-4. `unknown` and `reconciliation-failed` scenarios create/retain an Unknown
+3. A preview expires after the local preview window. An expired preview is
+   invalidated and cannot be consumed; the user must create a new preview.
+4. `consumePreview(previewId, draftHash)` rechecks the current quote status,
+   buying power, and sellable position before consuming the preview once and
+   creating a local fictional order. There is no broker request. Mock event
+   timestamps use the adapter clock so expiry tests and the resulting timeline
+   share one deterministic time source. A failed recheck cannot consume the
+   preview.
+5. `unknown` and `reconciliation-failed` scenarios create/retain an Unknown
    state; the UI must say not to resubmit.
-5. `reconcileOrder(orderId)` is the only path that moves an Unknown Mock order
+6. `reconcileOrder(orderId)` is the only path that moves an Unknown Mock order
    to a known working state, and it can fail deterministically.
 
 ## Fault scenarios
@@ -63,4 +73,3 @@ Future broker adapters must implement the same contracts and capability flags.
 Adding a live adapter must not change the Mock adapter's semantics or silently
 enable real writes. Unknown, stale, offline, and reauthorization states remain
 first-class data statuses.
-

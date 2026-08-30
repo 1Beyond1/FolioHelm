@@ -16,7 +16,8 @@ Run `npm test` and cover:
 - order reconciliation and “do not resubmit” behavior;
 - automation caps, allowlists, idempotency, backpressure, and kill switch;
 - evidence hash-chain creation, import/export, tamper detection, and secret
-  field rejection.
+  field rejection; malformed record shapes must fail closed and queued
+  verify/export/clear operations must not race appends.
 
 ### Frontend tests
 
@@ -24,10 +25,15 @@ The React tests cover navigation and the critical interaction contract:
 
 - home chart hover and wheel period interpolation;
 - heatmap activity/return and percent/USD modes;
-- market search, movers, instrument navigation, and trade entry;
+- market search, movers, instrument navigation, unknown-symbol recovery, and
+  trade entry;
 - portfolio sorting and order timeline expansion;
-- trade modal validation, safety gate, preview acknowledgement, receipt, and
-  close behavior;
+- trade modal validation, safety gate, preview acknowledgement, normal/Unknown
+  receipt, unsupported-symbol no-data handling, and close behavior; the safety rows must reflect the current
+  account, quote, buying-power/position, and Mock preview state rather than
+  showing false success checks;
+- broker-to-UI synchronization after a local Mock order and selected fault
+  scenario;
 - settings persistence, scenario selection, theme/language controls, and
   risk confirmation.
 
@@ -75,6 +81,10 @@ UI remains honest:
 - `request-failed` / `rate-limited`: deterministic local failure with no
   network request.
 
+The top navigation and system status bar must agree with the selected data
+state. A stale, offline, reauthorization, or read-error scenario must not
+continue to display an all-clear “Market open” state.
+
 ## Responsive and accessibility checks
 
 - 1440×900 default desktop layout;
@@ -90,4 +100,3 @@ UI remains honest:
 Record the commit, commands, OS, artifact path, and SHA-256 in the release
 checklist. Any failed installer bundler must be recorded as a known issue; do
 not silently present a portable EXE as a signed installer.
-

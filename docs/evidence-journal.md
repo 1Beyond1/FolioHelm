@@ -16,11 +16,17 @@ The entry hash is SHA-256 over canonical JSON. Verification detects:
 - sequence gaps;
 - previous-hash mismatches;
 - unsupported schema versions;
+- invalid record shapes, event kinds, timestamps, hashes, or payload types;
 - secret-like field names or values.
 
 Settings provides local Verify, Export, Import, and Clear actions. Import is
-accepted only after the complete chain verifies. Exports are Mock evidence
-bundles and must not be treated as broker statements.
+accepted only after the complete chain verifies. Append, verify, export, import,
+and clear operations share one local serial queue, so an export cannot race a
+pending append and a clear cannot be followed by an already-queued append. The
+queue is process-local; it is not a replacement for transactional persistence.
+Exports are Mock evidence bundles and must not be treated as broker statements.
+A failed local write is reported as a failure; the UI does not claim that
+evidence was persisted or cleared when storage rejected it.
 
 ## Evidence recorded by the current UI
 
@@ -56,4 +62,3 @@ Do not resubmit. Freeze the relevant budget, preserve the local evidence, query
 the broker ledger once the adapter is available, and append the reconciliation
 result. If reconciliation is unavailable, keep the order Unknown and make the
 blocked state visible.
-

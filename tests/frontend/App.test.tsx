@@ -1,12 +1,9 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
 import { App } from "../../src/App";
 import { detectInitialLanguage } from "../../src/i18n";
 import { MOCK_PORTFOLIO } from "../../src/mocks/portfolio";
-
-afterEach(() => {
-  document.body.innerHTML = "";
-});
+import { STORAGE_PREFIX } from "../../src/platform/storage";
 
 describe("FolioHelm demo home", () => {
   it("shows an explicit fictional-data and no-brokerage-connection state", () => {
@@ -19,6 +16,15 @@ describe("FolioHelm demo home", () => {
   it("falls back to English for an unknown system language", () => {
     expect(detectInitialLanguage(["fr-FR", "de-DE"])).toBe("en");
     expect(detectInitialLanguage(["zh-CN", "en-US"])).toBe("zh");
+  });
+
+  it("falls back to the system theme when a stored theme is invalid", () => {
+    window.localStorage.setItem(`${STORAGE_PREFIX}theme`, JSON.stringify("neon"));
+
+    render(<App />);
+
+    expect(document.documentElement.dataset.themeMode).toBe("system");
+    expect(["dark", "light"]).toContain(document.documentElement.dataset.theme);
   });
 
   it("switches the heatmap from activity to daily return and then USD", () => {
@@ -46,6 +52,18 @@ describe("FolioHelm demo home", () => {
     const firstCell = screen.getByRole("button", { name: /Jan 1, 2026/ });
     fireEvent.mouseEnter(firstCell);
     expect(screen.getByRole("status")).toHaveTextContent(/[+-]/);
+  });
+
+  it("renders an explicit no-data summary for an empty account", () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Settings|设置/i }));
+    fireEvent.change(screen.getByRole("combobox", { name: /Mock scenario|Mock 场景/i }), { target: { value: "empty-account" } });
+    fireEvent.click(within(screen.getByRole("navigation", { name: /Primary navigation|主导航/i })).getByRole("button", { name: /Home|首页/i }));
+    fireEvent.click(screen.getByTestId("heatmap-mode-return"));
+
+    expect(screen.getByTestId("heatmap-best-day")).toHaveTextContent(/No data|暂无数据/i);
+    expect(screen.getByTestId("heatmap-best-day")).not.toHaveTextContent(/Infinity|∞/i);
   });
 
   it("hides and restores the portfolio value without pretending USD or the year are controls", () => {

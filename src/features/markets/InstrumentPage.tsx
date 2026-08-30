@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import type { Language } from "../../types";
+import { DataStateNotice } from "../../components/DataStateNotice";
 import {
   blendSeries,
   chartAreaPath,
@@ -233,6 +234,38 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
     element.addEventListener("wheel", handleWheel, { passive: false });
     return () => element.removeEventListener("wheel", handleWheel);
   }, []);
+
+  if (security.status === "no-data") {
+    return (
+      <main className="instrument-page instrument-page--empty" data-testid="instrument-page">
+        <button type="button" className="instrument-back-button" data-testid="instrument-back" onClick={onBack}>
+          <BackIcon />
+          <span>{copy.backToMarkets}</span>
+        </button>
+
+        <header className="instrument-heading instrument-heading--empty">
+          <div className="instrument-heading-copy">
+            <div className="instrument-symbol-row">
+              <span className="instrument-symbol">{security.symbol}</span>
+              <span className="instrument-demo-chip">{copy.instrumentKicker}</span>
+            </div>
+            <h1>{companyForLanguage(security, language)}</h1>
+          </div>
+        </header>
+
+        <DataStateNotice language={language} status="no-data" />
+        <section className="instrument-no-data-card" data-testid="instrument-no-data" aria-labelledby="instrument-no-data-title">
+          <span className="markets-kicker">{copy.instrumentKicker}</span>
+          <h2 id="instrument-no-data-title">{copy.instrumentNoDataTitle}</h2>
+          <p>{copy.instrumentNoDataBody}</p>
+          <button type="button" className="instrument-back-button instrument-back-button--card" onClick={onBack}>
+            <BackIcon />
+            <span>{copy.backToMarkets}</span>
+          </button>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="instrument-page" data-testid="instrument-page">

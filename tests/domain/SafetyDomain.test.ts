@@ -1,12 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { decimalAdd, decimalMultiply, decimalSubtract, money, price, quantity } from "../../src/domain/decimal";
-import { AutomationController, DEFAULT_AUTOMATION_STATE, FUTURE_LIVE_CANARY_POLICY } from "../../src/domain/automation";
-import { appendEvidence, clearEvidence, exportEvidence, verifyEvidence } from "../../src/domain/evidenceJournal";
+import { AutomationController, DEFAULT_AUTOMATION_STATE, FUTURE_LIVE_CANARY_POLICY, normalizeAutomationState } from "../../src/domain/automation";
+import { appendEvidence, clearEvidence, evidenceCount, exportEvidence, verifyEvidence, type LocalEvidenceRecord } from "../../src/domain/evidenceJournal";
 import { MockBroker, MockBrokerError } from "../../src/domain/mockBroker";
 
-afterEach(() => {
+afterEach(async () => {
   localStorage.clear();
-  clearEvidence();
+  await clearEvidence();
 });
 
 describe("exact financial primitives", () => {
@@ -55,6 +55,69 @@ describe("Mock Broker safety states", () => {
     expect(broker.getSnapshot().account.buyingPower).toBe("0");
     expect(() => broker.previewOrder(draft)).toThrow(/buying power/i);
   });
+
+  it("blocks stale quotes and validates sell quantity without using buying power", () => {
+    const broker = new MockBroker();
+    const sellDraft = { symbol: "AAPL" as const, side: "sell" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+
+    broker.setScenario("stale-quote");
+    expect(() => broker.previewOrder(sellDraft)).toThrow(/stale/i);
+
+    broker.setScenario("healthy");
+    broker.setScenario("no-buying-power");
+    expect(() => broker.previewOrder(sellDraft)).not.toThrow();
+
+    const oversizedSell = { ...sellDraft, quantity: quantity("101") };
+    expect(() => broker.previewOrder(oversizedSell)).toThrow(/quantity/i);
+  });
+
+  it("expires a preview before it can be consumed", () => {
+    let now = 0;
+    const broker = new MockBroker(() => now);
+    const draft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+    const preview = broker.previewOrder(draft);
+
+    now = 60_000;
+
+    expect(() => broker.consumePreview(preview.previewId, preview.draftHash)).toThrow(/expired/i);
+    expect(() => broker.consumePreview(preview.previewId, preview.draftHash)).toThrow(/missing|expired|already consumed/i);
+  });
+
+  it("rechecks account gates when a preview is consumed", () => {
+    const broker = new MockBroker();
+    const draft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+    const preview = broker.previewOrder(draft);
+
+    broker.setScenario("no-buying-power");
+    expect(() => broker.consumePreview(preview.previewId, preview.draftHash)).toThrow(/buying power/i);
+  });
+
+  it("rejects malformed order drafts and uses the injected clock for mock events", () => {
+    let now = 0;
+    const broker = new MockBroker(() => now);
+    const baseDraft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+
+    expect(() => broker.previewOrder({ ...baseDraft, quantity: quantity("-1") })).toThrow(/invalid/i);
+    expect(() => broker.previewOrder({ ...baseDraft, type: "limit", limitPrice: null })).toThrow(/invalid/i);
+
+    const preview = broker.previewOrder(baseDraft);
+    expect(preview.createdAt).toBe("1970-01-01T00:00:00.000Z");
+
+    now = 5_000;
+    const order = broker.consumePreview(preview.previewId, preview.draftHash);
+    expect(order.submittedAt).toBe("1970-01-01T00:00:05.000Z");
+    expect(order.events.every((event) => event.at === order.submittedAt)).toBe(true);
+  });
+
+  it("falls back to the deterministic Mock timestamp for an invalid clock", () => {
+    const broker = new MockBroker(() => Number.NaN);
+    const draft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+    const preview = broker.previewOrder(draft);
+    const order = broker.consumePreview(preview.previewId, preview.draftHash);
+
+    expect(preview.createdAt).toBe("2026-08-10T16:00:00Z");
+    expect(order.submittedAt).toBe("2026-08-10T16:00:00Z");
+  });
 });
 
 describe("local automation guardrails", () => {
@@ -78,6 +141,64 @@ describe("local automation guardrails", () => {
     expect(controller.run({ ...input, idempotencyKey: "accepted" }).log.status).toBe("would-run");
     expect(controller.run({ ...input, idempotencyKey: "accepted" }).log.status).toBe("duplicate");
   });
+
+  it("enforces the rolling per-minute action cap without reserving blocked value", () => {
+    const controller = new AutomationController({
+      ...DEFAULT_AUTOMATION_STATE,
+      enabled: true,
+      mode: "dry-run",
+      policy: {
+        ...DEFAULT_AUTOMATION_STATE.policy,
+        maxOrderValue: money("1000.00"),
+        maxDailyValue: money("1000.00"),
+        maxOpenTasks: 10,
+        maxActionsPerMinute: 2,
+      },
+    });
+    const input = { symbol: "SPY" as const, side: "buy" as const, quantity: quantity("1"), price: price("100.00") };
+
+    expect(controller.run({ ...input, idempotencyKey: "rate-1", at: "2026-08-30T00:00:00Z" }).log.status).toBe("would-run");
+    controller.completeTask();
+    expect(controller.run({ ...input, idempotencyKey: "rate-2", at: "2026-08-30T00:00:30Z" }).log.status).toBe("would-run");
+    controller.completeTask();
+
+    const blocked = controller.run({ ...input, idempotencyKey: "rate-3", at: "2026-08-30T00:00:31Z" });
+    expect(blocked.log.status).toBe("blocked");
+    expect(blocked.log.reason).toMatch(/actions per minute/i);
+    expect(blocked.state.reservedToday).toBe("200");
+
+    expect(controller.run({ ...input, idempotencyKey: "rate-4", at: "2026-08-30T00:01:31Z" }).log.status).toBe("would-run");
+  });
+
+  it("normalizes malformed persisted automation state to safe values", () => {
+    const normalized = normalizeAutomationState({
+      enabled: "yes",
+      mode: "live",
+      schedule: "never",
+      strategyName: "   ",
+      openTasks: -4,
+      policy: {
+        maxOrderValue: "-1",
+        maxDailyValue: "not-money",
+        maxOpenTasks: 0,
+        maxActionsPerMinute: 0,
+        allowedSymbols: ["SPY", "NOT-A-SYMBOL"],
+      },
+      logs: [{ id: "bad", status: "would-run" }],
+    });
+
+    expect(normalized.enabled).toBe(false);
+    expect(normalized.mode).toBe("dry-run");
+    expect(normalized.schedule).toBe("manual");
+    expect(normalized.strategyName).toBe("Scheduled review");
+    expect(normalized.openTasks).toBe(0);
+    expect(normalized.policy.maxOrderValue).toBe("100");
+    expect(normalized.policy.maxDailyValue).toBe("500");
+    expect(normalized.policy.maxOpenTasks).toBe(1);
+    expect(normalized.policy.maxActionsPerMinute).toBe(6);
+    expect(normalized.policy.allowedSymbols).toEqual(["SPY"]);
+    expect(normalized.logs).toEqual([]);
+  });
 });
 
 describe("tamper-evident local journal", () => {
@@ -89,5 +210,46 @@ describe("tamper-evident local journal", () => {
     const bundle = JSON.parse(await exportEvidence()) as { records: Array<{ payload: Record<string, string> }> };
     bundle.records[0]!.payload.amount = "999.99";
     expect((await verifyEvidence(bundle.records as never)).valid).toBe(false);
+  });
+
+  it("rejects a record with an invalid payload shape", async () => {
+    await appendEvidence("order_intent", { mode: "mock", symbol: "SPY" });
+    const bundle = JSON.parse(await exportEvidence()) as { records: LocalEvidenceRecord[] };
+    const malformed = [{ ...bundle.records[0], payload: null }];
+
+    expect((await verifyEvidence(malformed as never)).valid).toBe(false);
+  });
+
+  it("fails closed when local storage cannot persist an evidence record", async () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+
+    await expect(appendEvidence("order_intent", { mode: "mock" })).rejects.toThrow(/could not be persisted/i);
+    setItem.mockRestore();
+    expect(evidenceCount()).toBe(0);
+  });
+
+  it("serializes concurrent appends into one valid evidence chain", async () => {
+    const records = await Promise.all([
+      appendEvidence("order_intent", { mode: "mock", symbol: "SPY" }),
+      appendEvidence("mock_response", { mode: "mock", status: "working" }),
+    ]);
+
+    expect(records.map((record) => record.sequence).sort()).toEqual([1, 2]);
+    expect((await verifyEvidence()).sequence).toBe(2);
+    expect((await verifyEvidence()).valid).toBe(true);
+  });
+
+  it("serializes snapshots and clear behind pending journal writes", async () => {
+    const append = appendEvidence("order_intent", { mode: "mock", symbol: "AAPL" });
+    const exported = exportEvidence();
+    const cleared = clearEvidence();
+
+    const bundle = JSON.parse(await exported) as { records: LocalEvidenceRecord[] };
+    expect(bundle.records).toHaveLength(1);
+    expect(await cleared).toBe(true);
+    await append;
+    expect(evidenceCount()).toBe(0);
   });
 });

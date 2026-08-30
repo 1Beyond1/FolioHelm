@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { InstrumentPage, MarketsPage } from "../../src/features/markets";
+import { getMarketSecurity } from "../../src/features/markets/marketsData";
 
 describe("FolioHelm markets demo", () => {
   it("filters the watchlist immediately by symbol", () => {
@@ -101,5 +102,25 @@ describe("FolioHelm markets demo", () => {
     fireEvent.click(screen.getByTestId("trade-TSLA"));
 
     expect(onOpenTrade).toHaveBeenCalledWith("TSLA");
+  });
+
+  it("does not reuse a listed instrument's quote for an unknown deep link", () => {
+    const onOpenTrade = vi.fn();
+
+    expect(getMarketSecurity("GOOG")).toMatchObject({ symbol: "GOOG", status: "no-data" });
+
+    render(
+      <InstrumentPage
+        language="en"
+        symbol="GOOG"
+        onBack={vi.fn()}
+        onOpenTrade={onOpenTrade}
+      />,
+    );
+
+    expect(screen.getByTestId("instrument-no-data")).toBeInTheDocument();
+    expect(screen.queryByTestId("instrument-trade")).not.toBeInTheDocument();
+    expect(screen.queryByText("$226.34")).not.toBeInTheDocument();
+    expect(onOpenTrade).not.toHaveBeenCalled();
   });
 });

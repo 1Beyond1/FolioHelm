@@ -90,6 +90,8 @@ export interface MarketsCopy {
   demo: string;
   backToMarkets: string;
   instrumentKicker: string;
+  instrumentNoDataTitle: string;
+  instrumentNoDataBody: string;
   quoteFreshness: string;
   quoteFreshnessValue: string;
   today: string;
@@ -137,7 +139,7 @@ export const MARKET_COPY: Record<Language, MarketsCopy> = {
     results: "results",
     watchlistKicker: "Demo watchlist",
     watchlistTitle: "Watchlist",
-    watchlistDescription: "Five familiar names in one fictional snapshot.",
+    watchlistDescription: "A small set of familiar names in one fictional snapshot.",
     symbol: "Symbol",
     company: "Company",
     price: "Price",
@@ -159,6 +161,8 @@ export const MARKET_COPY: Record<Language, MarketsCopy> = {
     demo: "Demo",
     backToMarkets: "Back to markets",
     instrumentKicker: "Fictional instrument",
+    instrumentNoDataTitle: "No demo data for this symbol",
+    instrumentNoDataBody: "This address does not map to one of the local fictional instruments. Return to Markets and choose a listed symbol. No quote, holding, chart, or trade action is available.",
     quoteFreshness: "Quote freshness",
     quoteFreshnessValue: "Demo snapshot · fictional",
     today: "Today",
@@ -204,7 +208,7 @@ export const MARKET_COPY: Record<Language, MarketsCopy> = {
     results: "项结果",
     watchlistKicker: "演示自选列表",
     watchlistTitle: "自选列表",
-    watchlistDescription: "五个熟悉标的的虚构快照。",
+    watchlistDescription: "多个熟悉标的的虚构快照。",
     symbol: "代码",
     company: "公司",
     price: "价格",
@@ -226,6 +230,8 @@ export const MARKET_COPY: Record<Language, MarketsCopy> = {
     demo: "演示",
     backToMarkets: "返回市场",
     instrumentKicker: "虚构证券",
+    instrumentNoDataTitle: "此代码暂无演示数据",
+    instrumentNoDataBody: "这个地址不对应本地虚构证券。请返回市场页选择列表中的代码；当前没有报价、持仓、图表或交易操作可用。",
     quoteFreshness: "报价新鲜度",
     quoteFreshnessValue: "演示快照 · 虚构数据",
     today: "今日",
@@ -656,8 +662,9 @@ export function getMarketSecurity(symbol: string): MarketSecurity {
   return {
     ...fallback,
     symbol: normalizedSymbol || "DEMO",
-    companyEn: "FolioHelm fictional instrument",
-    companyZh: "FolioHelm 虚构证券",
+    companyEn: normalizedSymbol ? `No demo data for ${normalizedSymbol}` : "No demo instrument selected",
+    companyZh: normalizedSymbol ? `${normalizedSymbol} 暂无演示数据` : "尚未选择演示证券",
+    status: "no-data",
   };
 }
 
@@ -666,14 +673,17 @@ export function companyForLanguage(security: MarketSecurity, language: Language)
 }
 
 export function formatPrice(value: number): string {
+  if (!Number.isFinite(value)) return "—";
   return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export function formatSignedPrice(value: number): string {
+  if (!Number.isFinite(value)) return "—";
   return `${value >= 0 ? "+" : "-"}${formatPrice(Math.abs(value))}`;
 }
 
 export function formatSignedPercent(value: number): string {
+  if (!Number.isFinite(value)) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 

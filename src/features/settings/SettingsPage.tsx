@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import type { Language, ThemeMode } from "../../types";
 import type { MockScenario } from "../../domain/contracts";
+import { detectInitialLanguage } from "../../i18n";
 import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
 import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
@@ -36,9 +37,20 @@ const INITIAL_PROTECTIONS: Record<ProtectionKey, boolean> = {
 };
 
 type EvidenceState =
-  | { kind: "idle"; text: string }
-  | { kind: "valid"; text: string }
-  | { kind: "invalid"; text: string };
+  | { kind: "idle" }
+  | { kind: "valid"; count: number }
+  | { kind: "invalid"; reason?: string; clearFailed?: boolean };
+
+function evidenceStatusText(state: EvidenceState, copy: typeof COPY[Language]): string {
+  if (state.kind === "idle") return copy.evidenceEmpty;
+  if (state.kind === "valid") return state.count === 0 ? copy.evidenceEmpty : copy.evidenceValid(state.count);
+  if (state.clearFailed) return copy.clearDataFailed;
+  return state.reason ? copy.evidenceInvalid(state.reason) : copy.evidenceUnavailable;
+}
+
+function storedBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
 
 const COPY = {
   en: {
@@ -78,17 +90,17 @@ const COPY = {
     scenarioUnknown: "Unknown outcome",
     scenarioReconciliationFailed: "Reconciliation failed",
     tradingSafety: "Trading Safety",
-    safetyBody: "Optional guards are on by default. Turning one off requires a deliberate, time-gated risk acknowledgement.",
+    safetyBody: "These preferences are on by default and are recorded locally. In this Mock build, only the core rules below are enforced; optional switches do not connect to a broker or change real orders.",
     on: "On",
     off: "Off",
     maxOrderValue: "Max order value",
-    maxOrderValueDetail: "Stops a simulated order above the demo value cap.",
+    maxOrderValueDetail: "Mock preference only; no live order or configurable value cap is active in this build.",
     priceDeviation: "Price deviation",
-    priceDeviationDetail: "Flags a simulated price too far from the fictional quote.",
+    priceDeviationDetail: "Mock preference only; no live quote comparison is performed in this build.",
     autoLock: "Auto lock",
-    autoLockDetail: "Locks this demo workspace after an idle period.",
+    autoLockDetail: "Mock preference only; session auto-lock is not active in this build.",
     accountAllowlist: "Account allowlist",
-    accountAllowlistDetail: "Keeps simulated actions scoped to the demo account.",
+    accountAllowlistDetail: "Mock preference only; this build has no broker account access or account selection.",
     coreRules: "Core rules cannot be disabled",
     previewFreshness: "Preview freshness",
     noWriteRetry: "No write retry",
@@ -103,6 +115,7 @@ const COPY = {
     evidenceValid: (count: number) => `Verified · ${count} local events`,
     evidenceInvalid: (reason: string) => `Verification failed · ${reason}`,
     evidenceUnavailable: "Verification unavailable in this environment",
+    clearDataFailed: "Local demo data could not be fully cleared. Check storage permissions and try again.",
     clearData: "Clear local demo data",
     clearDataTitle: "Clear local demo data?",
     clearDataBody: "This removes local Mock/Paper/Dry Run settings, evidence and safety preferences from this device. It cannot be undone. No brokerage credentials are present in this build.",
@@ -111,7 +124,7 @@ const COPY = {
     version: "Version",
     apiGate: "Schwab API gate",
     apiGateValue: "Pending official portal access",
-    disableWarning: "Warning: this optional protection is disabled. The demo will show the risk beside this setting.",
+    disableWarning: "Warning: this optional protection preference is disabled. Core Mock safety rules remain enforced; future live adapters must enforce their own guards.",
     enableAgain: "Enable again to restore this guard.",
     riskDialogTitle: "Disable optional protection?",
     riskDialogIntro: "Risk acknowledgement required",
@@ -124,7 +137,7 @@ const COPY = {
     confirmDisable: "Confirm disable",
     cancel: "Cancel",
     riskDetails: "Risk details",
-    riskDetailOne: "A disabled guard will not be evaluated by this mock UI until you turn it on again.",
+    riskDetailOne: "These optional switches are recorded preferences in the current Mock build, not live execution guards. Core rules remain enforced.",
     riskDetailTwo: "Review the selected setting, the demo account scope, and the fact that this screen cannot send a real order.",
     riskDetailThree: "The confirmation is intentionally delayed so the choice is observable and reversible.",
   },
@@ -165,17 +178,17 @@ const COPY = {
     scenarioUnknown: "未知结果",
     scenarioReconciliationFailed: "对账失败",
     tradingSafety: "交易安全",
-    safetyBody: "可选保护默认开启。关闭任意保护都需要经过有意的、带倒计时的风险确认。",
+    safetyBody: "这些偏好默认开启，并会保存在本地。本 Mock 版本只强制执行下方核心规则；可选开关不会连接券商，也不会改变真实订单。",
     on: "开启",
     off: "关闭",
     maxOrderValue: "最大订单金额",
-    maxOrderValueDetail: "阻止超过演示金额上限的模拟订单。",
+    maxOrderValueDetail: "仅是 Mock 偏好；本版本没有真实订单，也没有启用可配置的金额上限。",
     priceDeviation: "价格偏差",
-    priceDeviationDetail: "标记偏离虚构报价过大的模拟价格。",
+    priceDeviationDetail: "仅是 Mock 偏好；本版本不会执行实时报价偏差比较。",
     autoLock: "自动锁定",
-    autoLockDetail: "空闲一段时间后锁定演示工作区。",
+    autoLockDetail: "仅是 Mock 偏好；本版本尚未启用会话自动锁定。",
     accountAllowlist: "账户允许列表",
-    accountAllowlistDetail: "将模拟操作限定在演示账户内。",
+    accountAllowlistDetail: "仅是 Mock 偏好；本版本没有券商账户访问或账户选择。",
     coreRules: "核心规则不可关闭",
     previewFreshness: "预览新鲜度",
     noWriteRetry: "不重试写入",
@@ -190,6 +203,7 @@ const COPY = {
     evidenceValid: (count: number) => `验证通过 · ${count} 条本地事件`,
     evidenceInvalid: (reason: string) => `验证失败 · ${reason}`,
     evidenceUnavailable: "当前环境无法验证",
+    clearDataFailed: "无法完整清理本地演示数据。请检查存储权限后重试。",
     clearData: "清理本地演示数据",
     clearDataTitle: "清理本地演示数据？",
     clearDataBody: "这会删除本机的 Mock/Paper/Dry Run 设置、证据日志和安全偏好，且无法撤销。本版本不存在券商凭据。",
@@ -198,7 +212,7 @@ const COPY = {
     version: "版本",
     apiGate: "嘉信 API 状态",
     apiGateValue: "等待官方门户访问",
-    disableWarning: "警告：此可选保护已关闭。演示会在此设置旁显示风险。",
+    disableWarning: "警告：此可选保护偏好已关闭。核心 Mock 安全规则仍会执行；未来的真实适配器必须自行强制安全门槛。",
     enableAgain: "重新开启即可恢复此保护。",
     riskDialogTitle: "关闭可选保护？",
     riskDialogIntro: "需要风险确认",
@@ -211,7 +225,7 @@ const COPY = {
     confirmDisable: "确认关闭",
     cancel: "取消",
     riskDetails: "风险说明",
-    riskDetailOne: "保护关闭后，此 Mock 界面不会评估该保护，直到你重新开启。",
+    riskDetailOne: "这些可选开关在当前 Mock 版本中只是记录偏好，不是实时执行门槛；核心规则仍会执行。",
     riskDetailTwo: "请确认选中的设置、演示账户范围，以及此页面无法发送真实订单这一事实。",
     riskDetailThree: "确认被刻意延迟，让这个选择可观察且可逆。",
   },
@@ -259,12 +273,15 @@ export function SettingsPage({
   const copy = COPY[language];
   const definitions = getProtectionDefinitions(language);
   const [protections, setProtections] = useState<Record<ProtectionKey, boolean>>(() => {
-    const stored = readStored<Partial<Record<ProtectionKey, boolean>>>("protections", {});
+    const rawStored = readStored<unknown>("protections", {});
+    const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
+      ? rawStored as Partial<Record<ProtectionKey, boolean>>
+      : {};
     return {
-      maxOrderValue: stored.maxOrderValue ?? INITIAL_PROTECTIONS.maxOrderValue,
-      priceDeviation: stored.priceDeviation ?? INITIAL_PROTECTIONS.priceDeviation,
-      autoLock: stored.autoLock ?? INITIAL_PROTECTIONS.autoLock,
-      accountAllowlist: stored.accountAllowlist ?? INITIAL_PROTECTIONS.accountAllowlist,
+      maxOrderValue: storedBoolean(stored.maxOrderValue, INITIAL_PROTECTIONS.maxOrderValue),
+      priceDeviation: storedBoolean(stored.priceDeviation, INITIAL_PROTECTIONS.priceDeviation),
+      autoLock: storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock),
+      accountAllowlist: storedBoolean(stored.accountAllowlist, INITIAL_PROTECTIONS.accountAllowlist),
     };
   });
   const [warningKey, setWarningKey] = useState<ProtectionKey | null>(null);
@@ -275,7 +292,7 @@ export function SettingsPage({
   const [disablePhrase, setDisablePhrase] = useState("");
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
   const [clearDataDialogOpen, setClearDataDialogOpen] = useState(false);
-  const [evidenceStatus, setEvidenceStatus] = useState<EvidenceState>({ kind: "idle", text: copy.evidenceEmpty });
+  const [evidenceStatus, setEvidenceStatus] = useState<EvidenceState>({ kind: "idle" });
   const importInputRef = useRef<HTMLInputElement>(null);
 
   const settingsModalOpen = connectionDialogOpen || pendingKey !== null || clearDataDialogOpen;
@@ -286,6 +303,7 @@ export function SettingsPage({
 
   useEffect(() => {
     onModalStateChange(settingsModalOpen);
+    return () => onModalStateChange(false);
   }, [onModalStateChange, settingsModalOpen]);
 
   function downloadEvidence(serialized: string): void {
@@ -302,10 +320,10 @@ export function SettingsPage({
     try {
       const result = await verifyEvidence();
       setEvidenceStatus(result.valid
-        ? { kind: "valid", text: result.sequence === 0 ? copy.evidenceEmpty : copy.evidenceValid(result.sequence) }
-        : { kind: "invalid", text: copy.evidenceInvalid(result.reason ?? copy.evidenceUnavailable) });
+        ? { kind: "valid", count: result.sequence }
+        : { kind: "invalid", reason: result.reason });
     } catch {
-      setEvidenceStatus({ kind: "invalid", text: copy.evidenceUnavailable });
+      setEvidenceStatus({ kind: "invalid" });
     }
   }
 
@@ -314,7 +332,7 @@ export function SettingsPage({
       downloadEvidence(await exportEvidence());
       await handleVerifyEvidence();
     } catch {
-      setEvidenceStatus({ kind: "invalid", text: copy.evidenceUnavailable });
+      setEvidenceStatus({ kind: "invalid" });
     }
   }
 
@@ -324,20 +342,26 @@ export function SettingsPage({
     if (!file) return;
     try {
       const result = await importEvidence(await file.text());
-      setEvidenceStatus({ kind: "valid", text: result.sequence === 0 ? copy.evidenceEmpty : copy.evidenceValid(result.sequence) });
+      setEvidenceStatus({ kind: "valid", count: result.sequence });
     } catch (error) {
-      setEvidenceStatus({ kind: "invalid", text: copy.evidenceInvalid(error instanceof Error ? error.message : copy.evidenceUnavailable) });
+      setEvidenceStatus({ kind: "invalid", reason: error instanceof Error ? error.message : undefined });
     }
   }
 
-  function clearLocalData(): void {
-    clearFolioHelmStored();
-    clearEvidence();
+  async function clearLocalData(): Promise<void> {
+    const preferencesCleared = clearFolioHelmStored();
+    const evidenceCleared = await clearEvidence();
+    if (!preferencesCleared || !evidenceCleared) {
+      setEvidenceStatus({ kind: "invalid", clearFailed: true });
+      return;
+    }
     MOCK_BROKER.reset();
     AUTOMATION_CONTROLLER.replaceState(DEFAULT_AUTOMATION_STATE);
+    onLanguageChange(detectInitialLanguage());
+    onThemeChange("system");
     onMockScenarioChange?.("healthy");
     setProtections({ ...INITIAL_PROTECTIONS });
-    setEvidenceStatus({ kind: "valid", text: copy.evidenceEmpty });
+    setEvidenceStatus({ kind: "valid", count: 0 });
     setClearDataDialogOpen(false);
   }
 
@@ -560,7 +584,7 @@ export function SettingsPage({
         <div className="settings-evidence-row">
           <div>
             <strong>{copy.evidence}</strong>
-            <span className={`settings-evidence-status settings-evidence-status--${evidenceStatus.kind}`} role="status">{evidenceStatus.text}</span>
+            <span className={`settings-evidence-status settings-evidence-status--${evidenceStatus.kind}`} role="status">{evidenceStatusText(evidenceStatus, copy)}</span>
           </div>
           <div className="settings-evidence-actions">
             <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleVerifyEvidence()}>{copy.verify}</button>
@@ -674,7 +698,7 @@ export function SettingsPage({
           <p>{copy.clearDataBody}</p>
           <div className="settings-modal__actions">
             <button className="settings-button settings-button--secondary" type="button" onClick={() => setClearDataDialogOpen(false)}>{copy.cancel}</button>
-            <button className="settings-button settings-button--danger" type="button" onClick={clearLocalData}>{copy.confirmClear}</button>
+            <button className="settings-button settings-button--danger" type="button" onClick={() => void clearLocalData()}>{copy.confirmClear}</button>
           </div>
         </Modal>
       )}

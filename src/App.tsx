@@ -28,6 +28,11 @@ function initialLocation(): AppLocation {
   return parseLocationHash(window.location.hash);
 }
 
+function initialTheme(): ThemeMode {
+  const stored = readStored<string>("theme", "system");
+  return stored === "system" || stored === "dark" || stored === "light" ? stored : "system";
+}
+
 interface FolioHistoryState {
   foliohelm: true;
   entry: "initial" | "page" | "trade-dialog";
@@ -52,7 +57,7 @@ export function App() {
     const stored = readStored<Language | null>("language", null);
     return stored === "en" || stored === "zh" ? stored : detectInitialLanguage();
   });
-  const [theme, setTheme] = useState<ThemeMode>(() => readStored<ThemeMode>("theme", "system"));
+  const [theme, setTheme] = useState<ThemeMode>(initialTheme);
   const [mockScenario, setMockScenario] = useState<MockScenario>(() => {
     const stored = readStored<string>("mock-scenario", "healthy");
     return MOCK_SCENARIOS.includes(stored as MockScenario) ? stored as MockScenario : "healthy";
@@ -124,6 +129,39 @@ export function App() {
     const appContent = document.querySelector<HTMLElement>(".app-content");
     if (appContent) appContent.scrollTop = 0;
   }, [navigation.route, navigation.symbol]);
+
+  useEffect(() => {
+    let pageTitle: string;
+    switch (location.route) {
+      case "home":
+        pageTitle = language === "zh" ? "首页" : "Portfolio Home";
+        break;
+      case "instrument":
+        pageTitle = `${navigation.symbol ?? "AAPL"} · ${language === "zh" ? "证券详情" : "Instrument"}`;
+        break;
+      case "trade":
+        pageTitle = language === "zh" ? "交易" : "Trade";
+        break;
+      case "markets":
+        pageTitle = copy.markets;
+        break;
+      case "portfolio":
+        pageTitle = copy.portfolio;
+        break;
+      case "orders":
+        pageTitle = copy.orders;
+        break;
+      case "automation":
+        pageTitle = copy.automation;
+        break;
+      case "settings":
+        pageTitle = copy.settings;
+        break;
+      default:
+        pageTitle = copy.home;
+    }
+    document.title = `FolioHelm — ${pageTitle}`;
+  }, [copy, language, location.route, navigation.symbol]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -265,10 +303,11 @@ export function App() {
       <AppShell
         copy={copy}
         language={language}
-        activeRoute={location.route}
+        activeRoute={navigation.route}
         onLanguageChange={setLanguage}
         onNavigate={navigate}
         onSearch={() => setSearchOpen(true)}
+        dataStatus={dataStatus}
         persistenceWarning={storageWarning ? copy.localStorageWarning : undefined}
         onDismissPersistenceWarning={() => setStorageWarning(false)}
       >

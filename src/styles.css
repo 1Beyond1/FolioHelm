@@ -220,6 +220,11 @@
   background: transparent;
 }
 
+.status-dot.warning {
+  background: var(--warning);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 40%, transparent);
+}
+
 .search-overlay {
   position: fixed;
   z-index: 40;
