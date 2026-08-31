@@ -27,6 +27,18 @@ describe("FolioHelm demo home", () => {
     expect(["dark", "light"]).toContain(document.documentElement.dataset.theme);
   });
 
+  it("keeps document language and browser theme color in sync", () => {
+    window.localStorage.setItem(`${STORAGE_PREFIX}theme`, JSON.stringify("light"));
+    render(<App />);
+
+    expect(document.documentElement.lang).toBe("en");
+    expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toBe("#f4f5f0");
+
+    fireEvent.click(screen.getByTestId("language-toggle"));
+
+    expect(document.documentElement.lang).toBe("zh-CN");
+  });
+
   it("switches the heatmap from activity to daily return and then USD", () => {
     const { container } = render(<App />);
 
@@ -64,6 +76,7 @@ describe("FolioHelm demo home", () => {
 
     expect(screen.getByTestId("heatmap-best-day")).toHaveTextContent(/No data|暂无数据/i);
     expect(screen.getByTestId("heatmap-best-day")).not.toHaveTextContent(/Infinity|∞/i);
+    expect(within(screen.getByTestId("activity-card")).getByTestId("data-state-no-data")).toBeInTheDocument();
   });
 
   it("hides and restores the portfolio value without pretending USD or the year are controls", () => {

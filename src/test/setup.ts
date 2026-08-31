@@ -9,6 +9,8 @@ function resetBrowserState(): void {
   document.body.style.overflow = "";
   document.documentElement.dataset.theme = "";
   document.documentElement.dataset.themeMode = "";
+  document.documentElement.lang = "en";
+  document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute("content", "#050505");
   document.documentElement.scrollTop = 0;
   document.body.scrollTop = 0;
   document.title = "";

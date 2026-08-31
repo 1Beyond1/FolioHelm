@@ -123,4 +123,13 @@ describe("FolioHelm markets demo", () => {
     expect(screen.queryByText("$226.34")).not.toBeInTheDocument();
     expect(onOpenTrade).not.toHaveBeenCalled();
   });
+
+  it("returns a value-free model for unknown instruments", () => {
+    const security = getMarketSecurity("GOOG");
+
+    expect(security.status).toBe("no-data");
+    expect(security.price).toBeNaN();
+    expect(security.chart["1D"]).toEqual([]);
+    expect(security.news).toEqual([]);
+  });
 });

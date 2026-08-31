@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import {
   AutomationController,
@@ -66,6 +66,9 @@ const COPY = {
     duplicate: "Duplicate prevented",
     reserved: "Reserved today",
     noReal: "No real request exists",
+    evidenceSaving: "Saving the local evidence record…",
+    evidenceSaved: "Local evidence saved",
+    evidenceFailed: "This run is visible in memory, but its local evidence could not be saved. Check storage before relying on the record.",
   },
   zh: {
     title: "自动化",
@@ -112,6 +115,9 @@ const COPY = {
     duplicate: "已阻止重复运行",
     reserved: "今日已预留",
     noReal: "不存在真实请求",
+    evidenceSaving: "正在保存本地证据记录……",
+    evidenceSaved: "本地证据已保存",
+    evidenceFailed: "这次运行仅显示在内存中，本地证据没有保存成功。请先检查存储，再依赖这条记录。",
   },
 } as const;
 
@@ -180,12 +186,16 @@ function createRunIdempotencyKey(symbol: BrokerSymbol): string {
   return `manual-${symbol}-${suffix}`;
 }
 
+type EvidenceSaveStatus = "idle" | "saving" | "saved" | "failed";
+
 export function AutomationPage({ language }: AutomationPageProps) {
   const copy = COPY[language];
   const [state, setState] = useState<AutomationState>(() => normalizeAutomationState(readStored("automation", DEFAULT_AUTOMATION_STATE)));
   const [selectedMode, setSelectedMode] = useState<AutomationMode>(state.mode);
   const [selectedSymbol, setSelectedSymbol] = useState<BrokerSymbol>(state.policy.allowedSymbols[0] ?? "SPY");
   const [lastResult, setLastResult] = useState<AutomationState["logs"][number] | null>(null);
+  const [evidenceStatus, setEvidenceStatus] = useState<EvidenceSaveStatus>("idle");
+  const evidenceAttemptRef = useRef(0);
 
   useEffect(() => {
     writeStored("automation", persistableState(state));
@@ -213,7 +223,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
     if (allowed && selectedSymbol === symbol) setSelectedSymbol(next[0] ?? "SPY");
   }
 
-  function runNow(): void {
+  async function runNow(): Promise<void> {
     const controller = new AutomationController({ ...state, mode: selectedMode });
     const result = controller.run({
       symbol: selectedSymbol,
@@ -225,13 +235,21 @@ export function AutomationPage({ language }: AutomationPageProps) {
     const nextState = result.log.status === "would-run" ? controller.completeTask() : result.state;
     setState(nextState);
     setLastResult(result.log);
-    void appendEvidence("automation_run", {
-      mode: result.log.mode,
-      symbol: result.log.symbol,
-      status: result.log.status,
-      amount: result.log.amount,
-      reason: result.log.reason,
-    }).catch(() => undefined);
+    const attempt = evidenceAttemptRef.current + 1;
+    evidenceAttemptRef.current = attempt;
+    setEvidenceStatus("saving");
+    try {
+      await appendEvidence("automation_run", {
+        mode: result.log.mode,
+        symbol: result.log.symbol,
+        status: result.log.status,
+        amount: result.log.amount,
+        reason: result.log.reason,
+      });
+      if (evidenceAttemptRef.current === attempt) setEvidenceStatus("saved");
+    } catch {
+      if (evidenceAttemptRef.current === attempt) setEvidenceStatus("failed");
+    }
   }
 
   function reset(): void {
@@ -239,6 +257,8 @@ export function AutomationPage({ language }: AutomationPageProps) {
     setSelectedMode(DEFAULT_AUTOMATION_STATE.mode);
     setSelectedSymbol(DEFAULT_AUTOMATION_STATE.policy.allowedSymbols[0] ?? "SPY");
     setLastResult(null);
+    evidenceAttemptRef.current += 1;
+    setEvidenceStatus("idle");
   }
 
   return (
@@ -302,6 +322,16 @@ export function AutomationPage({ language }: AutomationPageProps) {
         <div className="automation-card-heading"><div><span>04</span><h2>{copy.logs}</h2></div><button type="button" className="automation-link" onClick={reset}>{copy.reset}</button></div>
         <p className="automation-muted">{copy.resetBody}</p>
         {lastResult && <div className={`automation-result automation-result--${lastResult.status}`}><strong>{automationStatusLabel(lastResult.status, language)}</strong><span>{automationReasonLabel(lastResult.reason, language)}</span></div>}
+        {evidenceStatus !== "idle" && (
+          <p
+            className={`automation-evidence-status automation-evidence-status--${evidenceStatus}`}
+            data-testid="automation-evidence-status"
+            role={evidenceStatus === "failed" ? "alert" : "status"}
+            aria-live={evidenceStatus === "failed" ? "assertive" : "polite"}
+          >
+            {evidenceStatus === "saving" ? copy.evidenceSaving : evidenceStatus === "saved" ? copy.evidenceSaved : copy.evidenceFailed}
+          </p>
+        )}
         <div className="automation-log-list">{state.logs.length === 0 ? <p className="automation-muted">{copy.noRuns}</p> : state.logs.map((log) => <div className="automation-log" key={log.id}><strong>{log.id} · {log.symbol}</strong><span>{automationModeLabel(log.mode, language)} · {automationStatusLabel(log.status, language)} · {formatMoney(log.amount, language)}</span><small>{automationReasonLabel(log.reason, language)}</small></div>)}</div>
       </section>
     </main>

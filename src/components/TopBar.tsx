@@ -37,7 +37,7 @@ export function TopBar({ copy, language, activeRoute, onLanguageChange, onNaviga
 
   return (
     <header className="topbar">
-      <button className="brand brand-button" type="button" aria-label="FolioHelm home" onClick={() => onNavigate("home")}>
+      <button className="brand brand-button" type="button" aria-label={language === "zh" ? "FolioHelm 首页" : "FolioHelm home"} onClick={() => onNavigate("home")}>
         <span className="brand-mark" aria-hidden="true">
           <i />
           <i />
@@ -47,7 +47,7 @@ export function TopBar({ copy, language, activeRoute, onLanguageChange, onNaviga
         <span>FolioHelm</span>
       </button>
 
-      <nav className="primary-nav" aria-label="Primary navigation">
+      <nav className="primary-nav" aria-label={language === "zh" ? "主导航" : "Primary navigation"}>
         {([
           ["home", copy.home],
           ["markets", copy.markets],

@@ -118,6 +118,34 @@ describe("Mock Broker safety states", () => {
     expect(preview.createdAt).toBe("2026-08-10T16:00:00Z");
     expect(order.submittedAt).toBe("2026-08-10T16:00:00Z");
   });
+
+  it("reads the injected clock once when anchoring preview expiry", () => {
+    const clock = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(60_000);
+    const broker = new MockBroker(clock);
+    const draft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+
+    const preview = broker.previewOrder(draft);
+
+    expect(clock).toHaveBeenCalledTimes(1);
+    expect(preview.createdAt).toBe("1970-01-01T00:00:00.000Z");
+    expect(preview.expiresAt).toBe("1970-01-01T00:01:00.000Z");
+  });
+
+  it("does not let a broken observer mask a committed mock order", () => {
+    const broker = new MockBroker();
+    const brokenListener = vi.fn(() => {
+      throw new Error("observer failed");
+    });
+    const healthyListener = vi.fn();
+    broker.subscribe(brokenListener);
+    broker.subscribe(healthyListener);
+    const draft = { symbol: "AAPL" as const, side: "buy" as const, type: "market" as const, quantity: quantity("1"), limitPrice: null };
+    const preview = broker.previewOrder(draft);
+
+    expect(() => broker.consumePreview(preview.previewId, preview.draftHash)).not.toThrow();
+    expect(healthyListener).toHaveBeenCalledTimes(1);
+    expect(broker.getSnapshot().orders[0]?.symbol).toBe("AAPL");
+  });
 });
 
 describe("local automation guardrails", () => {
@@ -218,6 +246,28 @@ describe("tamper-evident local journal", () => {
     const malformed = [{ ...bundle.records[0], payload: null }];
 
     expect((await verifyEvidence(malformed as never)).valid).toBe(false);
+  });
+
+  it("normalizes RFC 3339 offsets and rejects non-canonical stored timestamps", async () => {
+    const record = await appendEvidence(
+      "order_intent",
+      { mode: "mock" },
+      "0.1.0-mock",
+      "2026-08-09T22:00:01+08:00",
+    );
+    expect(record.occurredAtUtc).toBe("2026-08-09T14:00:01.000Z");
+
+    const bundle = JSON.parse(await exportEvidence()) as { records: LocalEvidenceRecord[] };
+    const nonCanonical = [{ ...bundle.records[0], occurredAtUtc: "2026-08-09T22:00:01+08:00" }];
+    expect((await verifyEvidence(nonCanonical)).valid).toBe(false);
+  });
+
+  it("rejects unknown top-level record fields instead of hashing them away", async () => {
+    await appendEvidence("order_intent", { mode: "mock" });
+    const bundle = JSON.parse(await exportEvidence()) as { records: LocalEvidenceRecord[] };
+    const withUnexpectedField = [{ ...bundle.records[0], token: "must-not-be-stored" }];
+
+    expect((await verifyEvidence(withUnexpectedField as never)).valid).toBe(false);
   });
 
   it("fails closed when local storage cannot persist an evidence record", async () => {

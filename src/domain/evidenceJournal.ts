@@ -14,6 +14,19 @@ const EVIDENCE_KINDS = [
   "safety_setting_changed",
 ] as const;
 const HASH_RE = /^[0-9a-f]{64}$/;
+const EVIDENCE_RECORD_KEYS = [
+  "schemaVersion",
+  "eventId",
+  "sequence",
+  "occurredAtUtc",
+  "appVersion",
+  "kind",
+  "payload",
+  "previousHash",
+  "entryHash",
+] as const;
+const EVIDENCE_BUNDLE_KEYS = ["format", "schemaVersion", "mode", "exportedAtUtc", "records"] as const;
+const RFC3339_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export type LocalEvidenceKind =
   | "order_intent"
@@ -76,6 +89,29 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(stableValue(value));
 }
 
+function normalizeUtcTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || !RFC3339_TIMESTAMP_RE.test(value)) return undefined;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return undefined;
+
+  try {
+    const canonical = new Date(parsed).toISOString();
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  return normalizeUtcTimestamp(value) === value;
+}
+
+function hasExactKeys(value: object, expectedKeys: readonly string[]): boolean {
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === expectedKeys.length
+    && expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
 async function sha256Hex(value: string): Promise<string> {
   if (!globalThis.crypto?.subtle) {
     throw new Error("Web Crypto SHA-256 is unavailable; evidence is locked for safety");
@@ -129,14 +165,20 @@ async function verifyEvidenceNow(records: readonly LocalEvidenceRecord[]): Promi
 
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index];
-    if (!record || record.schemaVersion !== SCHEMA_VERSION) {
+    if (
+      !record
+      || typeof record !== "object"
+      || Array.isArray(record)
+      || !hasExactKeys(record, EVIDENCE_RECORD_KEYS)
+      || record.schemaVersion !== SCHEMA_VERSION
+    ) {
       return { valid: false, sequence: index, headHash: previousHash, reason: "Unsupported evidence schema" };
     }
     if (
       typeof record.eventId !== "string"
       || record.eventId.trim() === ""
       || typeof record.occurredAtUtc !== "string"
-      || !Number.isFinite(Date.parse(record.occurredAtUtc))
+      || !isCanonicalUtcTimestamp(record.occurredAtUtc)
       || typeof record.appVersion !== "string"
       || record.appVersion.trim() === ""
       || !isEvidenceKind(record.kind)
@@ -179,6 +221,10 @@ async function appendEvidenceNow(
   occurredAtUtc = new Date().toISOString(),
 ): Promise<LocalEvidenceRecord> {
   rejectSensitiveFields(payload);
+  if (!isEvidenceKind(kind)) throw new Error("Unsupported evidence kind");
+  if (typeof appVersion !== "string" || appVersion.trim() === "") throw new Error("Evidence app version is required");
+  const normalizedOccurredAt = normalizeUtcTimestamp(occurredAtUtc);
+  if (!normalizedOccurredAt) throw new Error("Evidence timestamp must be canonical UTC");
   const records = storedRecords();
   const verification = await verifyEvidenceNow(records);
   if (!verification.valid) throw new Error(`Evidence journal is invalid: ${verification.reason ?? "unknown error"}`);
@@ -188,7 +234,7 @@ async function appendEvidenceNow(
     schemaVersion: SCHEMA_VERSION,
     eventId: `FH-EVENT-${String(sequence).padStart(6, "0")}`,
     sequence,
-    occurredAtUtc,
+    occurredAtUtc: normalizedOccurredAt,
     appVersion,
     kind,
     payload: { ...payload },
@@ -233,7 +279,17 @@ export function exportEvidence(): Promise<string> {
 
 async function importEvidenceNow(serialized: string): Promise<EvidenceVerification> {
   const parsed = JSON.parse(serialized) as Partial<EvidenceExportBundle>;
-  if (parsed.format !== "foliohelm-local-evidence" || parsed.schemaVersion !== SCHEMA_VERSION || parsed.mode !== "mock" || !Array.isArray(parsed.records)) {
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || !hasExactKeys(parsed, EVIDENCE_BUNDLE_KEYS)
+    || parsed.format !== "foliohelm-local-evidence"
+    || parsed.schemaVersion !== SCHEMA_VERSION
+    || parsed.mode !== "mock"
+    || !isCanonicalUtcTimestamp(parsed.exportedAtUtc)
+    || !Array.isArray(parsed.records)
+  ) {
     throw new Error("Unsupported FolioHelm evidence bundle");
   }
   const verification = await verifyEvidenceNow(parsed.records);

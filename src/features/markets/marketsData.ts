@@ -616,6 +616,44 @@ function alignSeriesToQuote(points: readonly number[], currentPrice: number): re
   return adjusted;
 }
 
+const EMPTY_MARKET_CHART: Record<MarketPeriod, readonly number[]> = {
+  "1D": [],
+  "1W": [],
+  "1M": [],
+  "6M": [],
+  "1Y": [],
+};
+
+const EMPTY_MARKET_STATS: MarketStats = {
+  volume: "—",
+  marketCap: "—",
+  averageVolume: "—",
+  dayRange: "—",
+  yearRange: "—",
+  peRatio: "—",
+  dividendYield: "—",
+};
+
+function noDataSecurity(symbol: string, companyEn: string, companyZh: string): MarketSecurity {
+  return {
+    symbol,
+    companyEn,
+    companyZh,
+    price: Number.NaN,
+    change: Number.NaN,
+    changePct: Number.NaN,
+    sparkline: [],
+    chart: { ...EMPTY_MARKET_CHART },
+    shares: Number.NaN,
+    averageCost: Number.NaN,
+    holdingValue: Number.NaN,
+    holdingPnl: Number.NaN,
+    status: "no-data",
+    stats: { ...EMPTY_MARKET_STATS },
+    news: [],
+  };
+}
+
 /**
  * View data adapter. Chart/news/stat presentation remains local to this
  * feature, while quote and holding facts come from the canonical Mock Broker.
@@ -623,7 +661,7 @@ function alignSeriesToQuote(points: readonly number[], currentPrice: number): re
 function adaptMarketSecurity(security: MarketSecurity): MarketSecurity {
   const canonicalQuote = findMockQuote(security.symbol);
   const canonicalHolding = findMockHolding(security.symbol);
-  if (!canonicalQuote) return { ...security, status: "no-data" };
+  if (!canonicalQuote) return noDataSecurity(security.symbol, security.companyEn, security.companyZh);
 
   const priceValue = decimalToNumber(canonicalQuote.price);
   return {
@@ -658,14 +696,12 @@ export function getMarketSecurity(symbol: string): MarketSecurity {
 
   if (match) return match;
 
-  const fallback = securities[0] ?? MARKET_SECURITIES[0];
-  return {
-    ...fallback,
-    symbol: normalizedSymbol || "DEMO",
-    companyEn: normalizedSymbol ? `No demo data for ${normalizedSymbol}` : "No demo instrument selected",
-    companyZh: normalizedSymbol ? `${normalizedSymbol} 暂无演示数据` : "尚未选择演示证券",
-    status: "no-data",
-  };
+  const displaySymbol = normalizedSymbol || "DEMO";
+  return noDataSecurity(
+    displaySymbol,
+    normalizedSymbol ? `No demo data for ${normalizedSymbol}` : "No demo instrument selected",
+    normalizedSymbol ? `${normalizedSymbol} 暂无演示数据` : "尚未选择演示证券",
+  );
 }
 
 export function companyForLanguage(security: MarketSecurity, language: Language): string {

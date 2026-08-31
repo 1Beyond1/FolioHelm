@@ -297,10 +297,16 @@ function stableDraftHash(draft: OrderDraft): string {
   return [draft.symbol, draft.side, draft.type, draft.quantity, draft.limitPrice ?? "market"].join(":");
 }
 
-function nowIso(clock: () => number = () => Date.now()): string {
+function nowValue(clock: () => number = () => Date.now()): { timestamp: number; iso: string } {
   const timestamp = clock();
   const date = new Date(timestamp);
-  return Number.isFinite(timestamp) && Number.isFinite(date.getTime()) ? date.toISOString() : AS_OF;
+  return Number.isFinite(timestamp) && Number.isFinite(date.getTime())
+    ? { timestamp, iso: date.toISOString() }
+    : { timestamp: Date.parse(AS_OF), iso: AS_OF };
+}
+
+function nowIso(clock: () => number = () => Date.now()): string {
+  return nowValue(clock).iso;
 }
 
 function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): BrokerSnapshot {
@@ -475,7 +481,14 @@ export class MockBroker implements BrokerAdapter {
   }
 
   private notify(): void {
-    for (const listener of [...this.listeners]) listener();
+    for (const listener of [...this.listeners]) {
+      try {
+        listener();
+      } catch {
+        // Observers refresh UI only; a broken observer must not turn a
+        // completed local ledger mutation into a reported order failure.
+      }
+    }
   }
 
   setScenario(scenario: MockScenario): void {
@@ -534,7 +547,10 @@ export class MockBroker implements BrokerAdapter {
     }
     const draftHash = stableDraftHash(draft);
     const previewId = `MOCK-PREVIEW-${draft.symbol}-${++this.sequence}`;
-    const createdAt = nowIso(this.clock);
+    // Read the injected clock once so the displayed creation time and the
+    // internal expiry anchor describe the same instant.
+    const created = nowValue(this.clock);
+    const createdAt = created.iso;
     const preview: MockPreview = {
       previewId,
       draftHash,
@@ -546,11 +562,7 @@ export class MockBroker implements BrokerAdapter {
       status: "preview",
     };
     this.previews.set(previewId, preview);
-    const issuedAt = this.clock();
-    this.previewIssuedAt.set(
-      previewId,
-      Number.isFinite(issuedAt) && Number.isFinite(new Date(issuedAt).getTime()) ? issuedAt : Date.parse(createdAt),
-    );
+    this.previewIssuedAt.set(previewId, created.timestamp);
     return clonePreview(preview);
   }
 

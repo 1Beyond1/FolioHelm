@@ -52,6 +52,16 @@ function aggregateDataStatus(): DisplayDataStatus | null {
     ?? (snapshot.quotes.length === 0 || snapshot.quotes.every((quote) => quote.status === "no-data") ? "no-data" : null);
 }
 
+function syncThemeColor(): void {
+  let themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+  if (!themeColor) {
+    themeColor = document.createElement("meta");
+    themeColor.name = "theme-color";
+    document.head.appendChild(themeColor);
+  }
+  themeColor.content = document.documentElement.dataset.theme === "light" ? "#f4f5f0" : "#050505";
+}
+
 export function App() {
   const [language, setLanguage] = useState<Language>(() => {
     const stored = readStored<Language | null>("language", null);
@@ -87,10 +97,18 @@ export function App() {
 
   useEffect(() => {
     writeStored("theme", theme);
-    applyTheme(theme);
+    const applyThemeAndColor = () => {
+      applyTheme(theme);
+      syncThemeColor();
+    };
+    applyThemeAndColor();
     if (theme !== "system") return undefined;
-    return watchSystemTheme(() => applyTheme(theme));
+    return watchSystemTheme(applyThemeAndColor);
   }, [theme]);
+
+  useEffect(() => {
+    document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
+  }, [language]);
 
   useEffect(() => {
     return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
@@ -242,7 +260,7 @@ export function App() {
             onOpenInstrument={(symbol) => navigate("instrument", symbol)}
             onViewAll={() => navigate("portfolio")}
           />
-          <ActivityCard copy={copy} activity={mockPortfolio.activity} onViewAll={() => navigate("orders")} />
+          <ActivityCard copy={copy} language={language} activity={mockPortfolio.activity} onViewAll={() => navigate("orders")} />
         </aside>
       </section>
     </main>
