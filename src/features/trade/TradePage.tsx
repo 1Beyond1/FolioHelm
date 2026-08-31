@@ -217,8 +217,11 @@ const COPY = {
   },
 } as const;
 
-function isTradeSymbol(value: string | undefined): value is TradeSymbol {
-  return value !== undefined && SYMBOLS.includes(value as TradeSymbol);
+function normalizeTradeSymbol(value: string | undefined): TradeSymbol | undefined {
+  const normalized = value?.trim().toUpperCase();
+  return normalized && SYMBOLS.includes(normalized as TradeSymbol)
+    ? normalized as TradeSymbol
+    : undefined;
 }
 
 function formatMoney(amount: Money | Price, language: Language): string {
@@ -236,7 +239,8 @@ const ZERO_PRICE = price("0");
 
 export function TradePage({ language, initialSymbol, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
-  const hasUnsupportedInitialSymbol = initialSymbol !== undefined && !isTradeSymbol(initialSymbol);
+  const initialTradeSymbol = normalizeTradeSymbol(initialSymbol);
+  const hasUnsupportedInitialSymbol = initialSymbol !== undefined && initialTradeSymbol === undefined;
   const unsupportedSymbol = initialSymbol?.trim().toUpperCase() || "—";
   const demoSnapshot = MOCK_BROKER.getSnapshot();
   const demoAccount = language === "zh"
@@ -244,9 +248,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
     : `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
   const demoBuyingPower = demoSnapshot.account.buyingPower;
   const [step, setStep] = useState<TradeStep>("ticket");
-  const [symbol, setSymbol] = useState<TradeSymbol>(() =>
-    isTradeSymbol(initialSymbol) ? initialSymbol : "AAPL",
-  );
+  const [symbol, setSymbol] = useState<TradeSymbol>(() => initialTradeSymbol ?? "AAPL");
   const [side, setSide] = useState<TradeSide>("Buy");
   const [orderType, setOrderType] = useState<OrderType>("Market");
   const [quantity, setQuantity] = useState("");

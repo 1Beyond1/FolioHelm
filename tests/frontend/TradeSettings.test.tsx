@@ -129,6 +129,13 @@ describe("TradePage", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("normalizes a known trade symbol from a deep link", () => {
+    render(<TradePage language="en" initialSymbol=" aapl " onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    expect(screen.getByLabelText("Symbol")).toHaveValue("AAPL");
+    expect(screen.queryByTestId("trade-no-data")).not.toBeInTheDocument();
+  });
+
   it("shows the actual buying-power gate before the Mock preview", () => {
     MOCK_BROKER.setScenario("no-buying-power");
     render(<TradePage language="en" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
