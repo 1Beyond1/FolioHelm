@@ -21,8 +21,8 @@ export function ActivityCard({ copy, language, activity, onViewAll }: ActivityCa
         <DataStateNotice language={language} status="no-data" compact />
       ) : (
         <div className="activity-list">
-          {activity.map((item) => (
-            <div key={`${item.time}-${item.title}`}>
+          {activity.map((item, index) => (
+            <div key={item.id ?? `${item.time}-${item.title}-${index}`}>
               <i className={`activity-dot ${item.kind}`} />
               <span><b>{item.title}</b><small>{item.detail}</small></span>
               <time>{item.time}</time>

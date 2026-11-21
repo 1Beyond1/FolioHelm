@@ -1,4 +1,4 @@
-import { useRef, useState, type KeyboardEvent } from "react";
+import { useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import type { Copy } from "../i18n";
 import { formatHeatmapDate, formatSignedCurrency, formatSignedPercent } from "../formatters";
 import type { HeatLevel, HeatmapEntry, HeatmapMode, Language, ReturnUnit } from "../types";
@@ -13,6 +13,7 @@ interface InvestingHeatmapProps {
 }
 
 const legendLevels: HeatLevel[] = [0, 1, 2, 3, 4];
+const DAYS_PER_WEEK = 7;
 
 function returnLevel(dailyReturnPct: number | null): HeatLevel {
   if (dailyReturnPct === null || !Number.isFinite(dailyReturnPct) || dailyReturnPct === 0) return 0;
@@ -21,6 +22,12 @@ function returnLevel(dailyReturnPct: number | null): HeatLevel {
 
 function actionLabel(actions: number, copy: Copy): string {
   return `${actions} ${actions === 1 ? copy.action : copy.actions}`;
+}
+
+function startWeekdayOffset(entries: readonly HeatmapEntry[]): number {
+  if (entries.length === 0) return 0;
+  const parsed = new Date(`${entries[0]!.date}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) ? parsed.getUTCDay() : 0;
 }
 
 export function InvestingHeatmap({
@@ -47,15 +54,18 @@ export function InvestingHeatmap({
   const months = language === "zh"
     ? ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
     : ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const hoveredColumn = hoveredIndex === null ? null : Math.floor(hoveredIndex / 7);
-  const hoveredRow = hoveredIndex === null ? null : hoveredIndex % 7;
-  const columnCount = Math.ceil(entries.length / 7);
+  const startOffset = startWeekdayOffset(entries);
+  const weekCount = Math.max(1, Math.ceil((startOffset + entries.length) / DAYS_PER_WEEK));
+  const hoveredSlot = hoveredIndex === null ? null : startOffset + hoveredIndex;
+  const hoveredColumn = hoveredSlot === null ? null : Math.floor(hoveredSlot / DAYS_PER_WEEK);
+  const hoveredRow = hoveredSlot === null ? null : hoveredSlot % DAYS_PER_WEEK;
   const tooltipStyle = hoveredColumn === null || hoveredRow === null
     ? undefined
     : {
-        left: `${Math.min(90, Math.max(10, ((hoveredColumn + 0.5) / columnCount) * 100))}%`,
+        left: `${Math.min(90, Math.max(10, ((hoveredColumn + 0.5) / weekCount) * 100))}%`,
         top: `${36 + hoveredRow * 13}px`,
       };
+  const heatmapStyle = { "--heatmap-weeks": String(weekCount) } as CSSProperties;
 
   return (
     <article className="heatmap-card surface-card">
@@ -118,70 +128,107 @@ export function InvestingHeatmap({
         <div className="weekday-labels" aria-hidden="true">
           {copy.weekdays.map((weekday) => <span key={weekday}>{weekday}</span>)}
         </div>
-        <div className="activity-heatmap" role="grid" aria-label={copy.yourInvestingYear}>
-          {entries.map((entry, index) => {
-            const displayValue = returnUnit === "percent" ? entry.dailyReturnPct : entry.dailyReturnUsd;
-            const tone = entry.dataStatus !== "available" || entry.dailyReturnPct === null
-              ? "neutral"
-              : entry.dailyReturnPct > 0 ? "positive" : entry.dailyReturnPct < 0 ? "negative" : "neutral";
-            const level = entry.dataStatus === "available" ? (isReturnMode ? returnLevel(entry.dailyReturnPct) : entry.level) : 0;
-            const date = formatHeatmapDate(entry.date, language);
-            const summary = entry.dataStatus !== "available" || displayValue === null
-              ? `${date}: ${copy.noData}`
-              : isReturnMode
-                ? `${date}: ${returnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language)}`
-                : `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`;
+        <div
+          className="activity-heatmap"
+          role="grid"
+          aria-label={copy.yourInvestingYear}
+          aria-rowcount={DAYS_PER_WEEK}
+          aria-colcount={weekCount}
+          style={heatmapStyle}
+        >
+          {Array.from({ length: DAYS_PER_WEEK }, (_, row) => (
+            <div
+              key={row}
+              className="heatmap-row"
+              role="row"
+              aria-rowindex={row + 1}
+            >
+              {Array.from({ length: weekCount }, (_, column) => {
+                const entryIndex = column * DAYS_PER_WEEK + row - startOffset;
+                const entry = entryIndex >= 0 && entryIndex < entries.length ? entries[entryIndex] : undefined;
 
-            function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>): void {
-              const row = index % 7;
-              const column = Math.floor(index / 7);
-              let nextIndex = index;
-              if (event.key === "ArrowUp") nextIndex = column * 7 + Math.max(0, row - 1);
-              if (event.key === "ArrowDown") nextIndex = Math.min(entries.length - 1, column * 7 + Math.min(6, row + 1));
-              if (event.key === "ArrowLeft") nextIndex = Math.max(0, (column - 1) * 7 + row);
-              if (event.key === "ArrowRight") nextIndex = Math.min(entries.length - 1, (column + 1) * 7 + row);
-              if (event.key === "Home") nextIndex = column * 7;
-              if (event.key === "End") nextIndex = Math.min(entries.length - 1, column * 7 + 6);
-              if (nextIndex === index) return;
-              event.preventDefault();
-              setFocusIndex(nextIndex);
-              cellRefs.current[nextIndex]?.focus();
-            }
+                if (!entry) {
+                  return (
+                    <div
+                      key={`pad-${row}-${column}`}
+                      className="heatmap-gridcell"
+                      role="gridcell"
+                      aria-colindex={column + 1}
+                      aria-disabled="true"
+                    >
+                      <span className="heat-cell-empty" aria-hidden="true" />
+                    </div>
+                  );
+                }
 
-            return (
-              <button
-                key={entry.date}
-                type="button"
-                tabIndex={index === focusIndex ? 0 : -1}
-                aria-rowindex={index % 7 + 1}
-                aria-colindex={Math.floor(index / 7) + 1}
-                ref={(element) => { cellRefs.current[index] = element; }}
-                className={`heat-cell ${index === 133 ? "featured" : ""} ${entry.dataStatus !== "available" ? "is-no-data" : ""}`}
-                data-level={level}
-                data-return-sign={tone}
-                data-status={entry.dataStatus}
-                aria-label={summary}
-                onKeyDown={handleKeyDown}
-                onMouseEnter={() => {
-                  setHoveredEntry(entry);
-                  setHoveredIndex(index);
-                }}
-                onFocus={() => {
-                  setFocusIndex(index);
-                  setHoveredEntry(entry);
-                  setHoveredIndex(index);
-                }}
-                onMouseLeave={() => {
-                  setHoveredEntry(null);
-                  setHoveredIndex(null);
-                }}
-                onBlur={() => {
-                  setHoveredEntry(null);
-                  setHoveredIndex(null);
-                }}
-              />
-            );
-          })}
+                const displayValue = returnUnit === "percent" ? entry.dailyReturnPct : entry.dailyReturnUsd;
+                const tone = entry.dataStatus !== "available" || entry.dailyReturnPct === null
+                  ? "neutral"
+                  : entry.dailyReturnPct > 0 ? "positive" : entry.dailyReturnPct < 0 ? "negative" : "neutral";
+                const level = entry.dataStatus === "available" ? (isReturnMode ? returnLevel(entry.dailyReturnPct) : entry.level) : 0;
+                const date = formatHeatmapDate(entry.date, language);
+                const summary = entry.dataStatus !== "available" || displayValue === null
+                  ? `${date}: ${copy.noData}`
+                  : isReturnMode
+                    ? `${date}: ${returnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language)}`
+                    : `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`;
+
+                function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>): void {
+                  let nextIndex = entryIndex;
+                  if (event.key === "ArrowUp" && row > 0 && entryIndex - 1 >= 0) nextIndex = entryIndex - 1;
+                  if (event.key === "ArrowDown" && row < DAYS_PER_WEEK - 1 && entryIndex + 1 < entries.length) nextIndex = entryIndex + 1;
+                  if (event.key === "ArrowLeft" && entryIndex - DAYS_PER_WEEK >= 0) nextIndex = entryIndex - DAYS_PER_WEEK;
+                  if (event.key === "ArrowRight" && entryIndex + DAYS_PER_WEEK < entries.length) nextIndex = entryIndex + DAYS_PER_WEEK;
+                  if (event.key === "Home") nextIndex = Math.max(0, column * DAYS_PER_WEEK - startOffset);
+                  if (event.key === "End") nextIndex = Math.min(entries.length - 1, column * DAYS_PER_WEEK + (DAYS_PER_WEEK - 1) - startOffset);
+                  if (nextIndex === entryIndex) return;
+                  event.preventDefault();
+                  setFocusIndex(nextIndex);
+                  cellRefs.current[nextIndex]?.focus();
+                }
+
+                return (
+                  <div
+                    key={entry.date}
+                    className="heatmap-gridcell"
+                    role="gridcell"
+                    aria-colindex={column + 1}
+                    data-date={entry.date}
+                    data-weekday={row}
+                  >
+                    <button
+                      type="button"
+                      tabIndex={entryIndex === focusIndex ? 0 : -1}
+                      ref={(element) => { cellRefs.current[entryIndex] = element; }}
+                      className={`heat-cell ${entryIndex === 133 ? "featured" : ""} ${entry.dataStatus !== "available" ? "is-no-data" : ""}`}
+                      data-level={level}
+                      data-return-sign={tone}
+                      data-status={entry.dataStatus}
+                      aria-label={summary}
+                      onKeyDown={handleKeyDown}
+                      onMouseEnter={() => {
+                        setHoveredEntry(entry);
+                        setHoveredIndex(entryIndex);
+                      }}
+                      onFocus={() => {
+                        setFocusIndex(entryIndex);
+                        setHoveredEntry(entry);
+                        setHoveredIndex(entryIndex);
+                      }}
+                      onMouseLeave={() => {
+                        setHoveredEntry(null);
+                        setHoveredIndex(null);
+                      }}
+                      onBlur={() => {
+                        setHoveredEntry(null);
+                        setHoveredIndex(null);
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          ))}
         </div>
         <div className={`heatmap-tooltip ${hoveredEntry ? "visible" : ""}`} style={tooltipStyle} role="status" aria-live="polite">
           {hoveredEntry && (
@@ -191,10 +238,10 @@ export function InvestingHeatmap({
                 {hoveredEntry.dataStatus !== "available"
                   ? copy.noData
                   : isReturnMode
-                  ? returnUnit === "percent"
-                    ? formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)
-                    : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language)
-                  : actionLabel(hoveredEntry.actions, copy)}
+                    ? returnUnit === "percent"
+                      ? formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)
+                      : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language)
+                    : actionLabel(hoveredEntry.actions, copy)}
               </strong>
               <em>
                 {hoveredEntry.dataStatus !== "available"

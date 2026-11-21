@@ -1,4 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { detectInitialLanguage } from "../i18n";
+import { readStored } from "../platform/storage";
 
 interface AppErrorBoundaryProps {
   children: ReactNode;
@@ -9,7 +11,14 @@ interface AppErrorBoundaryState {
 }
 
 function isChinese(): boolean {
-  return typeof navigator !== "undefined" && navigator.language.toLowerCase().startsWith("zh");
+  try {
+    const stored = readStored<string | null>("language", null);
+    if (stored === "zh") return true;
+    if (stored === "en") return false;
+  } catch {
+    // Fallback to navigator language when storage cannot be read.
+  }
+  return detectInitialLanguage() === "zh";
 }
 
 export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorBoundaryState> {

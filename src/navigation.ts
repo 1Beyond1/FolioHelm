@@ -53,9 +53,12 @@ function parsePath(value: string | undefined): NavigationState | undefined {
   const [routeValue, symbolValue] = decoded.split("/");
   if (!isAppRoute(routeValue) || routeValue === "trade") return undefined;
 
+  const normalizedSymbol = symbolValue?.trim();
+  if (routeValue === "instrument" && !normalizedSymbol) return { route: "markets" };
+
   return {
     route: routeValue,
-    symbol: routeValue === "instrument" ? symbolValue : undefined,
+    symbol: routeValue === "instrument" ? normalizedSymbol : undefined,
   };
 }
 
@@ -64,7 +67,7 @@ export function parseLocationHash(hash: string): AppLocation {
   const [path, query = ""] = withoutPrefix.split("?");
   const [routeValue, symbolValue] = path.split("/");
   const route = isAppRoute(routeValue) ? routeValue : "home";
-  const symbol = decodeSegment(symbolValue);
+  const symbol = decodeSegment(symbolValue)?.trim() || undefined;
 
   if (route !== "trade") {
     // An instrument route without a decodable symbol must not silently fall
@@ -83,14 +86,19 @@ export function parseLocationHash(hash: string): AppLocation {
 }
 
 export function serializeLocation(location: AppLocation): string {
-  const symbol = location.symbol ? `/${encodeURIComponent(location.symbol)}` : "";
+  const trimmedSymbol = location.symbol?.trim();
+  const symbol = trimmedSymbol ? `/${encodeURIComponent(trimmedSymbol)}` : "";
 
   if (location.route !== "trade") {
+    if (location.route === "instrument" && !trimmedSymbol) return "#/markets";
     return `#/${location.route}${location.route === "instrument" ? symbol : ""}`;
   }
 
-  const background = location.background ?? { route: "home" as const };
-  const backgroundSymbol = background.symbol ? `/${encodeURIComponent(background.symbol)}` : "";
+  const rawBackground = location.background ?? { route: "home" as const };
+  const background = rawBackground.route === "instrument" && !rawBackground.symbol?.trim()
+    ? { route: "markets" as const }
+    : rawBackground;
+  const backgroundSymbol = background.symbol?.trim() ? `/${encodeURIComponent(background.symbol.trim())}` : "";
   const from = encodeURIComponent(`${background.route}${background.route === "instrument" ? backgroundSymbol : ""}`);
   return `#/trade${symbol}?from=${from}`;
 }

@@ -1,6 +1,7 @@
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { findMockHolding, findMockQuote } from "../../domain/mockBroker";
+import { formatCurrency, formatSignedCurrency } from "../../formatters";
 import type { DataStatus } from "../../domain/contracts";
 
 export type MarketPeriod = "1D" | "1W" | "1M" | "6M" | "1Y";
@@ -733,14 +734,12 @@ export function companyForLanguage(security: MarketSecurity, language: Language)
   return language === "zh" ? security.companyZh : security.companyEn;
 }
 
-export function formatPrice(value: number): string {
-  if (!Number.isFinite(value)) return "—";
-  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+export function formatPrice(value: number, language: Language = "en"): string {
+  return formatCurrency(value, language);
 }
 
-export function formatSignedPrice(value: number): string {
-  if (!Number.isFinite(value)) return "—";
-  return `${value >= 0 ? "+" : "-"}${formatPrice(Math.abs(value))}`;
+export function formatSignedPrice(value: number, language: Language = "en"): string {
+  return formatSignedCurrency(value, language);
 }
 
 export function formatSignedPercent(value: number): string {

@@ -1,5 +1,6 @@
 import { MOCK_BROKER } from "../domain/mockBroker";
 import { decimalToNumber } from "../domain/decimal";
+import { formatCurrency } from "../formatters";
 import type { BrokerSymbol } from "../domain/contracts";
 import type { ActivityItem, HeatmapEntry, Language, PortfolioMockData, PortfolioPoint, PortfolioPeriod, Position } from "../types";
 
@@ -50,13 +51,14 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
     const quote = quoteBySymbol.get(order.symbol);
     const isFilled = order.status === "filled";
     const detailPrice = order.limitPrice === null
-      ? quote ? `$${decimalToNumber(quote.price).toFixed(2)}` : chinese ? "市价" : "market"
-      : `$${decimalToNumber(order.limitPrice).toFixed(2)}`;
+      ? quote ? formatCurrency(decimalToNumber(quote.price), language) : chinese ? "市价" : "market"
+      : formatCurrency(decimalToNumber(order.limitPrice), language);
     const sideLabel = chinese ? order.side === "buy" ? "买入" : "卖出" : order.side === "buy" ? "buy" : "sell";
     const statusLabel = chinese
       ? order.status === "filled" ? "订单已成交" : order.status === "working" ? "订单工作中" : order.status === "canceled" ? "订单已撤销" : order.status === "rejected" ? "订单已拒绝" : "订单状态未知"
       : order.status;
     return {
+      id: order.id,
       kind: isFilled ? "filled" : "pending",
       title: `${order.symbol} ${sideLabel} ${statusLabel}`,
       detail: `${decimalToNumber(order.quantity)} ${chinese ? "股" : "shares"} · ${detailPrice}`,

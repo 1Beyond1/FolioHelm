@@ -37,6 +37,7 @@ export interface Position {
 export type ActivityKind = "filled" | "pending" | "dividend";
 
 export interface ActivityItem {
+  id?: string;
   kind: ActivityKind;
   title: string;
   detail: string;

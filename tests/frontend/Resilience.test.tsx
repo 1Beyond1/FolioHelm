@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppErrorBoundary } from "../../src/components/AppErrorBoundary";
 import { Modal } from "../../src/components/Modal";
+import { STORAGE_PREFIX } from "../../src/platform/storage";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -55,6 +56,24 @@ describe("shared resilience primitives", () => {
     expect(screen.getByTestId("app-error-boundary")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(/error|错误/i);
     expect(screen.getByRole("button", { name: /Reload app|重新加载应用/i })).toBeInTheDocument();
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it("respects the persisted language preference in AppErrorBoundary", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    window.localStorage.setItem(`${STORAGE_PREFIX}language`, JSON.stringify("zh"));
+    function BrokenView(): never {
+      throw new Error("localized render failure");
+    }
+
+    render(
+      <AppErrorBoundary>
+        <BrokenView />
+      </AppErrorBoundary>,
+    );
+
+    expect(screen.getByRole("heading", { name: "页面暂时出了问题" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新加载应用" })).toBeInTheDocument();
     expect(errorSpy).toHaveBeenCalled();
   });
 });

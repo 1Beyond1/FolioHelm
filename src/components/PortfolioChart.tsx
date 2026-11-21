@@ -91,7 +91,10 @@ function chartPointLabel(period: PortfolioPeriod, index: number, total: number, 
     return months[Math.min(months.length - 1, Math.round(progress * (months.length - 1)))];
   }
 
-  return `${2025 + Math.round(progress)}${language === "zh" ? " 年" : ""}`;
+  const yearLabels = language === "zh"
+    ? ["2025年8月", "2025年11月", "2026年2月", "2026年5月", "2026年8月"]
+    : ["Aug '25", "Nov '25", "Feb '26", "May '26", "Aug '26"];
+  return yearLabels[Math.min(yearLabels.length - 1, Math.round(progress * (yearLabels.length - 1)))];
 }
 
 function chartScaleLabel(value: number): string {
@@ -255,7 +258,7 @@ export function PortfolioChart({
           <span>{chartScaleLabel(min)}</span>
         </div>
         <div className="chart-dates" aria-hidden="true">
-          {chartDates.map((date) => <span key={date}>{date}</span>)}
+          {chartDates.map((date, index) => <span key={`${activePeriod}-${index}`}>{date}</span>)}
         </div>
       </div>
     </div>

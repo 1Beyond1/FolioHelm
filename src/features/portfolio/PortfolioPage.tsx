@@ -3,6 +3,7 @@ import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { MOCK_BROKER } from "../../domain/mockBroker";
 import { DataStateNotice } from "../../components/DataStateNotice";
+import { formatCurrency, formatSignedCurrency } from "../../formatters";
 import "./portfolio.css";
 
 export interface PortfolioPageProps {
@@ -174,13 +175,7 @@ function buildReturnChart(values: readonly number[]): ReturnChartData {
 }
 
 function formatMoney(value: number, language: Language, withSign = false): string {
-  const locale = language === "zh" ? "zh-CN" : "en-US";
-  const amount = Math.abs(value).toLocaleString(locale, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-  const sign = value < 0 ? "-" : withSign && value > 0 ? "+" : "";
-  return `${sign}$${amount}`;
+  return withSign ? formatSignedCurrency(value, language) : formatCurrency(value, language);
 }
 
 function formatShares(value: number, language: Language): string {

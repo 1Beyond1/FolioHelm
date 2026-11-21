@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { App } from "../../src/App";
 import { detectInitialLanguage } from "../../src/i18n";
 import { MOCK_PORTFOLIO } from "../../src/mocks/portfolio";
@@ -115,5 +115,41 @@ describe("FolioHelm demo home", () => {
     expect(MOCK_PORTFOLIO.heatmap[0]?.date).toBe("2026-01-01");
     expect(MOCK_PORTFOLIO.heatmap.at(-1)?.date).toBe("2026-12-31");
     expect(MOCK_PORTFOLIO.heatmap.some((entry) => entry.date.startsWith("2027-"))).toBe(false);
+  });
+
+  it("aligns 2026-01-01 to Thursday (weekday 4) inside a valid ARIA grid/row/gridcell structure", () => {
+    const { container } = render(<App />);
+
+    const grid = screen.getByRole("grid", { name: /Your investing year|你的投资年度/i });
+    const rows = within(grid).getAllByRole("row");
+    expect(rows).toHaveLength(7);
+
+    const jan1Cell = container.querySelector('[data-date="2026-01-01"]');
+    expect(jan1Cell).toHaveAttribute("role", "gridcell");
+    expect(jan1Cell).toHaveAttribute("data-weekday", "4");
+    expect(jan1Cell?.closest('[role="row"]')).toHaveAttribute("aria-rowindex", "5");
+  });
+
+  it("renders unique 1Y x-axis labels without duplicate React key warnings", () => {
+    const errorSpy = vi.spyOn(console, "error");
+    try {
+      const { container } = render(<App />);
+      fireEvent.click(screen.getByRole("button", { name: "1Y" }));
+
+      const labels = Array.from(container.querySelectorAll(".chart-dates span"), (node) => node.textContent);
+      expect(labels).toHaveLength(5);
+      expect(new Set(labels).size).toBe(5);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("applies a persisted mock scenario on initial render without flashing healthy state", () => {
+    window.localStorage.setItem(`${STORAGE_PREFIX}mock-scenario`, JSON.stringify("stale-quote"));
+
+    render(<App />);
+
+    expect(screen.getByTestId("data-state-stale")).toBeInTheDocument();
   });
 });

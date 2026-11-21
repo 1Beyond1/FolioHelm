@@ -3,6 +3,7 @@ import type { Copy } from "../i18n";
 import type { Language } from "../types";
 import { decimalToNumber } from "../domain/decimal";
 import { MOCK_BROKER } from "../domain/mockBroker";
+import { formatCurrency } from "../formatters";
 import { Modal } from "./Modal";
 
 interface SearchPaletteProps {
@@ -122,7 +123,7 @@ export function SearchPalette({
           >
             <span className="search-symbol-mark">{item.symbol.slice(0, 1)}</span>
             <span><b>{item.symbol}</b><small>{chinese ? item.companyZh : item.companyEn}</small></span>
-            <span className="search-price"><b>${item.price.toFixed(2)}</b><small className={item.change >= 0 ? "positive" : "negative"}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</small></span>
+            <span className="search-price"><b>{formatCurrency(item.price, language)}</b><small className={item.change >= 0 ? "positive" : "negative"}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</small></span>
           </button>
         ))}
         {results.length === 0 && <p>{chinese ? "没有匹配的演示证券" : "No demo instruments match"}</p>}

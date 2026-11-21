@@ -70,7 +70,9 @@ export function App() {
   const [theme, setTheme] = useState<ThemeMode>(initialTheme);
   const [mockScenario, setMockScenario] = useState<MockScenario>(() => {
     const stored = readStored<string>("mock-scenario", "healthy");
-    return MOCK_SCENARIOS.includes(stored as MockScenario) ? stored as MockScenario : "healthy";
+    const resolved = MOCK_SCENARIOS.includes(stored as MockScenario) ? stored as MockScenario : "healthy";
+    MOCK_BROKER.setScenario(resolved);
+    return resolved;
   });
   const [searchOpen, setSearchOpen] = useState(false);
   const [location, setLocation] = useState<AppLocation>(initialLocation);
@@ -155,7 +157,9 @@ export function App() {
         pageTitle = language === "zh" ? "首页" : "Portfolio Home";
         break;
       case "instrument":
-        pageTitle = `${navigation.symbol ?? "AAPL"} · ${language === "zh" ? "证券详情" : "Instrument"}`;
+        pageTitle = navigation.symbol
+          ? `${navigation.symbol} · ${language === "zh" ? "证券详情" : "Instrument"}`
+          : copy.markets;
         break;
       case "trade":
         pageTitle = language === "zh" ? "交易" : "Trade";
@@ -213,12 +217,18 @@ export function App() {
   };
 
   const navigate = (route: AppRoute, symbol?: string) => {
+    const trimmedSymbol = symbol?.trim() || undefined;
     if (route === "trade") {
-      commitLocation({ route, symbol, background: navigation });
+      commitLocation({ route, symbol: trimmedSymbol, background: navigation });
       return;
     }
 
-    commitLocation({ route, symbol });
+    if (route === "instrument" && !trimmedSymbol) {
+      commitLocation({ route: "markets" });
+      return;
+    }
+
+    commitLocation({ route, symbol: route === "instrument" ? trimmedSymbol : undefined });
   };
 
   const closeTrade = () => {
@@ -279,10 +289,19 @@ export function App() {
           />
         );
       case "instrument":
+        if (!navigation.symbol) {
+          return (
+            <MarketsPage
+              language={language}
+              onOpenInstrument={(symbol) => navigate("instrument", symbol)}
+              onOpenTrade={(symbol) => navigate("trade", symbol)}
+            />
+          );
+        }
         return (
           <InstrumentPage
             language={language}
-            symbol={navigation.symbol ?? "AAPL"}
+            symbol={navigation.symbol}
             onBack={() => navigate("markets")}
             onOpenTrade={(symbol) => navigate("trade", symbol)}
           />

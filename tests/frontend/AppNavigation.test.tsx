@@ -28,7 +28,13 @@ function renderApp() {
 describe("FolioHelm App navigation", () => {
   it("does not turn a malformed instrument hash into an AAPL page", () => {
     expect(parseLocationHash("#/instrument/")).toEqual({ route: "markets" });
+    expect(parseLocationHash("#/instrument/%20")).toEqual({ route: "markets" });
     expect(parseLocationHash("#/instrument/%E0%A4%A")).toEqual({ route: "markets" });
+    expect(parseLocationHash("#/trade?from=instrument")).toEqual({
+      route: "trade",
+      symbol: undefined,
+      background: { route: "markets" },
+    });
   });
 
   it("opens the Markets page from the top navigation", () => {
