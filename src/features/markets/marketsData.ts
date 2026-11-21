@@ -295,8 +295,8 @@ const COMMON_STATS: MarketStats = {
   volume: "48.2M",
   marketCap: "$2.86T",
   averageVolume: "52.4M",
-  dayRange: "$181.20 – $185.10",
-  yearRange: "$142.90 – $198.23",
+  dayRange: "$221.57 – $226.34",
+  yearRange: "$178.34 – $226.34",
   peRatio: "31.4",
   dividendYield: "0.52%",
 };
@@ -611,9 +611,28 @@ const LEGACY_MARKET_SECURITIES: readonly MarketSecurity[] = [
 
 function alignSeriesToQuote(points: readonly number[], currentPrice: number): readonly number[] {
   if (points.length === 0) return [currentPrice];
-  const adjusted = [...points];
-  adjusted[adjusted.length - 1] = currentPrice;
-  return adjusted;
+  if (!Number.isFinite(currentPrice)) return [...points];
+  const lastPoint = points[points.length - 1]!;
+  if (!Number.isFinite(lastPoint) || lastPoint === 0) {
+    const delta = Number.isFinite(lastPoint) ? currentPrice - lastPoint : 0;
+    return points.map((point, index) =>
+      index === points.length - 1 ? currentPrice : Number((point + delta).toFixed(2)),
+    );
+  }
+
+  const ratio = currentPrice / lastPoint;
+  return points.map((point, index) =>
+    index === points.length - 1 ? currentPrice : Number((point * ratio).toFixed(2)),
+  );
+}
+
+function formatPriceRange(points: readonly number[], currentPrice: number): string {
+  const finite = points.filter(Number.isFinite);
+  if (Number.isFinite(currentPrice)) finite.push(currentPrice);
+  if (finite.length === 0) return "—";
+  const low = Math.min(...finite);
+  const high = Math.max(...finite);
+  return `${formatPrice(low)} – ${formatPrice(high)}`;
 }
 
 const EMPTY_MARKET_CHART: Record<MarketPeriod, readonly number[]> = {
@@ -664,20 +683,26 @@ function adaptMarketSecurity(security: MarketSecurity): MarketSecurity {
   if (!canonicalQuote) return noDataSecurity(security.symbol, security.companyEn, security.companyZh);
 
   const priceValue = decimalToNumber(canonicalQuote.price);
+  const alignedChart = Object.fromEntries(
+    Object.entries(security.chart).map(([period, points]) => [period, alignSeriesToQuote(points, priceValue)]),
+  ) as Record<MarketPeriod, readonly number[]>;
   return {
     ...security,
     price: priceValue,
     change: decimalToNumber(canonicalQuote.change),
     changePct: decimalToNumber(canonicalQuote.changePct),
     sparkline: alignSeriesToQuote(security.sparkline, priceValue),
-    chart: Object.fromEntries(
-      Object.entries(security.chart).map(([period, points]) => [period, alignSeriesToQuote(points, priceValue)]),
-    ) as Record<MarketPeriod, readonly number[]>,
+    chart: alignedChart,
     shares: canonicalHolding ? decimalToNumber(canonicalHolding.quantity) : 0,
     averageCost: canonicalHolding ? decimalToNumber(canonicalHolding.averageCost) : 0,
     holdingValue: canonicalHolding ? decimalToNumber(canonicalHolding.marketValue) : 0,
-    holdingPnl: canonicalHolding ? decimalToNumber(canonicalHolding.dayPnl) : 0,
+    holdingPnl: canonicalHolding ? decimalToNumber(canonicalHolding.totalPnl) : 0,
     status: canonicalQuote.status,
+    stats: {
+      ...security.stats,
+      dayRange: formatPriceRange(alignedChart["1D"], priceValue),
+      yearRange: formatPriceRange(alignedChart["1Y"], priceValue),
+    },
   };
 }
 
@@ -686,7 +711,7 @@ export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURI
 
 /** Rebuilds the view model from the current local broker scenario. */
 export function getMarketSecurities(): readonly MarketSecurity[] {
-  return MARKET_SECURITIES.map(adaptMarketSecurity);
+  return LEGACY_MARKET_SECURITIES.map(adaptMarketSecurity);
 }
 
 export function getMarketSecurity(symbol: string): MarketSecurity {

@@ -1,7 +1,10 @@
 import {
+  decimal,
   decimalAdd,
   decimalCompare,
+  decimalDivide,
   decimalMultiply,
+  decimalRound,
   decimalSubtract,
   decimalToFixed,
   money,
@@ -9,8 +12,12 @@ import {
   price,
   quantity,
   type Money,
+  type Percent,
+  type Price,
+  type Quantity,
 } from "./decimal";
 import type {
+  BrokerAccount,
   BrokerAdapter,
   BrokerCapabilities,
   BrokerHolding,
@@ -27,7 +34,11 @@ import type {
 const AS_OF = "2026-08-10T16:00:00Z";
 const PREVIEW_EXPIRY_MS = 60_000;
 const ZERO_PRICE = price("0");
+const ZERO_MONEY = money("0");
 const ZERO_QUANTITY = quantity("0");
+const HUNDRED = decimal("100");
+const LOSS_PRICE_FACTOR = decimal("0.84");
+const LOSS_DAY_DROP_RATE = decimal("-0.018");
 
 const capabilities: BrokerCapabilities = {
   readQuotes: true,
@@ -67,62 +78,138 @@ export const MOCK_SCENARIOS: readonly MockScenario[] = [
   "reconciliation-failed",
 ];
 
+function deriveChangePct(currentPrice: Price, dailyChange: Price): Percent {
+  const previousClose = decimalSubtract(currentPrice, dailyChange);
+  if (decimalCompare(previousClose, ZERO_PRICE) <= 0) return percent("0");
+  return decimalDivide(decimalMultiply(dailyChange, HUNDRED), previousClose, 2, "half-even") as Percent;
+}
+
 const quote = (
   symbol: BrokerQuote["symbol"],
   companyEn: string,
   companyZh: string,
   currentPrice: string,
   change: string,
-  changePct: string,
-): BrokerQuote => ({
-  symbol,
-  companyEn,
-  companyZh,
-  price: price(currentPrice),
-  change: price(change),
-  changePct: percent(changePct),
-  asOf: AS_OF,
-  status: "available",
-});
+): BrokerQuote => {
+  const parsedPrice = price(currentPrice);
+  const parsedChange = price(change);
+  return {
+    symbol,
+    companyEn,
+    companyZh,
+    price: parsedPrice,
+    change: parsedChange,
+    changePct: deriveChangePct(parsedPrice, parsedChange),
+    asOf: AS_OF,
+    status: "available",
+  };
+};
 
 const QUOTES: readonly BrokerQuote[] = [
-  quote("AAPL", "Apple Inc.", "苹果公司", "226.34", "2.68", "1.18"),
-  quote("NVDA", "NVIDIA Corporation", "英伟达", "118.40", "-0.74", "-0.62"),
-  quote("MSFT", "Microsoft Corporation", "微软", "412.55", "1.90", "0.46"),
-  quote("SPY", "SPDR S&P 500 ETF", "标普 500 ETF", "542.18", "1.14", "0.21"),
-  quote("TSLA", "Tesla, Inc.", "特斯拉", "241.73", "-2.54", "-1.04"),
-  quote("AMD", "Advanced Micro Devices", "超威半导体", "168.44", "1.94", "1.16"),
-  quote("AMZN", "Amazon.com, Inc.", "亚马逊", "181.27", "-1.12", "-0.61"),
+  quote("AAPL", "Apple Inc.", "苹果公司", "226.34", "2.68"),
+  quote("NVDA", "NVIDIA Corporation", "英伟达", "118.40", "-0.74"),
+  quote("MSFT", "Microsoft Corporation", "微软", "412.55", "1.90"),
+  quote("SPY", "SPDR S&P 500 ETF", "标普 500 ETF", "542.18", "1.14"),
+  quote("TSLA", "Tesla, Inc.", "特斯拉", "241.73", "-2.54"),
+  quote("AMD", "Advanced Micro Devices", "超威半导体", "168.44", "1.94"),
+  quote("AMZN", "Amazon.com, Inc.", "亚马逊", "181.27", "-1.12"),
 ];
 
-function holding(
+interface HoldingSeed {
+  symbol: BrokerHolding["symbol"];
+  companyEn: string;
+  companyZh: string;
+  quantity: Quantity;
+  availableQuantity: Quantity;
+  averageCost: Price;
+}
+
+function holdingSeed(
   symbol: BrokerHolding["symbol"],
   companyEn: string,
   companyZh: string,
   quantityValue: string,
   averageCost: string,
-  marketValue: string,
-  dayPnl: string,
-  totalPnl: string,
-): BrokerHolding {
+): HoldingSeed {
+  const parsedQty = quantity(quantityValue);
   return {
     symbol,
     companyEn,
     companyZh,
-    quantity: quantity(quantityValue),
+    quantity: parsedQty,
+    availableQuantity: parsedQty,
     averageCost: price(averageCost),
-    marketValue: money(marketValue),
-    dayPnl: money(dayPnl),
-    totalPnl: money(totalPnl),
   };
 }
 
-const HOLDINGS: readonly BrokerHolding[] = [
-  holding("AAPL", "Apple Inc.", "苹果公司", "100", "221.84", "22634.00", "450.00", "1250.00"),
-  holding("NVDA", "NVIDIA Corporation", "英伟达", "50", "120.50", "5920.00", "-105.00", "-105.00"),
-  holding("SPY", "SPDR S&P 500 ETF", "标普 500 ETF", "200", "535.00", "108436.00", "1436.00", "14800.00"),
-  holding("MSFT", "Microsoft Corporation", "微软", "28", "406.03", "11551.40", "182.14", "2797.16"),
+function deriveHoldings(
+  seeds: readonly HoldingSeed[],
+  quotes: readonly BrokerQuote[],
+): BrokerHolding[] {
+  const quoteBySymbol = new Map(quotes.map((item) => [item.symbol, item]));
+  return seeds.map((seed) => {
+    const matchedQuote = quoteBySymbol.get(seed.symbol);
+    const currentPrice = matchedQuote?.price ?? seed.averageCost;
+    const dailyChange = matchedQuote?.change ?? ZERO_PRICE;
+    const marketValue = decimalRound(decimalMultiply(currentPrice, seed.quantity), 2, "half-even") as Money;
+    const dayPnl = decimalRound(decimalMultiply(dailyChange, seed.quantity), 2, "half-even") as Money;
+    const totalPnl = decimalRound(
+      decimalMultiply(decimalSubtract(currentPrice, seed.averageCost), seed.quantity),
+      2,
+      "half-even",
+    ) as Money;
+    return {
+      symbol: seed.symbol,
+      companyEn: seed.companyEn,
+      companyZh: seed.companyZh,
+      quantity: seed.quantity,
+      availableQuantity: seed.availableQuantity,
+      averageCost: seed.averageCost,
+      marketValue,
+      dayPnl,
+      totalPnl,
+    };
+  });
+}
+
+function deriveAccountSummary(
+  baseAccount: BrokerAccount,
+  holdings: readonly BrokerHolding[],
+): BrokerAccount {
+  const holdingsValue = holdings.reduce<Money>(
+    (total, item) => decimalAdd(total, item.marketValue) as Money,
+    ZERO_MONEY,
+  );
+  const totalEquity = decimalAdd(holdingsValue, baseAccount.cash) as Money;
+  const todayChange = holdings.reduce<Money>(
+    (total, item) => decimalAdd(total, item.dayPnl) as Money,
+    ZERO_MONEY,
+  );
+  const previousEquity = decimalSubtract(totalEquity, todayChange);
+  const todayChangePct = decimalCompare(previousEquity, ZERO_PRICE) > 0
+    ? decimalDivide(decimalMultiply(todayChange, HUNDRED), previousEquity, 2, "half-even") as Percent
+    : percent("0");
+  const allTimeChange = holdings.reduce<Money>(
+    (total, item) => decimalAdd(total, item.totalPnl) as Money,
+    ZERO_MONEY,
+  );
+  return {
+    ...baseAccount,
+    totalEquity,
+    todayChange,
+    todayChangePct,
+    allTimeChange,
+  };
+}
+
+const BASE_HOLDING_SEEDS: readonly HoldingSeed[] = [
+  holdingSeed("AAPL", "Apple Inc.", "苹果公司", "100", "213.84"),
+  holdingSeed("NVDA", "NVIDIA Corporation", "英伟达", "50", "120.50"),
+  holdingSeed("SPY", "SPDR S&P 500 ETF", "标普 500 ETF", "200", "468.18"),
+  holdingSeed("MSFT", "Microsoft Corporation", "微软", "28", "372.55"),
 ];
+
+const HOLDINGS: readonly BrokerHolding[] = deriveHoldings(BASE_HOLDING_SEEDS, QUOTES);
 
 const orderEvent = (
   kind: BrokerOrderEvent["kind"],
@@ -261,18 +348,20 @@ function createHeatmap(): BrokerSnapshot["heatmap"] {
   });
 }
 
-const holdingsValue = HOLDINGS.reduce<Money>((total, item) => decimalAdd(total, item.marketValue) as Money, money("0"));
-const account = {
-  accountKey: "demo-account-1234",
-  cash: money("5320.00"),
-  buyingPower: money("10983.40"),
-  totalEquity: decimalAdd(holdingsValue, money("5320.00")) as Money,
-  todayChange: HOLDINGS.reduce<Money>((total, item) => decimalAdd(total, item.dayPnl) as Money, money("0")),
-  todayChangePct: percent("1.28"),
-  allTimeChange: money("18742.16"),
-  asOf: AS_OF,
-  status: "available" as const,
-};
+const account: BrokerAccount = deriveAccountSummary(
+  {
+    accountKey: "demo-account-1234",
+    cash: money("5320.00"),
+    buyingPower: money("10983.40"),
+    totalEquity: ZERO_MONEY,
+    todayChange: ZERO_MONEY,
+    todayChangePct: percent("0"),
+    allTimeChange: ZERO_MONEY,
+    asOf: AS_OF,
+    status: "available",
+  },
+  HOLDINGS,
+);
 
 const BASE_SNAPSHOT: BrokerSnapshot = {
   mode: "mock",
@@ -290,7 +379,7 @@ const BASE_SNAPSHOT: BrokerSnapshot = {
   heatmap: createHeatmap(),
   activeDays: 86,
   ordersFilled: 42,
-  yearNetChange: money("8214.00"),
+  yearNetChange: account.allTimeChange,
 };
 
 function stableDraftHash(draft: OrderDraft): string {
@@ -310,12 +399,23 @@ function nowIso(clock: () => number = () => Date.now()): string {
 }
 
 function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): BrokerSnapshot {
-  if (scenario === "healthy" || scenario === "request-failed" || scenario === "rate-limited" || scenario === "timeout" || scenario === "unknown" || scenario === "reconciliation-failed" || scenario === "insufficient-quantity" || scenario === "no-buying-power") {
+  if (
+    scenario === "healthy"
+    || scenario === "request-failed"
+    || scenario === "rate-limited"
+    || scenario === "timeout"
+    || scenario === "unknown"
+    || scenario === "reconciliation-failed"
+    || scenario === "insufficient-quantity"
+    || scenario === "no-buying-power"
+  ) {
     if (scenario === "no-buying-power") {
-      const holdingsValue = snapshot.holdings.reduce<Money>((total, holding) => decimalAdd(total, holding.marketValue) as Money, money("0"));
       return {
         ...snapshot,
-        account: { ...snapshot.account, cash: money("0"), buyingPower: money("0"), totalEquity: holdingsValue, status: "available" },
+        account: deriveAccountSummary(
+          { ...snapshot.account, cash: ZERO_MONEY, buyingPower: ZERO_MONEY, status: "available" },
+          snapshot.holdings,
+        ),
       };
     }
     return snapshot;
@@ -345,9 +445,9 @@ function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): Bro
         cash: cashOnlyValue,
         buyingPower: cashOnlyValue,
         totalEquity: cashOnlyValue,
-        todayChange: money("0"),
+        todayChange: ZERO_MONEY,
         todayChangePct: percent("0"),
-        allTimeChange: money("0"),
+        allTimeChange: ZERO_MONEY,
       },
       holdings: [],
       orders: [],
@@ -355,15 +455,27 @@ function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): Bro
       heatmap,
       activeDays: 0,
       ordersFilled: 0,
-      yearNetChange: money("0"),
+      yearNetChange: ZERO_MONEY,
     };
   }
 
   if (scenario === "loss") {
+    const lossQuotes: BrokerQuote[] = snapshot.quotes.map((item) => {
+      const lossPrice = decimalRound(decimalMultiply(item.price, LOSS_PRICE_FACTOR), 2, "half-even") as Price;
+      const lossChange = decimalRound(decimalMultiply(lossPrice, LOSS_DAY_DROP_RATE), 2, "half-even") as Price;
+      return {
+        ...item,
+        price: lossPrice,
+        change: lossChange,
+        changePct: deriveChangePct(lossPrice, lossChange),
+      };
+    });
+    const lossHoldings = deriveHoldings(snapshot.holdings, lossQuotes);
+    const lossAccount = deriveAccountSummary(snapshot.account, lossHoldings);
     const reverseAndAnchor = (points: readonly Money[]): readonly Money[] => {
       const reversed = [...points].reverse();
       if (reversed.length === 0) return reversed;
-      const offset = decimalSubtract(snapshot.account.totalEquity, reversed[reversed.length - 1]!) as Money;
+      const offset = decimalSubtract(lossAccount.totalEquity, reversed[reversed.length - 1]!) as Money;
       return reversed.map((point) => decimalAdd(point, offset) as Money);
     };
     const portfolioChart: BrokerSnapshot["portfolioChart"] = {
@@ -375,33 +487,34 @@ function scenarioSnapshot(snapshot: BrokerSnapshot, scenario: MockScenario): Bro
     };
     return {
       ...snapshot,
-      account: { ...snapshot.account, todayChange: money("-1820.34"), todayChangePct: percent("-1.18"), allTimeChange: money("-4210.80") },
-      holdings: snapshot.holdings.map((holding) => ({ ...holding, dayPnl: decimalMultiply(holding.dayPnl, money("-1")) as Money, totalPnl: decimalMultiply(holding.totalPnl, money("-1")) as Money })),
+      quotes: lossQuotes,
+      account: lossAccount,
+      holdings: lossHoldings,
       portfolioChart,
-      yearNetChange: money("-4210.80"),
+      yearNetChange: lossAccount.allTimeChange,
     };
   }
 
   if (scenario === "market-closed") {
-    return { ...snapshot, quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "stale" as const })) };
+    return { ...snapshot, quotes: snapshot.quotes.map((item) => ({ ...item, status: "stale" as const })) };
   }
 
   if (scenario === "stale-quote") {
-    return { ...snapshot, quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "stale" as const })) };
+    return { ...snapshot, quotes: snapshot.quotes.map((item) => ({ ...item, status: "stale" as const })) };
   }
 
   if (scenario === "offline") {
     return {
       ...snapshot,
       account: { ...snapshot.account, status: "offline" },
-      quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "offline" as const })),
+      quotes: snapshot.quotes.map((item) => ({ ...item, status: "offline" as const })),
     };
   }
 
   return {
     ...snapshot,
     account: { ...snapshot.account, status: "reauth-required" },
-    quotes: snapshot.quotes.map((quote) => ({ ...quote, status: "reauth-required" as const })),
+    quotes: snapshot.quotes.map((item) => ({ ...item, status: "reauth-required" as const })),
   };
 }
 
@@ -525,23 +638,23 @@ export class MockBroker implements BrokerAdapter {
     }
 
     const snapshot = this.getSnapshot();
-    const quote = snapshot.quotes.find((item) => item.symbol === draft.symbol);
-    if (!quote) throw new Error(`No mock quote for ${draft.symbol}`);
-    if (quote.status !== "available") {
+    const matchedQuote = snapshot.quotes.find((item) => item.symbol === draft.symbol);
+    if (!matchedQuote) throw new Error(`No mock quote for ${draft.symbol}`);
+    if (matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
 
-    const unitPrice = draft.limitPrice ?? quote.price;
-    const estimatedAmount = decimalMultiply(unitPrice, draft.quantity) as Money;
+    const unitPrice = draft.limitPrice ?? matchedQuote.price;
+    const estimatedAmount = decimalRound(decimalMultiply(unitPrice, draft.quantity), 2, "half-even") as Money;
     if (draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
-    if (this.scenario === "insufficient-quantity") {
-      throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
-    }
     if (draft.side === "sell") {
-      const holding = snapshot.holdings.find((item) => item.symbol === draft.symbol);
-      if (!holding || decimalCompare(draft.quantity, holding.quantity) > 0) {
+      if (this.scenario === "insufficient-quantity") {
+        throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+      }
+      const matchedHolding = snapshot.holdings.find((item) => item.symbol === draft.symbol);
+      if (!matchedHolding || decimalCompare(draft.quantity, matchedHolding.availableQuantity) > 0) {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
     }
@@ -555,7 +668,7 @@ export class MockBroker implements BrokerAdapter {
       previewId,
       draftHash,
       draft: { ...draft },
-      quote,
+      quote: matchedQuote,
       estimatedAmount,
       createdAt,
       expiresAt: new Date(Date.parse(createdAt) + PREVIEW_EXPIRY_MS).toISOString(),
@@ -582,22 +695,26 @@ export class MockBroker implements BrokerAdapter {
 
     // The account and quote can change while a preview is on screen. Recheck
     // the same local gates at consumption time so a stale preview cannot
-    // bypass a newly selected safety scenario.
+    // bypass a newly selected safety scenario or double-spend reserved funds.
     const snapshot = this.getSnapshot();
-    const quote = snapshot.quotes.find((item) => item.symbol === preview.draft.symbol);
-    if (!quote || quote.status !== "available") {
+    const matchedQuote = snapshot.quotes.find((item) => item.symbol === preview.draft.symbol);
+    if (!matchedQuote || matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
-    const estimatedAmount = decimalMultiply(preview.draft.limitPrice ?? quote.price, preview.draft.quantity) as Money;
+    const estimatedAmount = decimalRound(
+      decimalMultiply(preview.draft.limitPrice ?? matchedQuote.price, preview.draft.quantity),
+      2,
+      "half-even",
+    ) as Money;
     if (preview.draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
-    if (this.scenario === "insufficient-quantity") {
-      throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
-    }
     if (preview.draft.side === "sell") {
-      const holding = snapshot.holdings.find((item) => item.symbol === preview.draft.symbol);
-      if (!holding || decimalCompare(preview.draft.quantity, holding.quantity) > 0) {
+      if (this.scenario === "insufficient-quantity") {
+        throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
+      }
+      const matchedHolding = snapshot.holdings.find((item) => item.symbol === preview.draft.symbol);
+      if (!matchedHolding || decimalCompare(preview.draft.quantity, matchedHolding.availableQuantity) > 0) {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
     }
@@ -626,7 +743,32 @@ export class MockBroker implements BrokerAdapter {
         event,
       ],
     };
-    this.snapshot = { ...this.snapshot, orders: [order, ...this.snapshot.orders] };
+
+    const nextAccount: BrokerAccount = preview.draft.side === "buy"
+      ? {
+          ...this.snapshot.account,
+          buyingPower: decimalCompare(this.snapshot.account.buyingPower, estimatedAmount) > 0
+            ? decimalSubtract(this.snapshot.account.buyingPower, estimatedAmount) as Money
+            : ZERO_MONEY,
+        }
+      : this.snapshot.account;
+
+    const nextHoldings: readonly BrokerHolding[] = preview.draft.side === "sell"
+      ? this.snapshot.holdings.map((item) => {
+          if (item.symbol !== preview.draft.symbol) return item;
+          const remaining = decimalCompare(item.availableQuantity, preview.draft.quantity) > 0
+            ? decimalSubtract(item.availableQuantity, preview.draft.quantity) as Quantity
+            : ZERO_QUANTITY;
+          return { ...item, availableQuantity: remaining };
+        })
+      : this.snapshot.holdings;
+
+    this.snapshot = {
+      ...this.snapshot,
+      account: nextAccount,
+      holdings: nextHoldings,
+      orders: [order, ...this.snapshot.orders],
+    };
     this.notify();
     return cloneOrder(order);
   }

@@ -54,6 +54,7 @@ export interface BrokerHolding {
   companyEn: string;
   companyZh: string;
   quantity: Quantity;
+  availableQuantity: Quantity;
   averageCost: Price;
   marketValue: Money;
   dayPnl: Money;

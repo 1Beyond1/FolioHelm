@@ -89,6 +89,16 @@ describe("dynamic Mock snapshot", () => {
     expect(activity[0]?.title).toContain("买入");
     expect(activity[0]?.detail).toContain("股");
   });
+
+  it("uses cumulative unrealized P&L (totalPnl) consistently on home positions instead of dayPnl", () => {
+    const snapshot = MOCK_BROKER.getSnapshot();
+    const portfolio = getMockPortfolio("en");
+    const aaplHolding = snapshot.holdings.find((item) => item.symbol === "AAPL")!;
+    const aaplPosition = portfolio.positions.find((item) => item.ticker === "AAPL")!;
+
+    expect(aaplHolding.totalPnl).not.toBe(aaplHolding.dayPnl);
+    expect(aaplPosition.unrealizedPnl).toBe(Number(aaplHolding.totalPnl));
+  });
 });
 
 describe("OrdersPage", () => {

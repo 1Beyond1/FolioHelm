@@ -26,7 +26,7 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
     company: `${chinese ? holding.companyZh : holding.companyEn} · ${holding.quantity} ${chinese ? "股" : "shares"}`,
     shares: decimalToNumber(holding.quantity),
     marketValue: decimalToNumber(holding.marketValue),
-    unrealizedPnl: decimalToNumber(holding.dayPnl),
+    unrealizedPnl: decimalToNumber(holding.totalPnl),
     iconClass: holding.symbol.toLowerCase(),
   }));
 

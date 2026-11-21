@@ -132,4 +132,28 @@ describe("FolioHelm markets demo", () => {
     expect(security.chart["1D"]).toEqual([]);
     expect(security.news).toEqual([]);
   });
+
+  it("scales historical price series smoothly to the canonical quote and keeps stats ranges containing current price", () => {
+    const aapl = getMarketSecurity("AAPL");
+    const oneDay = aapl.chart["1D"];
+    const previousPoint = oneDay[oneDay.length - 2]!;
+    const lastPoint = oneDay[oneDay.length - 1]!;
+
+    expect(lastPoint).toBe(aapl.price);
+    // Avoid single-point cliff jump (previously jumped from 183.50 to 226.34 = >23%)
+    expect(Math.abs((lastPoint - previousPoint) / previousPoint)).toBeLessThan(0.05);
+
+    const parseRange = (range: string): [number, number] => {
+      const matches = range.match(/\d[\d,]*(?:\.\d+)?/g) ?? [];
+      return [Number(matches[0]?.replace(/,/g, "")), Number(matches[1]?.replace(/,/g, ""))];
+    };
+    const [dayLow, dayHigh] = parseRange(aapl.stats.dayRange);
+    const [yearLow, yearHigh] = parseRange(aapl.stats.yearRange);
+    expect(aapl.price).toBeGreaterThanOrEqual(dayLow);
+    expect(aapl.price).toBeLessThanOrEqual(dayHigh);
+    expect(aapl.price).toBeGreaterThanOrEqual(yearLow);
+    expect(aapl.price).toBeLessThanOrEqual(yearHigh);
+    // Uses cumulative totalPnl rather than dayPnl
+    expect(aapl.holdingPnl).toBe(1250);
+  });
 });

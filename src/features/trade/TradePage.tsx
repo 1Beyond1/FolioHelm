@@ -45,7 +45,7 @@ function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
     company: language === "zh" ? canonicalQuote?.companyZh ?? symbol : canonicalQuote?.companyEn ?? symbol,
     price: canonicalQuote?.price ?? price("0"),
     changePct: canonicalQuote?.changePct ?? ("0" as Percent),
-    heldShares: canonicalHolding?.quantity ?? makeQuantity("0"),
+    heldShares: canonicalHolding?.availableQuantity ?? makeQuantity("0"),
     status: canonicalQuote?.status ?? "no-data",
   };
 }
@@ -287,9 +287,10 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const positionReady = side === "Sell"
     && accountReady
     && quoteReady
+    && MOCK_BROKER.getScenario() !== "insufficient-quantity"
     && draft !== null
     && decimalCompare(draft.quantity, currentQuote.heldShares) <= 0;
-  const previewBlockedScenarios = ["offline", "reauth-required", "request-failed", "rate-limited", "timeout", "stale-quote", "market-closed", "insufficient-quantity"] as const;
+  const previewBlockedScenarios = ["offline", "reauth-required", "request-failed", "rate-limited", "timeout", "stale-quote", "market-closed"] as const;
   const executionReady = !previewBlockedScenarios.includes(MOCK_BROKER.getScenario() as (typeof previewBlockedScenarios)[number]);
   const safetyChecks = [
     {
