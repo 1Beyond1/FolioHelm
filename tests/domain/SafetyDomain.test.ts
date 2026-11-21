@@ -261,6 +261,46 @@ describe("local automation guardrails", () => {
     expect(normalized.policy.allowedSymbols).toEqual(["SPY"]);
     expect(normalized.logs).toEqual([]);
   });
+
+  it("resets reservedToday automatically on a new UTC calendar day and blocks closed-session runs", () => {
+    const controller = new AutomationController({
+      ...DEFAULT_AUTOMATION_STATE,
+      enabled: true,
+      mode: "dry-run",
+      policy: {
+        ...DEFAULT_AUTOMATION_STATE.policy,
+        maxOrderValue: money("200.00"),
+        maxDailyValue: money("200.00"),
+        maxOpenTasks: 5,
+      },
+    });
+    const baseInput = { symbol: "SPY" as const, side: "buy" as const, quantity: quantity("1"), price: price("150.00") };
+
+    const day1First = controller.run({ ...baseInput, idempotencyKey: "day1-1", at: "2026-08-10T14:00:00Z" });
+    expect(day1First.log.status).toBe("would-run");
+    expect(day1First.state.reservedToday).toBe("150");
+    controller.completeTask();
+
+    const day1Second = controller.run({ ...baseInput, idempotencyKey: "day1-2", at: "2026-08-10T15:00:00Z" });
+    expect(day1Second.log.status).toBe("blocked");
+    expect(day1Second.log.reason).toMatch(/daily value cap/i);
+
+    // Next UTC day resets reservedToday to 0 so the $150 run succeeds
+    const day2First = controller.run({ ...baseInput, idempotencyKey: "day2-1", at: "2026-08-11T14:00:00Z" });
+    expect(day2First.log.status).toBe("would-run");
+    expect(day2First.state.reservedToday).toBe("150");
+    controller.completeTask();
+
+    // Closed market session is blocked when regularSessionOnly is true
+    const closedSession = controller.run({
+      ...baseInput,
+      idempotencyKey: "day2-closed",
+      at: "2026-08-11T15:00:00Z",
+      marketSession: "closed",
+    });
+    expect(closedSession.log.status).toBe("blocked");
+    expect(closedSession.log.reason).toMatch(/regular market session is closed/i);
+  });
 });
 
 describe("tamper-evident local journal", () => {

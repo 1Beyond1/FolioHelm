@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import {
-  AutomationController,
+  AUTOMATION_CONTROLLER,
   DEFAULT_AUTOMATION_STATE,
   normalizeAutomationState,
   type AutomationMode,
@@ -9,6 +9,8 @@ import {
   type AutomationState,
 } from "../../domain/automation";
 import { decimalCompare, money, price, quantity, decimalToNumber, type Money } from "../../domain/decimal";
+import { findMockQuote, MOCK_BROKER } from "../../domain/mockBroker";
+import { formatCurrency } from "../../formatters";
 import type { BrokerSymbol } from "../../domain/contracts";
 import type { Language } from "../../types";
 import { readStored, writeStored } from "../../platform/storage";
@@ -122,12 +124,7 @@ const COPY = {
 } as const;
 
 function formatMoney(value: string, language: Language): string {
-  return new Intl.NumberFormat(language === "zh" ? "zh-CN" : "en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(decimalToNumber(money(value)));
+  return formatCurrency(decimalToNumber(money(value)), language);
 }
 
 function safeMoneyInput(value: string, fallback: Money): Money {
@@ -169,6 +166,7 @@ function automationReasonLabel(reason: string, language: Language): string {
     "Automation is disabled": "自动化已关闭",
     "Global kill switch is active": "全局紧急停止已触发",
     "Real Trading is unavailable until the Schwab API gate is completed": "完成嘉信 API Gate 前，真实交易不可用",
+    "Regular market session is closed; automation is restricted to regular hours": "常规交易时段已关闭；自动化仅限常规交易时段运行",
     "Symbol is not on the explicit automation allowlist": "该证券不在明确的自动化允许列表中",
     "Order value exceeds the configured per-order cap": "订单金额超过单笔上限",
     "Daily value cap would be exceeded; remaining budget is frozen": "将超过每日金额上限；剩余预算已冻结",
@@ -188,14 +186,28 @@ function createRunIdempotencyKey(symbol: BrokerSymbol): string {
 
 type EvidenceSaveStatus = "idle" | "saving" | "saved" | "failed";
 
+function hydrateAutomationState(): AutomationState {
+  const stored = readStored<unknown>("automation", null);
+  if (stored !== null) {
+    AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(stored));
+  }
+  return AUTOMATION_CONTROLLER.getState();
+}
+
 export function AutomationPage({ language }: AutomationPageProps) {
   const copy = COPY[language];
-  const [state, setState] = useState<AutomationState>(() => normalizeAutomationState(readStored("automation", DEFAULT_AUTOMATION_STATE)));
-  const [selectedMode, setSelectedMode] = useState<AutomationMode>(state.mode);
-  const [selectedSymbol, setSelectedSymbol] = useState<BrokerSymbol>(state.policy.allowedSymbols[0] ?? "SPY");
+  const [state, setState] = useState<AutomationState>(hydrateAutomationState);
+  const [selectedSymbol, setSelectedSymbol] = useState<BrokerSymbol>(() => state.policy.allowedSymbols[0] ?? "SPY");
   const [lastResult, setLastResult] = useState<AutomationState["logs"][number] | null>(null);
   const [evidenceStatus, setEvidenceStatus] = useState<EvidenceSaveStatus>("idle");
   const evidenceAttemptRef = useRef(0);
+  const selectedMode = state.mode;
+
+  useEffect(() => {
+    return AUTOMATION_CONTROLLER.subscribe(() => {
+      setState(AUTOMATION_CONTROLLER.getState());
+    });
+  }, []);
 
   useEffect(() => {
     writeStored("automation", persistableState(state));
@@ -207,11 +219,11 @@ export function AutomationPage({ language }: AutomationPageProps) {
   }, [state.policy.maxDailyValue, state.reservedToday]);
 
   function updateState(patch: Partial<AutomationState>): void {
-    setState((current) => ({ ...current, ...patch }));
+    AUTOMATION_CONTROLLER.updateState(patch);
   }
 
   function updatePolicy(patch: Partial<AutomationState["policy"]>): void {
-    setState((current) => ({ ...current, policy: { ...current.policy, ...patch } }));
+    AUTOMATION_CONTROLLER.updatePolicy(patch);
   }
 
   function toggleSymbol(symbol: BrokerSymbol): void {
@@ -224,16 +236,19 @@ export function AutomationPage({ language }: AutomationPageProps) {
   }
 
   async function runNow(): Promise<void> {
-    const controller = new AutomationController({ ...state, mode: selectedMode });
-    const result = controller.run({
+    const quote = findMockQuote(selectedSymbol);
+    const marketSession = MOCK_BROKER.getScenario() === "market-closed" ? "closed" : "regular";
+    const result = AUTOMATION_CONTROLLER.run({
       symbol: selectedSymbol,
       side: "buy",
       quantity: quantity("1"),
-      price: price("100.00"),
+      price: quote?.price ?? price("0"),
       idempotencyKey: createRunIdempotencyKey(selectedSymbol),
+      marketSession,
     });
-    const nextState = result.log.status === "would-run" ? controller.completeTask() : result.state;
-    setState(nextState);
+    if (result.log.status === "would-run") {
+      AUTOMATION_CONTROLLER.completeTask();
+    }
     setLastResult(result.log);
     const attempt = evidenceAttemptRef.current + 1;
     evidenceAttemptRef.current = attempt;
@@ -253,8 +268,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
   }
 
   function reset(): void {
-    setState({ ...DEFAULT_AUTOMATION_STATE, policy: { ...DEFAULT_AUTOMATION_STATE.policy, allowedSymbols: [...DEFAULT_AUTOMATION_STATE.policy.allowedSymbols] }, logs: [] });
-    setSelectedMode(DEFAULT_AUTOMATION_STATE.mode);
+    AUTOMATION_CONTROLLER.replaceState(DEFAULT_AUTOMATION_STATE);
     setSelectedSymbol(DEFAULT_AUTOMATION_STATE.policy.allowedSymbols[0] ?? "SPY");
     setLastResult(null);
     evidenceAttemptRef.current += 1;
@@ -282,7 +296,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
           <div className="automation-card-heading"><div><span>01</span><h2>{copy.mode}</h2></div></div>
           <div className="automation-mode-grid" role="group" aria-label={copy.mode}>
             {(["mock", "paper", "dry-run"] as const).map((mode) => (
-              <button key={mode} type="button" className={selectedMode === mode ? "is-selected" : ""} aria-pressed={selectedMode === mode} onClick={() => { setSelectedMode(mode); updateState({ mode }); }}>
+              <button key={mode} type="button" className={selectedMode === mode ? "is-selected" : ""} aria-pressed={selectedMode === mode} onClick={() => updateState({ mode })}>
                 {mode === "mock" ? copy.mock : mode === "paper" ? copy.paper : copy.dryRun}
               </button>
             ))}
@@ -315,7 +329,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
 
       <section className={`automation-kill ${state.killSwitchTripped ? "is-tripped" : ""}`}>
         <div><span className="automation-kill-label">{copy.killSwitch}</span><strong>{state.killSwitchTripped ? copy.tripped : copy.armed}</strong></div>
-        {state.killSwitchTripped ? <button type="button" className="automation-secondary" onClick={() => updateState({ killSwitchTripped: false })}>{copy.rearm}</button> : <button type="button" className="automation-danger" onClick={() => updateState({ killSwitchTripped: true, enabled: false })}>{copy.trip}</button>}
+        {state.killSwitchTripped ? <button type="button" className="automation-secondary" onClick={() => AUTOMATION_CONTROLLER.resetKillSwitch()}>{copy.rearm}</button> : <button type="button" className="automation-danger" onClick={() => AUTOMATION_CONTROLLER.tripKillSwitch()}>{copy.trip}</button>}
       </section>
 
       <section className="automation-card automation-card--wide">
