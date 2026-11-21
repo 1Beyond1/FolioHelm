@@ -4,7 +4,7 @@ import type { Language, ThemeMode } from "../../types";
 import type { MockScenario } from "../../domain/contracts";
 import { detectInitialLanguage } from "../../i18n";
 import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
-import { clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
+import { appendEvidence, clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
 import { Modal } from "../../components/Modal";
@@ -130,6 +130,7 @@ const COPY = {
     riskDialogIntro: "Risk acknowledgement required",
     riskDialogBody: "Turning off this protection increases the chance that a simulated order crosses a safety boundary. This is still a mock: no order, request, credential, or account action will occur.",
     readDetails: "I have read the risk details to the bottom.",
+    scrollToBottomHint: "Scroll the risk details to the bottom to enable this confirmation.",
     wait: (seconds: number) => `Wait ${seconds} seconds before confirming.`,
     ready: "The waiting period is complete.",
     typeDisable: "Type DISABLE to continue",
@@ -218,6 +219,7 @@ const COPY = {
     riskDialogIntro: "需要风险确认",
     riskDialogBody: "关闭此保护会增加模拟订单跨过安全边界的风险。这仍然是 Mock：不会发生订单、请求、凭证或账户操作。",
     readDetails: "我已阅读风险说明到底部。",
+    scrollToBottomHint: "请先将风险说明滚动到底部再勾选确认。",
     wait: (seconds: number) => `确认前请等待 ${seconds} 秒。`,
     ready: "等待时间已结束。",
     typeDisable: "输入 DISABLE 继续",
@@ -288,12 +290,14 @@ export function SettingsPage({
   const [pendingKey, setPendingKey] = useState<ProtectionKey | null>(null);
   const [countdown, setCountdown] = useState(8);
   const [readToBottom, setReadToBottom] = useState(false);
+  const [hasScrolledToBottom, setHasScrolledToBottom] = useState(false);
   const [confirmIntent, setConfirmIntent] = useState(false);
   const [disablePhrase, setDisablePhrase] = useState("");
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
   const [clearDataDialogOpen, setClearDataDialogOpen] = useState(false);
   const [evidenceStatus, setEvidenceStatus] = useState<EvidenceState>({ kind: "idle" });
   const importInputRef = useRef<HTMLInputElement>(null);
+  const riskScrollRef = useRef<HTMLDivElement>(null);
 
   const settingsModalOpen = connectionDialogOpen || pendingKey !== null || clearDataDialogOpen;
 
@@ -313,7 +317,7 @@ export function SettingsPage({
     anchor.href = url;
     anchor.download = "foliohelm-evidence-mock.json";
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   async function handleVerifyEvidence(): Promise<void> {
@@ -349,9 +353,16 @@ export function SettingsPage({
   }
 
   async function clearLocalData(): Promise<void> {
-    const preferencesCleared = clearFolioHelmStored();
-    const evidenceCleared = await clearEvidence();
-    if (!preferencesCleared || !evidenceCleared) {
+    await appendEvidence("state_changed", {
+      mode: "mock",
+      action: "local_data_reset_requested",
+    }).catch(() => undefined);
+    let preferencesCleared = false;
+    const cleared = await clearEvidence(() => {
+      preferencesCleared = clearFolioHelmStored();
+      return preferencesCleared;
+    });
+    if (!cleared || !preferencesCleared) {
       setEvidenceStatus({ kind: "invalid", clearFailed: true });
       return;
     }
@@ -371,12 +382,16 @@ export function SettingsPage({
   const needsDisablePhrase = pendingDefinition?.highRisk === true;
   const canConfirm = pendingKey !== null
     && countdown === 0
+    && hasScrolledToBottom
     && readToBottom
     && confirmIntent
     && (!needsDisablePhrase || disablePhrase === "DISABLE");
 
   useEffect(() => {
     if (pendingKey === null) return undefined;
+
+    const scrollBox = riskScrollRef.current;
+    setHasScrolledToBottom(!scrollBox || scrollBox.scrollHeight <= scrollBox.clientHeight + 1);
 
     const timer = window.setInterval(() => {
       setCountdown((current) => {
@@ -391,10 +406,19 @@ export function SettingsPage({
     return () => window.clearInterval(timer);
   }, [pendingKey]);
 
+  function handleRiskScroll(): void {
+    const scrollBox = riskScrollRef.current;
+    if (!scrollBox) return;
+    if (scrollBox.scrollTop + scrollBox.clientHeight >= scrollBox.scrollHeight - 4) {
+      setHasScrolledToBottom(true);
+    }
+  }
+
   function openDisableDialog(key: ProtectionKey): void {
     setPendingKey(key);
     setCountdown(8);
     setReadToBottom(false);
+    setHasScrolledToBottom(false);
     setConfirmIntent(false);
     setDisablePhrase("");
   }
@@ -407,12 +431,19 @@ export function SettingsPage({
 
     setProtections((current) => ({ ...current, [key]: true }));
     setWarningKey(null);
+    void appendEvidence("safety_setting_changed", {
+      mode: "mock",
+      setting: key,
+      enabled: "true",
+      action: "enabled",
+    }).catch(() => undefined);
   }
 
   function handleCancelDisable(): void {
     setPendingKey(null);
     setCountdown(8);
     setReadToBottom(false);
+    setHasScrolledToBottom(false);
     setConfirmIntent(false);
     setDisablePhrase("");
   }
@@ -424,6 +455,12 @@ export function SettingsPage({
     setProtections((current) => ({ ...current, [confirmedKey]: false }));
     setWarningKey(confirmedKey);
     handleCancelDisable();
+    void appendEvidence("safety_setting_changed", {
+      mode: "mock",
+      setting: confirmedKey,
+      enabled: "false",
+      action: "disabled",
+    }).catch(() => undefined);
   }
 
   const countdownText = countdown === 0 ? copy.ready : copy.wait(countdown);
@@ -638,7 +675,15 @@ export function SettingsPage({
           <p>{copy.riskDialogBody}</p>
           <p className="settings-risk-modal__target"><strong>{pendingDefinition.label}</strong></p>
 
-          <div className="settings-risk-scroll" role="region" aria-label={copy.riskDetails} tabIndex={0}>
+          <div
+            ref={riskScrollRef}
+            className="settings-risk-scroll"
+            data-testid="risk-details-scroll"
+            role="region"
+            aria-label={copy.riskDetails}
+            tabIndex={0}
+            onScroll={handleRiskScroll}
+          >
             <h3>{copy.riskDetails}</h3>
             <p>{copy.riskDetailOne}</p>
             <p>{copy.riskDetailTwo}</p>
@@ -649,10 +694,14 @@ export function SettingsPage({
             <input
               type="checkbox"
               checked={readToBottom}
+              disabled={!hasScrolledToBottom}
               onChange={(event) => setReadToBottom(event.target.checked)}
             />
             <span>{copy.readDetails}</span>
           </label>
+          {!hasScrolledToBottom && (
+            <p className="settings-scroll-hint" data-testid="risk-scroll-hint">{copy.scrollToBottomHint}</p>
+          )}
 
           <p className="settings-countdown" aria-live="polite" data-testid="disable-countdown">{countdownText}</p>
 

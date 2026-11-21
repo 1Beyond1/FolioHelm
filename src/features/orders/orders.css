@@ -560,6 +560,55 @@
   text-transform: none;
 }
 
+.fh-status-cell-group,
+.fh-timeline-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fh-reconcile-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--fh-warning-line);
+  border-radius: 999px;
+  background: var(--fh-warning-soft);
+  color: var(--fh-amber);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 750;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.fh-reconcile-button:hover,
+.fh-reconcile-button:focus-visible {
+  border-color: var(--fh-amber);
+  background: color-mix(in srgb, var(--fh-amber) 18%, transparent);
+}
+
+.fh-reconcile-feedback {
+  max-width: 1440px;
+  margin: 0 auto 12px;
+  padding: 11px 16px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.fh-reconcile-feedback--success {
+  border: 1px solid color-mix(in srgb, var(--fh-lime) 35%, var(--fh-line));
+  background: var(--fh-lime-soft);
+  color: var(--fh-lime);
+}
+
+.fh-reconcile-feedback--error {
+  border: 1px solid var(--fh-warning-line);
+  background: var(--fh-warning-soft);
+  color: var(--fh-amber);
+}
+
 @media (max-width: 900px) {
   .fh-orders-page .fh-orders-toolbar {
     align-items: stretch;

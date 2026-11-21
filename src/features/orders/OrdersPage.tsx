@@ -1,7 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
-import { MOCK_BROKER } from "../../domain/mockBroker";
+import { appendEvidence } from "../../domain/evidenceJournal";
+import { MOCK_BROKER, MockBrokerError } from "../../domain/mockBroker";
+import { formatCurrency } from "../../formatters";
 import "./orders.css";
 
 export interface OrdersPageProps {
@@ -36,111 +38,7 @@ export interface OrderRecord {
 
 const STATUS_KEYS: OrderStatus[] = ["working", "filled", "canceled", "rejected", "unknown"];
 
-const LEGACY_ORDERS: OrderRecord[] = [
-  {
-    id: "ORD-1048",
-    symbol: "NVDA",
-    side: "Buy",
-    type: "Limit",
-    qty: 12,
-    filled: 0,
-    limit: 132.5,
-    status: "working",
-    submitted: "Aug 09 · 09:42",
-    timeline: [
-      { kind: "draft", timestamp: "09:41:48", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "09:41:55", detail: "Estimated cost and buying power checked" },
-      { kind: "accepted", timestamp: "09:42:01", detail: "Accepted by the demo venue" },
-    ],
-  },
-  {
-    id: "ORD-1044",
-    symbol: "AAPL",
-    side: "Sell",
-    type: "Market",
-    qty: 8,
-    filled: 8,
-    limit: null,
-    status: "filled",
-    submitted: "Aug 08 · 14:16",
-    timeline: [
-      { kind: "draft", timestamp: "14:15:12", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "14:15:18", detail: "Estimated cost and buying power checked" },
-      { kind: "accepted", timestamp: "14:15:24", detail: "Accepted by the demo venue" },
-      { kind: "fill", timestamp: "14:16:03", detail: "8 shares filled at $196.20" },
-    ],
-  },
-  {
-    id: "ORD-1042",
-    symbol: "MSFT",
-    side: "Buy",
-    type: "Limit",
-    qty: 4,
-    filled: 4,
-    limit: 418,
-    status: "filled",
-    submitted: "Aug 08 · 11:07",
-    timeline: [
-      { kind: "draft", timestamp: "11:06:41", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "11:06:49", detail: "Estimated cost and buying power checked" },
-      { kind: "accepted", timestamp: "11:06:55", detail: "Accepted by the demo venue" },
-      { kind: "fill", timestamp: "11:07:22", detail: "4 shares filled at $417.88" },
-    ],
-  },
-  {
-    id: "ORD-1039",
-    symbol: "TSLA",
-    side: "Buy",
-    type: "Stop",
-    qty: 3,
-    filled: 0,
-    limit: 344,
-    status: "canceled",
-    submitted: "Aug 07 · 16:32",
-    timeline: [
-      { kind: "draft", timestamp: "16:31:08", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "16:31:16", detail: "Estimated cost and buying power checked" },
-      { kind: "accepted", timestamp: "16:31:24", detail: "Accepted by the demo venue" },
-      { kind: "canceled", timestamp: "16:32:10", detail: "Canceled by the account owner" },
-    ],
-  },
-  {
-    id: "ORD-1038",
-    symbol: "VTI",
-    side: "Sell",
-    type: "Limit",
-    qty: 5,
-    filled: 0,
-    limit: 281,
-    status: "rejected",
-    submitted: "Aug 07 · 13:55",
-    timeline: [
-      { kind: "draft", timestamp: "13:54:27", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "13:54:34", detail: "Estimated cost and buying power checked" },
-      { kind: "rejected", timestamp: "13:55:02", detail: "Demo venue rejected the order" },
-    ],
-  },
-  {
-    id: "ORD-1047",
-    symbol: "AMD",
-    side: "Buy",
-    type: "Limit",
-    qty: 6,
-    filled: 0,
-    limit: 161.4,
-    status: "unknown",
-    submitted: "Aug 09 · 09:39",
-    timeline: [
-      { kind: "draft", timestamp: "09:38:12", detail: "Created from the trade ticket" },
-      { kind: "preview", timestamp: "09:38:20", detail: "Estimated cost and buying power checked" },
-      { kind: "accepted", timestamp: "09:38:31", detail: "Accepted by the demo venue" },
-      { kind: "unknown", timestamp: "09:39:04", detail: "Venue acknowledgement is incomplete" },
-    ],
-  },
-];
-
 function readOrders(language: Language): OrderRecord[] {
-  void LEGACY_ORDERS;
   const locale = language === "zh" ? "zh-CN" : "en-US";
   return MOCK_BROKER.getSnapshot().orders.map((order) => ({
     id: order.id,
@@ -193,6 +91,9 @@ const COPY = {
     unknownTitle: "Unknown order state",
     unknownBody: "Do not resubmit — reconcile the broker ledger before taking any action.",
     unknownTag: "Review required",
+    reconcile: "Reconcile",
+    reconcileSuccess: (orderId: string, status: string) => `Reconciled ${orderId}: status updated to ${status}.`,
+    reconcileFailed: (orderId: string) => `Reconciliation failed for ${orderId}. Keep the order locked and do not resubmit.`,
     statuses: {
       working: "Working",
       filled: "Filled",
@@ -243,6 +144,9 @@ const COPY = {
     unknownTitle: "未知订单状态",
     unknownBody: "先对账，禁止重下。请先核对券商账本，再采取任何操作。",
     unknownTag: "需要复核",
+    reconcile: "对账",
+    reconcileSuccess: (orderId: string, status: string) => `已完成 ${orderId} 对账：状态已更新为「${status}」。`,
+    reconcileFailed: (orderId: string) => `${orderId} 对账失败，请保持该订单锁定并禁止重下。`,
     statuses: {
       working: "工作中",
       filled: "已成交",
@@ -263,23 +167,30 @@ const COPY = {
   },
 } as const;
 
-function formatMoney(value: number, language: Language): string {
-  const locale = language === "zh" ? "zh-CN" : "en-US";
-  return `$${value.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
 function formatQuantity(value: number, language: Language): string {
   return value.toLocaleString(language === "zh" ? "zh-CN" : "en-US", { maximumFractionDigits: 2 });
 }
 
+interface ReconcileFeedback {
+  kind: "success" | "error";
+  message: string;
+}
+
 export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   const copy = COPY[language];
-  // Read the canonical local ledger on every render so a newly consumed Mock
-  // preview appears immediately after the trade modal closes.
-  const orders = readOrders(language);
+  const [, setBrokerRevision] = useState(0);
   const [activeStatus, setActiveStatus] = useState<OrderStatus>("working");
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
+  const [reconcileFeedback, setReconcileFeedback] = useState<ReconcileFeedback | null>(null);
+
+  useEffect(() => {
+    return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
+  }, []);
+
+  // Read the canonical local ledger on every render so a newly consumed Mock
+  // preview or reconciled order appears immediately.
+  const orders = readOrders(language);
 
   const statusCounts = useMemo(() => {
     return orders.reduce<Record<OrderStatus, number>>(
@@ -303,6 +214,39 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   function selectStatus(status: OrderStatus) {
     setActiveStatus(status);
     setExpandedOrderId(null);
+  }
+
+  function handleReconcile(orderId: string, symbol: string): void {
+    try {
+      const reconciled = MOCK_BROKER.reconcileOrder(orderId);
+      setReconcileFeedback({
+        kind: "success",
+        message: copy.reconcileSuccess(reconciled.id, copy.statuses[reconciled.status]),
+      });
+      if (expandedOrderId === orderId && reconciled.status !== activeStatus) {
+        setExpandedOrderId(null);
+      }
+      void appendEvidence("reconciliation", {
+        mode: "mock",
+        orderId: reconciled.id,
+        symbol: reconciled.symbol,
+        previousStatus: "unknown",
+        nextStatus: reconciled.status,
+      }).catch(() => undefined);
+    } catch (error) {
+      setReconcileFeedback({
+        kind: "error",
+        message: copy.reconcileFailed(orderId),
+      });
+      void appendEvidence("reconciliation", {
+        mode: "mock",
+        orderId,
+        symbol,
+        previousStatus: "unknown",
+        outcome: "failed",
+        reason: error instanceof MockBrokerError ? error.code : "reconciliation_failed",
+      }).catch(() => undefined);
+    }
   }
 
   return (
@@ -359,6 +303,16 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
         </label>
       </section>
 
+      {reconcileFeedback && (
+        <aside
+          className={`fh-reconcile-feedback fh-reconcile-feedback--${reconcileFeedback.kind}`}
+          data-testid="orders-reconcile-feedback"
+          role={reconcileFeedback.kind === "error" ? "alert" : "status"}
+        >
+          {reconcileFeedback.message}
+        </aside>
+      )}
+
       {activeStatus === "unknown" && (
         <aside className="fh-unknown-warning" data-testid="orders-unknown-warning" role="alert">
           <span className="fh-unknown-icon">!</span>
@@ -408,6 +362,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
                     order={order}
                     expanded={expanded}
                     onToggle={() => setExpandedOrderId(expanded ? null : order.id)}
+                    onReconcile={() => handleReconcile(order.id, order.symbol)}
                   />
                 );
               })}
@@ -432,12 +387,14 @@ function OrderRows({
   order,
   expanded,
   onToggle,
+  onReconcile,
 }: {
   copy: OrdersCopy;
   language: Language;
   order: OrderRecord;
   expanded: boolean;
   onToggle: () => void;
+  onReconcile: () => void;
 }) {
   const statusLabel = copy.statuses[order.status];
   return (
@@ -474,9 +431,25 @@ function OrderRows({
           <span>{formatQuantity(order.filled, language)}</span>
           <span className="fh-filled-total">/ {formatQuantity(order.qty, language)}</span>
         </td>
-        <td className="fh-number-cell">{order.limit === null ? "—" : formatMoney(order.limit, language)}</td>
+        <td className="fh-number-cell">{order.limit === null ? "—" : formatCurrency(order.limit, language)}</td>
         <td>
-          <span className={`fh-order-status fh-order-status-${order.status}`}>{statusLabel}</span>
+          <span className="fh-status-cell-group">
+            <span className={`fh-order-status fh-order-status-${order.status}`}>{statusLabel}</span>
+            {order.status === "unknown" && (
+              <button
+                type="button"
+                className="fh-reconcile-button"
+                data-testid={`orders-reconcile-${order.id}`}
+                aria-label={`${copy.reconcile} ${order.id}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onReconcile();
+                }}
+              >
+                {copy.reconcile}
+              </button>
+            )}
+          </span>
         </td>
         <td className="fh-submitted-cell">{order.submitted}</td>
       </tr>
@@ -488,11 +461,23 @@ function OrderRows({
                 <strong>{copy.timeline}</strong>
                 <span>{copy.timelineDetail}</span>
               </div>
-              {order.status === "unknown" && <span className="fh-timeline-warning">{copy.doNotResubmit}</span>}
+              {order.status === "unknown" && (
+                <div className="fh-timeline-actions">
+                  <span className="fh-timeline-warning">{copy.doNotResubmit}</span>
+                  <button
+                    type="button"
+                    className="fh-reconcile-button"
+                    data-testid={`orders-timeline-reconcile-${order.id}`}
+                    onClick={onReconcile}
+                  >
+                    {copy.reconcile}
+                  </button>
+                </div>
+              )}
             </div>
             <ol className="fh-order-timeline">
-              {order.timeline.map((event) => (
-                <li key={`${order.id}-${event.kind}-${event.timestamp}`} className={`fh-timeline-event fh-timeline-${event.kind}`}>
+              {order.timeline.map((event, index) => (
+                <li key={`${order.id}-${event.kind}-${event.timestamp}-${index}`} className={`fh-timeline-event fh-timeline-${event.kind}`}>
                   <span className="fh-timeline-dot" aria-hidden="true" />
                   <div>
                     <div className="fh-timeline-meta">

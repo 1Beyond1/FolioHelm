@@ -1,13 +1,15 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PortfolioPage } from "../../src/features/portfolio/PortfolioPage";
 import { OrdersPage } from "../../src/features/orders/OrdersPage";
+import { clearEvidence, listEvidence, verifyEvidence } from "../../src/domain/evidenceJournal";
 import { MOCK_BROKER } from "../../src/domain/mockBroker";
 import { getMockPortfolio } from "../../src/mocks/portfolio";
 
-afterEach(() => {
-  MOCK_BROKER.reset();
+afterEach(async () => {
   cleanup();
+  MOCK_BROKER.reset();
+  await clearEvidence();
 });
 
 describe("PortfolioPage", () => {
@@ -136,5 +138,42 @@ describe("OrdersPage", () => {
 
     fireEvent.click(screen.getByTestId("orders-new-order"));
     expect(onOpenTrade).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles an unknown order via the Reconcile action and records reconciliation evidence", async () => {
+    render(<OrdersPage language="en" onOpenTrade={vi.fn()} />);
+
+    fireEvent.click(screen.getByTestId("orders-tab-unknown"));
+    expect(screen.getByTestId("orders-count-unknown")).toHaveTextContent("1");
+    expect(screen.getByTestId("orders-count-working")).toHaveTextContent("1");
+
+    fireEvent.click(screen.getByTestId("orders-reconcile-ORD-1047"));
+
+    expect(screen.getByTestId("orders-count-unknown")).toHaveTextContent("0");
+    expect(screen.getByTestId("orders-count-working")).toHaveTextContent("2");
+    expect(screen.getByTestId("orders-reconcile-feedback")).toHaveTextContent(/Reconciled ORD-1047/i);
+
+    await waitFor(async () => {
+      const records = await listEvidence();
+      expect(records.some((r) => r.kind === "reconciliation" && r.payload.orderId === "ORD-1047" && r.payload.nextStatus === "working")).toBe(true);
+    });
+    expect((await verifyEvidence()).valid).toBe(true);
+  });
+
+  it("keeps an unknown order locked and shows an alert when reconciliation fails", async () => {
+    MOCK_BROKER.setScenario("reconciliation-failed");
+    render(<OrdersPage language="zh" onOpenTrade={vi.fn()} />);
+
+    fireEvent.click(screen.getByTestId("orders-tab-unknown"));
+    fireEvent.click(screen.getByTestId("orders-reconcile-ORD-1047"));
+
+    expect(screen.getByTestId("orders-count-unknown")).toHaveTextContent("1");
+    expect(screen.getByTestId("orders-reconcile-feedback")).toHaveAttribute("role", "alert");
+    expect(screen.getByTestId("orders-reconcile-feedback")).toHaveTextContent(/对账失败/);
+
+    await waitFor(async () => {
+      const records = await listEvidence();
+      expect(records.some((r) => r.kind === "reconciliation" && r.payload.outcome === "failed")).toBe(true);
+    });
   });
 });

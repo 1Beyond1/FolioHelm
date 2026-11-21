@@ -566,6 +566,12 @@
   accent-color: var(--settings-lime);
 }
 
+.settings-scroll-hint {
+  margin: 6px 0 0 26px !important;
+  color: var(--settings-warning) !important;
+  font-size: 11px !important;
+}
+
 .settings-countdown {
   margin: 17px 0 0 !important;
   color: var(--settings-warning) !important;

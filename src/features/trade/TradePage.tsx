@@ -1,8 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
 import { decimalCompare, decimalMultiply, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
 import { findMockHolding, findMockQuote, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
+import { appendEvidence } from "../../domain/evidenceJournal";
+import { formatCurrency } from "../../formatters";
 import type { BrokerOrder, BrokerOrderStatus, BrokerSymbol, DataStatus, MockPreview, OrderDraft } from "../../domain/contracts";
 import "./TradePage.css";
 
@@ -25,12 +27,14 @@ interface Quote {
   price: Price;
   changePct: Percent;
   heldShares: Quantity;
+  asOf: string;
   status: DataStatus;
 }
 
 interface DemoReceipt {
   receiptId: string;
   orderId: string;
+  previewId: string;
   draftHash: string;
   estimatedAmount: Money;
   status: BrokerOrderStatus;
@@ -46,8 +50,22 @@ function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
     price: canonicalQuote?.price ?? price("0"),
     changePct: canonicalQuote?.changePct ?? ("0" as Percent),
     heldShares: canonicalHolding?.availableQuantity ?? makeQuantity("0"),
+    asOf: canonicalQuote?.asOf ?? "",
     status: canonicalQuote?.status ?? "no-data",
   };
+}
+
+function formatQuoteFreshness(asOf: string, language: Language): string {
+  const parsed = Date.parse(asOf);
+  if (!Number.isFinite(parsed)) {
+    return language === "zh" ? "模拟快照" : "Mock snapshot";
+  }
+  const ageSeconds = Math.floor((Date.now() - parsed) / 1000);
+  if (ageSeconds >= 0 && ageSeconds < 60) {
+    return language === "zh" ? `${ageSeconds} 秒前` : `${ageSeconds} seconds old`;
+  }
+  const stamp = new Date(parsed).toISOString().slice(0, 16).replace("T", " ");
+  return language === "zh" ? `模拟快照 · ${stamp} UTC` : `Mock snapshot · ${stamp} UTC`;
 }
 
 const COPY = {
@@ -84,6 +102,7 @@ const COPY = {
     quoteAgeValue: "12 seconds old",
     buyingPowerCheck: "Buying power",
     available: "Available in this mock",
+    availableSuffix: "available",
     insufficientBuyingPower: "Insufficient buying power",
     positionAvailable: "Available to sell",
     positionInsufficient: "Insufficient position",
@@ -167,6 +186,7 @@ const COPY = {
     quoteAgeValue: "12 秒前",
     buyingPowerCheck: "购买力",
     available: "演示中的可用金额",
+    availableSuffix: "可用",
     insufficientBuyingPower: "购买力不足",
     positionAvailable: "可卖数量",
     positionInsufficient: "持仓数量不足",
@@ -225,12 +245,7 @@ function normalizeTradeSymbol(value: string | undefined): TradeSymbol | undefine
 }
 
 function formatMoney(amount: Money | Price, language: Language): string {
-  return new Intl.NumberFormat(language === "zh" ? "zh-CN" : "en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(decimalToNumber(amount));
+  return formatCurrency(decimalToNumber(amount), language);
 }
 
 const WHOLE_QUANTITY_RE = /^[1-9]\d*$/;
@@ -258,6 +273,11 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const [preview, setPreview] = useState<MockPreview | null>(null);
   const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
   const [flowError, setFlowError] = useState<string | null>(null);
+  const [, setBrokerRevision] = useState(0);
+
+  useEffect(() => {
+    return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
+  }, []);
 
   const currentQuote = getTradeQuote(symbol, language);
   const draft = useMemo<OrderDraft | null>(() => {
@@ -304,7 +324,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       key: "quote",
       passed: quoteReady,
       title: copy.quoteAge,
-      detail: quoteReady ? copy.quoteAgeValue : copy.quoteUnavailable,
+      detail: quoteReady ? formatQuoteFreshness(currentQuote.asOf, language) : copy.quoteUnavailable,
       suffix: copy.quote,
     },
     {
@@ -314,7 +334,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       detail: side === "Buy"
         ? buyingPowerReady
           ? `${copy.available} · ${formatMoney(demoBuyingPower, language)}`
-          : `${copy.insufficientBuyingPower} · ${formatMoney(demoBuyingPower, language)} available`
+          : `${copy.insufficientBuyingPower} · ${formatMoney(demoBuyingPower, language)} ${copy.availableSuffix}`
         : positionReady
           ? `${copy.positionAvailable} · ${currentQuote.heldShares} ${copy.shares}`
           : `${copy.positionInsufficient} · ${currentQuote.heldShares} ${copy.shares}`,
@@ -371,15 +391,35 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
     if (preview) MOCK_BROKER.invalidatePreview(preview.previewId);
 
     try {
-      setPreview(MOCK_BROKER.previewOrder(draft));
+      const nextPreview = MOCK_BROKER.previewOrder(draft);
+      setPreview(nextPreview);
       setAcknowledged(false);
       setErrors({});
       setFlowError(null);
       setStep("preview");
-    } catch {
+      void appendEvidence("preview_created", {
+        mode: "mock",
+        symbol: nextPreview.draft.symbol,
+        side: nextPreview.draft.side,
+        orderType: nextPreview.draft.type,
+        quantity: nextPreview.draft.quantity,
+        estimatedAmount: nextPreview.estimatedAmount,
+        previewId: nextPreview.previewId,
+        draftHash: nextPreview.draftHash,
+      }).catch(() => undefined);
+    } catch (error) {
       setErrors({});
       setFlowError(copy.previewBlocked);
       setStep("safety");
+      void appendEvidence("order_intent", {
+        mode: "mock",
+        symbol: draft.symbol,
+        side: draft.side,
+        orderType: draft.type,
+        quantity: draft.quantity,
+        status: "blocked",
+        reason: error instanceof MockBrokerError ? error.code : "preview_failed",
+      }).catch(() => undefined);
     }
   }
 
@@ -393,17 +433,40 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       setReceipt({
         receiptId: `DEMO-RECEIPT-${simulatedOrder.id}`,
         orderId: simulatedOrder.id,
+        previewId: preview.previewId,
         draftHash: currentDraftHash,
         estimatedAmount: preview.estimatedAmount,
         status: simulatedOrder.status,
       });
       setStep("receipt");
+      void appendEvidence("user_confirmation", {
+        mode: "mock",
+        symbol: draft.symbol,
+        previewId: preview.previewId,
+        draftHash: currentDraftHash,
+      }).catch(() => undefined);
+      void appendEvidence("mock_response", {
+        mode: "mock",
+        orderId: simulatedOrder.id,
+        symbol: simulatedOrder.symbol,
+        side: simulatedOrder.side,
+        quantity: simulatedOrder.quantity,
+        status: simulatedOrder.status,
+        previewId: preview.previewId,
+      }).catch(() => undefined);
     } catch (error) {
       MOCK_BROKER.invalidatePreview(preview.previewId);
       setPreview(null);
       setAcknowledged(false);
       setFlowError(error instanceof MockBrokerError && error.code === "preview-expired" ? copy.previewExpired : copy.simulationFailed);
       setStep("safety");
+      void appendEvidence("mock_response", {
+        mode: "mock",
+        symbol: draft.symbol,
+        previewId: preview.previewId,
+        status: "failed",
+        reason: error instanceof MockBrokerError ? error.code : "simulation_failed",
+      }).catch(() => undefined);
     }
   }
 
@@ -806,7 +869,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
             <div><dt>{copy.symbol}</dt><dd>{symbol}</dd></div>
              <div><dt>{copy.estimatedAmount}</dt><dd>{formatMoney(receipt.estimatedAmount, language)}</dd></div>
              <div><dt>{copy.receiptId}</dt><dd>{receipt.receiptId}</dd></div>
-             <div><dt>{copy.previewId}</dt><dd>{receipt.draftHash}</dd></div>
+             <div><dt>{copy.previewId}</dt><dd data-testid="trade-receipt-preview-id">{receipt.previewId}</dd></div>
           </dl>
           <div className="trade-card__footer">
             <button className="trade-button trade-button--secondary" type="button" onClick={handleCreateAnother}>{copy.another}</button>

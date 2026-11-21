@@ -1,15 +1,19 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPage } from "../../src/features/settings/SettingsPage";
 import { TradePage } from "../../src/features/trade/TradePage";
 import { detectInitialLanguage } from "../../src/i18n";
+import { clearEvidence, listEvidence, verifyEvidence } from "../../src/domain/evidenceJournal";
 import { MOCK_BROKER } from "../../src/domain/mockBroker";
 import { Modal } from "../../src/components/Modal";
 import { STORAGE_PREFIX } from "../../src/platform/storage";
 
-afterEach(() => {
+afterEach(async () => {
+  cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   MOCK_BROKER.reset();
+  await clearEvidence();
   document.body.innerHTML = "";
 });
 
@@ -159,6 +163,38 @@ describe("TradePage", () => {
     expect(screen.queryByText("Mock preview")).not.toBeInTheDocument();
     expect(screen.queryByText("Demo receipt")).not.toBeInTheDocument();
   });
+
+  it("renders the real previewId on the receipt and records verifiable evidence across trade steps", async () => {
+    render(<TradePage language="en" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("Quantity (whole shares)"), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to Mock preview" }));
+    fireEvent.click(screen.getByLabelText(/I understand this is a simulated order/));
+    fireEvent.click(screen.getByRole("button", { name: "Simulate order" }));
+
+    expect(screen.getByTestId("trade-receipt-preview-id")).toHaveTextContent(/^MOCK-PREVIEW-AAPL-/);
+    expect(screen.getByTestId("trade-receipt-preview-id")).not.toHaveTextContent("AAPL:buy:market");
+
+    await waitFor(async () => {
+      const records = await listEvidence();
+      expect(records.map((r) => r.kind)).toEqual(["preview_created", "user_confirmation", "mock_response"]);
+    });
+    expect((await verifyEvidence()).valid).toBe(true);
+  });
+
+  it("avoids English words on Chinese insufficient buying power and avoids hardcoded 12-second quote age", () => {
+    MOCK_BROKER.setScenario("no-buying-power");
+    render(<TradePage language="zh" initialSymbol="AAPL" onClose={() => undefined} onViewOrders={() => undefined} />);
+
+    fireEvent.change(screen.getByLabelText("数量（整数股）"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+
+    expect(screen.getByTestId("trade-check-buying-power")).not.toHaveTextContent(/\bavailable\b/i);
+    expect(screen.getByTestId("trade-check-buying-power")).toHaveTextContent("可用");
+    expect(screen.getByTestId("trade-check-quote")).not.toHaveTextContent("12 秒前");
+    expect(screen.getByTestId("trade-check-quote")).toHaveTextContent("2026-08-10 16:00 UTC");
+  });
 });
 
 describe("SettingsPage", () => {
@@ -293,5 +329,65 @@ describe("SettingsPage", () => {
 
     unmount();
     expect(onModalStateChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("records safety setting evidence when disabling and re-enabling protections", async () => {
+    vi.useFakeTimers();
+    render(<SettingsPage language="en" onLanguageChange={() => undefined} />);
+
+    fireEvent.click(screen.getByRole("switch", { name: /Price deviation: On/i }));
+    fireEvent.click(screen.getByLabelText("I have read the risk details to the bottom."));
+    fireEvent.click(screen.getByTestId("confirm-disable-intent"));
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm disable" }));
+    fireEvent.click(screen.getByRole("switch", { name: /Price deviation: Off/i }));
+
+    vi.useRealTimers();
+    await waitFor(async () => {
+      const records = await listEvidence();
+      expect(records.filter((r) => r.kind === "safety_setting_changed")).toHaveLength(2);
+    });
+    expect((await verifyEvidence()).valid).toBe(true);
+  });
+
+  it("defers revoking the blob URL on evidence export so WebView2 downloads are not truncated", async () => {
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock-evidence");
+    const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+
+    render(<SettingsPage language="en" onLanguageChange={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+
+    await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 1000);
+  });
+
+  it("requires scrolling an overflowing risk details box to the bottom before unlocking the checkbox", () => {
+    const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(320);
+    const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(120);
+
+    try {
+      render(<SettingsPage language="en" onLanguageChange={() => undefined} />);
+      fireEvent.click(screen.getByRole("switch", { name: /Price deviation: On/i }));
+
+      const checkbox = screen.getByLabelText("I have read the risk details to the bottom.");
+      expect(checkbox).toBeDisabled();
+      expect(screen.getByTestId("risk-scroll-hint")).toBeInTheDocument();
+
+      const scrollBox = screen.getByTestId("risk-details-scroll");
+      Object.defineProperty(scrollBox, "scrollTop", { value: 200, configurable: true });
+      fireEvent.scroll(scrollBox);
+
+      expect(checkbox).toBeEnabled();
+      expect(screen.queryByTestId("risk-scroll-hint")).not.toBeInTheDocument();
+    } finally {
+      scrollHeightSpy.mockRestore();
+      clientHeightSpy.mockRestore();
+    }
   });
 });
