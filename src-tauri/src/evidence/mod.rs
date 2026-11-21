@@ -43,10 +43,12 @@ pub enum EvidenceKind {
     ReplaceObserved,
     SessionLocked,
     SafetySettingChanged,
+    StateChanged,
+    AutomationRun,
 }
 
 impl EvidenceKind {
-    fn canonical_name(&self) -> &'static str {
+    pub fn canonical_name(&self) -> &'static str {
         match self {
             Self::DraftCreated => "draft_created",
             Self::PreviewRequested => "preview_requested",
@@ -64,6 +66,74 @@ impl EvidenceKind {
             Self::ReplaceObserved => "replace_observed",
             Self::SessionLocked => "session_locked",
             Self::SafetySettingChanged => "safety_setting_changed",
+            Self::StateChanged => "state_changed",
+            Self::AutomationRun => "automation_run",
+        }
+    }
+
+    pub fn local_kind(&self) -> &'static str {
+        match self {
+            Self::DraftCreated => "order_intent",
+            Self::PreviewRequested | Self::PreviewReceived => "preview_created",
+            Self::ConfirmationOpened | Self::ConfirmationAccepted => "user_confirmation",
+            Self::DispatchStarted
+            | Self::BrokerAccepted
+            | Self::BrokerRejected
+            | Self::OrderUnknown => "mock_response",
+            Self::ReconciliationObserved => "reconciliation",
+            Self::SafetySettingChanged => "safety_setting_changed",
+            Self::AutomationRun => "automation_run",
+            Self::CancelStarted
+            | Self::CancelObserved
+            | Self::ReplaceStarted
+            | Self::ReplaceObserved
+            | Self::SessionLocked
+            | Self::StateChanged => "state_changed",
+        }
+    }
+
+    pub fn from_canonical(name: &str) -> Result<Self, EvidenceError> {
+        match name {
+            "draft_created" => Ok(Self::DraftCreated),
+            "preview_requested" => Ok(Self::PreviewRequested),
+            "preview_received" => Ok(Self::PreviewReceived),
+            "confirmation_opened" => Ok(Self::ConfirmationOpened),
+            "confirmation_accepted" => Ok(Self::ConfirmationAccepted),
+            "dispatch_started" => Ok(Self::DispatchStarted),
+            "broker_accepted" => Ok(Self::BrokerAccepted),
+            "broker_rejected" => Ok(Self::BrokerRejected),
+            "order_unknown" => Ok(Self::OrderUnknown),
+            "reconciliation_observed" => Ok(Self::ReconciliationObserved),
+            "cancel_started" => Ok(Self::CancelStarted),
+            "cancel_observed" => Ok(Self::CancelObserved),
+            "replace_started" => Ok(Self::ReplaceStarted),
+            "replace_observed" => Ok(Self::ReplaceObserved),
+            "session_locked" => Ok(Self::SessionLocked),
+            "safety_setting_changed" => Ok(Self::SafetySettingChanged),
+            "state_changed" => Ok(Self::StateChanged),
+            "automation_run" => Ok(Self::AutomationRun),
+            other => Err(EvidenceError::UnsupportedKind(other.to_string())),
+        }
+    }
+
+    pub fn from_frontend_or_canonical(
+        name: &str,
+        fields: &BTreeMap<String, String>,
+    ) -> Result<Self, EvidenceError> {
+        match name {
+            "order_intent" => Ok(Self::DraftCreated),
+            "preview_created" => Ok(Self::PreviewReceived),
+            "user_confirmation" => Ok(Self::ConfirmationAccepted),
+            "mock_response" => match fields.get("status").map(String::as_str) {
+                Some("unknown") => Ok(Self::OrderUnknown),
+                Some("rejected" | "failed") => Ok(Self::BrokerRejected),
+                _ => Ok(Self::BrokerAccepted),
+            },
+            "reconciliation" => Ok(Self::ReconciliationObserved),
+            "automation_run" => Ok(Self::AutomationRun),
+            "safety_setting_changed" => Ok(Self::SafetySettingChanged),
+            "state_changed" => Ok(Self::StateChanged),
+            other => Self::from_canonical(other),
         }
     }
 }
@@ -123,6 +193,8 @@ impl EvidenceEvent {
         require_non_empty("app_version", &self.app_version)?;
         require_non_empty("account_ref", &self.payload.account_ref)?;
         require_non_empty("intent_id", &self.payload.intent_id)?;
+        reject_sensitive_value("account_ref", &self.payload.account_ref)?;
+        reject_sensitive_value("intent_id", &self.payload.intent_id)?;
 
         if normalize_timestamp(&self.occurred_at_utc)? != self.occurred_at_utc {
             return Err(EvidenceError::TimestampNotCanonical);
@@ -136,6 +208,7 @@ impl EvidenceEvent {
             if value.len() > 16_384 {
                 return Err(EvidenceError::FieldTooLong("payload field value"));
             }
+            reject_sensitive_field(key, value)?;
         }
         Ok(())
     }
@@ -469,6 +542,14 @@ pub enum EvidenceError {
     UntrustedNotary,
     #[error("notary receipt hash mismatch")]
     ReceiptHashMismatch,
+    #[error("sensitive evidence field rejected: {0}")]
+    SensitiveField(String),
+    #[error("unsupported evidence kind: {0}")]
+    UnsupportedKind(String),
+    #[error("unsupported evidence bundle: {0}")]
+    InvalidBundle(String),
+    #[error("operating system randomness is unavailable")]
+    RandomnessUnavailable,
 }
 
 fn hash_payload(payload: &EvidencePayload) -> Hash32 {
@@ -561,6 +642,517 @@ fn require_non_empty(name: &'static str, value: &str) -> Result<(), EvidenceErro
         Err(EvidenceError::EmptyField(name))
     } else {
         Ok(())
+    }
+}
+
+const SENSITIVE_KEY_TOKENS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "cookie",
+    "bearer",
+    "credential",
+    "credentials",
+    "authorization",
+];
+
+const SENSITIVE_KEY_COMPACT_SUBSTRINGS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "cookie",
+    "bearer",
+    "credential",
+    "apikey",
+    "appkey",
+    "privatekey",
+    "clientid",
+    "clientsecret",
+    "accountnumber",
+    "accounthash",
+    "authheader",
+    "authcode",
+    "oauthcode",
+    "sessionid",
+];
+
+const SENSITIVE_VALUE_ASSIGNMENT_KEYS: &[&str] = &[
+    "api_key",
+    "api-key",
+    "apikey",
+    "app_key",
+    "app-key",
+    "appkey",
+    "client_secret",
+    "client-secret",
+    "clientsecret",
+    "access_token",
+    "access-token",
+    "accesstoken",
+    "refresh_token",
+    "refresh-token",
+    "refreshtoken",
+    "private_key",
+    "private-key",
+    "privatekey",
+    "account_number",
+    "account-number",
+    "accountnumber",
+    "account_hash",
+    "account-hash",
+    "accounthash",
+    "authorization",
+    "credential",
+    "passphrase",
+    "password",
+    "passwd",
+    "secret",
+    "cookie",
+    "token",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| SENSITIVE_KEY_TOKENS.contains(&token))
+    {
+        return true;
+    }
+
+    let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+    SENSITIVE_KEY_COMPACT_SUBSTRINGS
+        .iter()
+        .any(|pattern| compact.contains(pattern))
+}
+
+fn is_word_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0 || !bytes[index - 1].is_ascii_alphanumeric()
+}
+
+fn contains_auth_scheme_credential(
+    lower: &str,
+    scheme: &str,
+    min_len: usize,
+    base64_only: bool,
+) -> bool {
+    let bytes = lower.as_bytes();
+    let scheme_bytes = scheme.as_bytes();
+    let mut offset = 0;
+
+    while let Some(rel) = lower[offset..].find(scheme) {
+        let pos = offset + rel;
+        let after_scheme = pos + scheme_bytes.len();
+        if is_word_boundary(bytes, pos)
+            && after_scheme < bytes.len()
+            && bytes[after_scheme].is_ascii_whitespace()
+        {
+            let mut cursor = after_scheme;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let token_start = cursor;
+            while cursor < bytes.len() {
+                let b = bytes[cursor];
+                let valid = if base64_only {
+                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')
+                } else {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+                };
+                if !valid {
+                    break;
+                }
+                cursor += 1;
+            }
+            if cursor.saturating_sub(token_start) >= min_len {
+                return true;
+            }
+        }
+        offset = after_scheme;
+    }
+    false
+}
+
+fn is_jwt_token(token: &str) -> bool {
+    if !token.starts_with("eyJ") {
+        return false;
+    }
+    let mut parts = token.split('.');
+    let (Some(header), Some(payload), Some(sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    [header, payload, sig].iter().all(|part| {
+        part.len() >= 6
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    })
+}
+
+fn has_known_secret_prefix(token: &str) -> bool {
+    (token.starts_with("sk-") && token.len() >= 20)
+        || (token.starts_with("ghp_") && token.len() >= 24)
+        || (token.starts_with("AIza") && token.len() >= 24)
+}
+
+fn contains_credential_assignment(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    for key in SENSITIVE_VALUE_ASSIGNMENT_KEYS {
+        let mut offset = 0;
+        while let Some(rel) = lower[offset..].find(key) {
+            let pos = offset + rel;
+            let after_key = pos + key.len();
+            if is_word_boundary(bytes, pos) {
+                let mut cursor = after_key;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if cursor < bytes.len() && matches!(bytes[cursor], b'=' | b':') {
+                    cursor += 1;
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    if cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                        return true;
+                    }
+                }
+            }
+            offset = after_key;
+        }
+    }
+    false
+}
+
+fn contains_sensitive_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("-----begin ") && lower.contains("private key-----") {
+        return true;
+    }
+    if contains_auth_scheme_credential(&lower, "bearer", 6, false)
+        || contains_auth_scheme_credential(&lower, "basic", 12, true)
+    {
+        return true;
+    }
+    if contains_credential_assignment(&lower) {
+        return true;
+    }
+    value
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')'))
+        .any(|token| is_jwt_token(token) || has_known_secret_prefix(token))
+}
+
+fn reject_sensitive_value(label: &str, value: &str) -> Result<(), EvidenceError> {
+    if contains_sensitive_value(value) {
+        return Err(EvidenceError::SensitiveField(label.to_string()));
+    }
+    Ok(())
+}
+
+fn reject_sensitive_field(key: &str, value: &str) -> Result<(), EvidenceError> {
+    if is_sensitive_key(key) || contains_sensitive_value(value) {
+        return Err(EvidenceError::SensitiveField(key.to_string()));
+    }
+    Ok(())
+}
+
+pub const SIGNED_EVIDENCE_BUNDLE_FORMAT: &str = "foliohelm-signed-evidence";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendEvidenceRequest {
+    pub kind: String,
+    pub payload: BTreeMap<String, String>,
+    pub app_version: Option<String>,
+    pub occurred_at_utc: Option<String>,
+    pub account_ref: Option<String>,
+    pub intent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedEvidenceRecordDto {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub sequence: u64,
+    pub occurred_at_utc: String,
+    pub app_version: String,
+    pub kind: String,
+    pub rust_kind: String,
+    pub account_ref: String,
+    pub intent_id: String,
+    pub payload: BTreeMap<String, String>,
+    pub previous_hash: String,
+    pub payload_hash: String,
+    pub entry_hash: String,
+    pub signer_public_key: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceVerificationDto {
+    pub valid: bool,
+    pub sequence: u64,
+    pub head_hash: String,
+    pub signer_public_key: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceExportBundleDto {
+    pub format: String,
+    pub schema_version: u16,
+    pub mode: String,
+    pub exported_at_utc: String,
+    pub signer_public_key: Option<String>,
+    pub records: Vec<SignedEvidenceRecordDto>,
+}
+
+impl SignedEvidenceRecordDto {
+    pub fn from_entry(entry: &SignedEvidenceEntry) -> Self {
+        Self {
+            schema_version: entry.event.schema_version,
+            event_id: entry.event.event_id.clone(),
+            sequence: entry.event.sequence,
+            occurred_at_utc: entry.event.occurred_at_utc.clone(),
+            app_version: entry.event.app_version.clone(),
+            kind: entry.event.kind.local_kind().to_string(),
+            rust_kind: entry.event.kind.canonical_name().to_string(),
+            account_ref: entry.event.payload.account_ref.clone(),
+            intent_id: entry.event.payload.intent_id.clone(),
+            payload: entry.event.payload.fields.clone(),
+            previous_hash: encode_hex(&entry.previous_hash),
+            payload_hash: encode_hex(&entry.payload_hash),
+            entry_hash: encode_hex(&entry.entry_hash),
+            signer_public_key: encode_hex(&entry.signer_public_key),
+            signature: encode_hex(&entry.signature),
+        }
+    }
+
+    pub fn into_entry(self) -> Result<SignedEvidenceEntry, EvidenceError> {
+        let kind = EvidenceKind::from_canonical(&self.rust_kind)?;
+        let event = EvidenceEvent {
+            schema_version: self.schema_version,
+            event_id: self.event_id,
+            sequence: self.sequence,
+            occurred_at_utc: self.occurred_at_utc,
+            app_version: self.app_version,
+            kind,
+            payload: EvidencePayload {
+                account_ref: self.account_ref,
+                intent_id: self.intent_id,
+                fields: self.payload,
+            },
+        };
+        let entry = SignedEvidenceEntry {
+            event,
+            previous_hash: decode_hex_fixed::<32>(&self.previous_hash)
+                .map_err(|msg| EvidenceError::InvalidBundle(msg.to_string()))?,
+            payload_hash: decode_hex_fixed::<32>(&self.payload_hash)
+                .map_err(|msg| EvidenceError::InvalidBundle(msg.to_string()))?,
+            entry_hash: decode_hex_fixed::<32>(&self.entry_hash)
+                .map_err(|msg| EvidenceError::InvalidBundle(msg.to_string()))?,
+            signer_public_key: decode_hex_fixed::<32>(&self.signer_public_key)
+                .map_err(|msg| EvidenceError::InvalidBundle(msg.to_string()))?,
+            signature: decode_hex_fixed::<64>(&self.signature)
+                .map_err(|msg| EvidenceError::InvalidBundle(msg.to_string()))?,
+        };
+        entry.verify()?;
+        Ok(entry)
+    }
+}
+
+/// In-memory Ed25519-signed evidence journal managed by Tauri state.
+///
+/// Stage 2 will back this journal with encrypted SQLCipher persistence and an
+/// OS-protected device key without changing the signing or verification rules.
+pub struct EvidenceJournal {
+    signing_key: SigningKey,
+    entries: Vec<SignedEvidenceEntry>,
+}
+
+impl EvidenceJournal {
+    pub fn new_random() -> Result<Self, EvidenceError> {
+        let mut seed = [0_u8; 32];
+        getrandom::fill(&mut seed).map_err(|_| EvidenceError::RandomnessUnavailable)?;
+        Ok(Self::from_signing_key(SigningKey::from_bytes(&seed)))
+    }
+
+    pub fn from_signing_key(signing_key: SigningKey) -> Self {
+        Self {
+            signing_key,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn signer_public_key_hex(&self) -> String {
+        encode_hex(&self.signing_key.verifying_key().to_bytes())
+    }
+
+    pub fn append(
+        &mut self,
+        request: AppendEvidenceRequest,
+    ) -> Result<SignedEvidenceRecordDto, EvidenceError> {
+        let head = verify_chain(&self.entries)?;
+        let sequence = head
+            .sequence
+            .checked_add(1)
+            .ok_or(EvidenceError::SequenceOverflow)?;
+        let kind = EvidenceKind::from_frontend_or_canonical(&request.kind, &request.payload)?;
+        let occurred_at = request
+            .occurred_at_utc
+            .unwrap_or_else(|| Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
+        let app_version = request
+            .app_version
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let account_ref = request
+            .account_ref
+            .unwrap_or_else(|| "acct_local_mock".to_string());
+        let intent_id = request
+            .intent_id
+            .unwrap_or_else(|| format!("intent-{sequence:06}"));
+        let event_id = format!("FH-EVENT-{sequence:06}");
+
+        let event = EvidenceEvent::new(
+            event_id,
+            sequence,
+            occurred_at,
+            app_version,
+            kind,
+            EvidencePayload {
+                account_ref,
+                intent_id,
+                fields: request.payload,
+            },
+        )?;
+        let signed = SignedEvidenceEntry::sign(event, head.hash, &self.signing_key)?;
+        let dto = SignedEvidenceRecordDto::from_entry(&signed);
+        self.entries.push(signed);
+        Ok(dto)
+    }
+
+    pub fn list(&self) -> Vec<SignedEvidenceRecordDto> {
+        self.entries
+            .iter()
+            .map(SignedEvidenceRecordDto::from_entry)
+            .collect()
+    }
+
+    pub fn verify(&self) -> EvidenceVerificationDto {
+        match verify_chain(&self.entries) {
+            Ok(head) => EvidenceVerificationDto {
+                valid: true,
+                sequence: head.sequence,
+                head_hash: encode_hex(&head.hash),
+                signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
+                reason: None,
+            },
+            Err(error) => EvidenceVerificationDto {
+                valid: false,
+                sequence: self.entries.len() as u64,
+                head_hash: self
+                    .entries
+                    .last()
+                    .map_or_else(|| encode_hex(&GENESIS_HASH), |e| encode_hex(&e.entry_hash)),
+                signer_public_key: Some(self.signer_public_key_hex()),
+                reason: Some(error.to_string()),
+            },
+        }
+    }
+
+    pub fn export(&self) -> Result<String, EvidenceError> {
+        let head = verify_chain(&self.entries)?;
+        let bundle = EvidenceExportBundleDto {
+            format: SIGNED_EVIDENCE_BUNDLE_FORMAT.to_string(),
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            mode: "mock".to_string(),
+            exported_at_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
+            records: self.list(),
+        };
+        serde_json::to_string_pretty(&bundle)
+            .map_err(|error| EvidenceError::InvalidBundle(error.to_string()))
+    }
+
+    pub fn import(&mut self, serialized: &str) -> Result<EvidenceVerificationDto, EvidenceError> {
+        let bundle: EvidenceExportBundleDto = serde_json::from_str(serialized)
+            .map_err(|error| EvidenceError::InvalidBundle(error.to_string()))?;
+        if bundle.format != SIGNED_EVIDENCE_BUNDLE_FORMAT
+            || bundle.schema_version != EVIDENCE_SCHEMA_VERSION
+            || bundle.mode != "mock"
+        {
+            return Err(EvidenceError::InvalidBundle(
+                "unsupported format, schema version, or mode".to_string(),
+            ));
+        }
+        if normalize_timestamp(&bundle.exported_at_utc)? != bundle.exported_at_utc {
+            return Err(EvidenceError::TimestampNotCanonical);
+        }
+
+        let mut entries = Vec::with_capacity(bundle.records.len());
+        for record in bundle.records {
+            entries.push(record.into_entry()?);
+        }
+        let head = verify_chain(&entries)?;
+        if let Some(imported_signer) = head.signer_public_key {
+            let current_signer = self.signing_key.verifying_key().to_bytes();
+            if imported_signer != current_signer {
+                return Err(EvidenceError::SignerChanged);
+            }
+        }
+        self.entries = entries;
+        Ok(EvidenceVerificationDto {
+            valid: true,
+            sequence: head.sequence,
+            head_hash: encode_hex(&head.hash),
+            signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
+            reason: None,
+        })
+    }
+
+    pub fn clear(&mut self) -> bool {
+        self.entries.clear();
+        true
+    }
+}
+
+pub fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn decode_hex_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], &'static str> {
+    if encoded.len() != N * 2 {
+        return Err("hex string has unexpected length");
+    }
+    let mut output = [0_u8; N];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0]).ok_or("hex string contains non-hex character")?;
+        let low = decode_hex_nibble(pair[1]).ok_or("hex string contains non-hex character")?;
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -853,5 +1445,159 @@ mod tests {
 
         value["signature"] = serde_json::Value::String(format!("{}gg", "00".repeat(63)));
         assert!(serde_json::from_value::<SignedEvidenceEntry>(value).is_err());
+    }
+
+    #[test]
+    fn rejects_sensitive_keys_and_credential_values_without_blocking_normal_status_text() {
+        let safe_event = EvidenceEvent::new(
+            "event_safe",
+            1,
+            "2026-08-09T14:00:01Z",
+            "0.1.0",
+            EvidenceKind::BrokerRejected,
+            EvidencePayload {
+                account_ref: "acct_local_01".into(),
+                intent_id: "intent_safe".into(),
+                fields: BTreeMap::from([
+                    ("status".into(), "reauth-required".into()),
+                    ("reason".into(), "Reauthorization required".into()),
+                    (
+                        "detail".into(),
+                        "Mock session requires reauthorization before preview".into(),
+                    ),
+                ]),
+            },
+        );
+        assert!(safe_event.is_ok());
+
+        for bad_key in [
+            "secret",
+            "access_token",
+            "password",
+            "api_key",
+            "bearer",
+            "account_number",
+            "credential",
+            "authorization",
+            "private_key",
+            "client_id",
+            "app_key",
+            "cookie",
+        ] {
+            let result = EvidenceEvent::new(
+                "event_bad_key",
+                1,
+                "2026-08-09T14:00:01Z",
+                "0.1.0",
+                EvidenceKind::DraftCreated,
+                EvidencePayload {
+                    account_ref: "acct_local_01".into(),
+                    intent_id: "intent_01".into(),
+                    fields: BTreeMap::from([(bad_key.into(), "benign".into())]),
+                },
+            );
+            assert_eq!(
+                result,
+                Err(EvidenceError::SensitiveField(bad_key.to_string())),
+                "key {bad_key} must be rejected"
+            );
+        }
+
+        for bad_value in [
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdef123456",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdef123456",
+            "api_key=supersecret123",
+            "password: hunter2",
+            "account_number=987654321",
+            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQE",
+            "sk-1234567890abcdefghij",
+        ] {
+            let result = EvidenceEvent::new(
+                "event_bad_val",
+                1,
+                "2026-08-09T14:00:01Z",
+                "0.1.0",
+                EvidenceKind::DraftCreated,
+                EvidencePayload {
+                    account_ref: "acct_local_01".into(),
+                    intent_id: "intent_01".into(),
+                    fields: BTreeMap::from([("reason".into(), bad_value.into())]),
+                },
+            );
+            assert_eq!(
+                result,
+                Err(EvidenceError::SensitiveField("reason".to_string())),
+                "value {bad_value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_appends_maps_frontend_kinds_verifies_exports_imports_and_clears() {
+        let mut journal = EvidenceJournal::from_signing_key(device_key());
+
+        let first = journal
+            .append(AppendEvidenceRequest {
+                kind: "preview_created".into(),
+                payload: BTreeMap::from([
+                    ("mode".into(), "mock".into()),
+                    ("symbol".into(), "AAPL".into()),
+                ]),
+                app_version: Some("0.1.0-mock".into()),
+                occurred_at_utc: Some("2026-08-09T14:00:01Z".into()),
+                account_ref: None,
+                intent_id: None,
+            })
+            .expect("first append succeeds");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.kind, "preview_created");
+        assert_eq!(first.rust_kind, "preview_received");
+        assert_eq!(first.signature.len(), 128);
+
+        let second = journal
+            .append(AppendEvidenceRequest {
+                kind: "mock_response".into(),
+                payload: BTreeMap::from([
+                    ("mode".into(), "mock".into()),
+                    ("status".into(), "unknown".into()),
+                    ("symbol".into(), "AAPL".into()),
+                ]),
+                app_version: Some("0.1.0-mock".into()),
+                occurred_at_utc: Some("2026-08-09T14:00:02Z".into()),
+                account_ref: None,
+                intent_id: None,
+            })
+            .expect("second append succeeds");
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.kind, "mock_response");
+        assert_eq!(second.rust_kind, "order_unknown");
+        assert_eq!(second.previous_hash, first.entry_hash);
+
+        let verification = journal.verify();
+        assert!(verification.valid);
+        assert_eq!(verification.sequence, 2);
+        assert_eq!(verification.head_hash, second.entry_hash);
+        assert_eq!(journal.list().len(), 2);
+
+        let exported = journal.export().expect("export succeeds");
+        assert!(journal.clear());
+        assert_eq!(journal.list().len(), 0);
+        assert_eq!(journal.verify().sequence, 0);
+
+        let imported = journal.import(&exported).expect("import succeeds");
+        assert!(imported.valid);
+        assert_eq!(imported.sequence, 2);
+        assert_eq!(journal.list().len(), 2);
+
+        // Tampered bundle must fail closed on import
+        let tampered = exported.replace("AAPL", "NVDA");
+        assert!(journal.import(&tampered).is_err());
+
+        // Bundle signed by another key must be rejected to keep one signer per chain
+        let mut other_journal = EvidenceJournal::from_signing_key(notary_key());
+        assert_eq!(
+            other_journal.import(&exported),
+            Err(EvidenceError::SignerChanged)
+        );
     }
 }

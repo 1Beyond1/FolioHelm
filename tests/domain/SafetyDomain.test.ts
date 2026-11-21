@@ -336,4 +336,47 @@ describe("tamper-evident local journal", () => {
     await append;
     expect(evidenceCount()).toBe(0);
   });
+
+  it("allows normal status messages like Reauthorization required while rejecting sensitive keys and credential values", async () => {
+    const safe = await appendEvidence("mock_response", {
+      status: "reauth-required",
+      reason: "Reauthorization required",
+      detail: "Mock session requires reauthorization",
+    });
+    expect(safe.sequence).toBe(1);
+    expect((await verifyEvidence()).valid).toBe(true);
+
+    for (const badKey of ["secret", "token", "password", "api_key", "bearer", "account_number", "credential", "authorization"]) {
+      await expect(appendEvidence("order_intent", { [badKey]: "benign" })).rejects.toThrow(/sensitive/i);
+    }
+
+    for (const badValue of [
+      "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdef123456",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdef123456",
+      "api_key=abc12345",
+      "password: hunter2",
+      "-----BEGIN PRIVATE KEY-----",
+    ]) {
+      await expect(appendEvidence("order_intent", { reason: badValue })).rejects.toThrow(/sensitive/i);
+    }
+  });
+
+  it("uses deterministic code-unit key ordering independent of localeCompare", async () => {
+    const localeSpy = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("localeCompare must not be used for evidence hashing");
+    });
+
+    try {
+      const record = await appendEvidence(
+        "order_intent",
+        { zeta: "1", Alpha: "2", alpha: "3" },
+        "0.1.0-mock",
+        "2026-08-10T16:00:00.000Z",
+      );
+      expect(record.entryHash).toMatch(/^[0-9a-f]{64}$/);
+      expect((await verifyEvidence()).valid).toBe(true);
+    } finally {
+      localeSpy.mockRestore();
+    }
+  });
 });

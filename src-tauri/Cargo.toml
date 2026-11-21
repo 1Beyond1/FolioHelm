@@ -17,10 +17,9 @@ tauri-build = { version = "=2.6.3", features = ["codegen"] }
 [dependencies]
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde"] }
 ed25519-dalek = { version = "=3.0.0" }
+getrandom = { version = "=0.3.4" }
 serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151" }
 sha2 = { version = "=0.10.9" }
 tauri = { version = "=2.11.5", features = [] }
 thiserror = { version = "=2.0.20" }
-
-[dev-dependencies]
-serde_json = { version = "=1.0.151" }

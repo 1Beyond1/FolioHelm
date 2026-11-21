@@ -1,6 +1,10 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-changed=capabilities/main.json");
+
     // tauri-build 2.6.3 always emits a Windows resource and therefore expects
     // an ICO file, even while bundling is disabled. Keep this build-only icon
     // in OUT_DIR so the repository does not need a product icon yet.
