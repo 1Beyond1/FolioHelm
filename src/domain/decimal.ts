@@ -10,6 +10,7 @@ export type Money = DecimalString & { readonly __foliohelmMoney: unique symbol }
 export type Price = DecimalString & { readonly __foliohelmPrice: unique symbol };
 export type Quantity = DecimalString & { readonly __foliohelmQuantity: unique symbol };
 export type Percent = DecimalString & { readonly __foliohelmPercent: unique symbol };
+export type DecimalRoundingMode = "half-even" | "half-up" | "truncate";
 
 interface ParsedDecimal {
   coefficient: bigint;
@@ -104,10 +105,71 @@ export function decimalSubtract(left: DecimalString, right: DecimalString): Deci
   return decimalAdd(left, stringifyDecimal({ coefficient: -parseDecimal(right).coefficient, scale: parseDecimal(right).scale }));
 }
 
+function divideAndRoundMagnitude(
+  numerator: bigint,
+  denominator: bigint,
+  mode: DecimalRoundingMode,
+): bigint {
+  const quotient = numerator / denominator;
+  const remainder = numerator % denominator;
+  if (remainder === 0n || mode === "truncate") return quotient;
+
+  const twiceRemainder = remainder * 2n;
+  if (mode === "half-up") {
+    return twiceRemainder >= denominator ? quotient + 1n : quotient;
+  }
+
+  // half-even (banker's rounding)
+  if (twiceRemainder > denominator) return quotient + 1n;
+  if (twiceRemainder < denominator) return quotient;
+  return quotient % 2n === 1n ? quotient + 1n : quotient;
+}
+
 export function decimalMultiply(left: DecimalString, right: DecimalString): DecimalString {
   const a = parseDecimal(left);
   const b = parseDecimal(right);
   return stringifyDecimal({ coefficient: a.coefficient * b.coefficient, scale: a.scale + b.scale });
+}
+
+export function decimalRound(
+  value: DecimalString,
+  scale: number,
+  mode: DecimalRoundingMode = "half-even",
+): DecimalString {
+  const parsed = parseDecimal(value);
+  if (!Number.isInteger(scale) || scale < 0) throw new Error(`Invalid target scale: ${scale}`);
+  if (parsed.scale <= scale) return stringifyDecimal(parsed);
+
+  const negative = parsed.coefficient < 0n;
+  const absCoefficient = negative ? -parsed.coefficient : parsed.coefficient;
+  const divisor = powerOfTen(parsed.scale - scale);
+  const roundedAbs = divideAndRoundMagnitude(absCoefficient, divisor, mode);
+  const coefficient = negative && roundedAbs !== 0n ? -roundedAbs : roundedAbs;
+  return stringifyDecimal({ coefficient, scale });
+}
+
+export function decimalDivide(
+  dividend: DecimalString,
+  divisor: DecimalString,
+  scale = 8,
+  mode: DecimalRoundingMode = "half-even",
+): DecimalString {
+  if (!Number.isInteger(scale) || scale < 0) throw new Error(`Invalid target scale: ${scale}`);
+  const a = parseDecimal(dividend);
+  const b = parseDecimal(divisor);
+  if (b.coefficient === 0n) throw new Error("Cannot divide decimal by zero");
+
+  const negative = (a.coefficient < 0n) !== (b.coefficient < 0n);
+  const absDividend = a.coefficient < 0n ? -a.coefficient : a.coefficient;
+  const absDivisor = b.coefficient < 0n ? -b.coefficient : b.coefficient;
+
+  const netScaleShift = scale + b.scale - a.scale;
+  const numerator = netScaleShift >= 0 ? absDividend * powerOfTen(netScaleShift) : absDividend;
+  const denominator = netScaleShift >= 0 ? absDivisor : absDivisor * powerOfTen(-netScaleShift);
+
+  const roundedAbs = divideAndRoundMagnitude(numerator, denominator, mode);
+  const coefficient = negative && roundedAbs !== 0n ? -roundedAbs : roundedAbs;
+  return stringifyDecimal({ coefficient, scale });
 }
 
 export function decimalAbs(value: DecimalString): DecimalString {
@@ -131,9 +193,14 @@ export function decimalToNumber(value: DecimalString): number {
   return Number(value);
 }
 
-export function decimalToFixed(value: DecimalString, scale: number): string {
-  const parsed = parseDecimal(value);
+export function decimalToFixed(
+  value: DecimalString,
+  scale: number,
+  roundingMode?: DecimalRoundingMode,
+): string {
   if (!Number.isInteger(scale) || scale < 0) throw new Error(`Invalid target scale: ${scale}`);
+  const source = roundingMode === undefined ? value : decimalRound(value, scale, roundingMode);
+  const parsed = parseDecimal(source);
 
   let coefficient: bigint;
   if (scale < parsed.scale) {

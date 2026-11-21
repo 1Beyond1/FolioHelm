@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { decimalAdd, decimalMultiply, decimalSubtract, money, price, quantity } from "../../src/domain/decimal";
+import { decimal, decimalAdd, decimalDivide, decimalMultiply, decimalRound, decimalSubtract, decimalToFixed, money, price, quantity } from "../../src/domain/decimal";
 import { AutomationController, DEFAULT_AUTOMATION_STATE, FUTURE_LIVE_CANARY_POLICY, normalizeAutomationState } from "../../src/domain/automation";
 import { appendEvidence, clearEvidence, evidenceCount, exportEvidence, verifyEvidence, type LocalEvidenceRecord } from "../../src/domain/evidenceJournal";
 import { MockBroker, MockBrokerError } from "../../src/domain/mockBroker";
@@ -14,6 +14,40 @@ describe("exact financial primitives", () => {
     expect(decimalAdd(money("0.10"), money("0.20"))).toBe("0.3");
     expect(decimalSubtract(money("100.00"), money("0.01"))).toBe("99.99");
     expect(decimalMultiply(price("226.34"), quantity("3"))).toBe("679.02");
+  });
+
+  it("rounds decimals explicitly with half-even, half-up, and truncate modes", () => {
+    expect(decimalRound(decimal("2.5"), 0, "half-even")).toBe("2");
+    expect(decimalRound(decimal("3.5"), 0, "half-even")).toBe("4");
+    expect(decimalRound(decimal("-2.5"), 0, "half-even")).toBe("-2");
+    expect(decimalRound(decimal("-3.5"), 0, "half-even")).toBe("-4");
+
+    expect(decimalRound(decimal("2.5"), 0, "half-up")).toBe("3");
+    expect(decimalRound(decimal("-2.5"), 0, "half-up")).toBe("-3");
+    expect(decimalRound(decimal("1.005"), 2, "half-up")).toBe("1.01");
+
+    expect(decimalRound(decimal("2.999"), 2, "truncate")).toBe("2.99");
+    expect(decimalRound(decimal("-2.999"), 2, "truncate")).toBe("-2.99");
+    expect(decimalRound(decimal("-0.001"), 2, "truncate")).toBe("0");
+  });
+
+  it("divides decimals accurately with explicit scale and rounding and rejects zero divisor", () => {
+    expect(decimalDivide(decimal("1"), decimal("3"), 4, "half-even")).toBe("0.3333");
+    expect(decimalDivide(decimal("2"), decimal("3"), 4, "half-even")).toBe("0.6667");
+    expect(decimalDivide(decimal("5"), decimal("2"), 0, "half-even")).toBe("2");
+    expect(decimalDivide(decimal("5"), decimal("2"), 0, "half-up")).toBe("3");
+    expect(decimalDivide(decimal("-5"), decimal("2"), 0, "truncate")).toBe("-2");
+    expect(decimalDivide(decimal("100"), decimal("0.25"), 2)).toBe("400");
+    expect(() => decimalDivide(decimal("1"), decimal("0"))).toThrow(/divide.*zero/i);
+  });
+
+  it("keeps decimalToFixed strict by default and allows explicit rounding when requested", () => {
+    expect(() => decimalToFixed(decimal("1.234"), 2)).toThrow(/cannot represent/i);
+    expect(decimalToFixed(decimal("1.235"), 2, "half-even")).toBe("1.24");
+    expect(decimalToFixed(decimal("1.245"), 2, "half-even")).toBe("1.24");
+    expect(decimalToFixed(decimal("1.245"), 2, "half-up")).toBe("1.25");
+    expect(decimalToFixed(decimal("1.249"), 2, "truncate")).toBe("1.24");
+    expect(decimalToFixed(decimal("1.2"), 4)).toBe("1.2000");
   });
 });
 
