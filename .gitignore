@@ -7,6 +7,11 @@ src-tauri/gen/
 .env.*
 !.env.example
 *.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.tmp/
 output/local/
 output/playwright/.playwright-cli/
 output/playwright/*.png
