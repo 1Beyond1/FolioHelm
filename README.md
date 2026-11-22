@@ -45,6 +45,16 @@ Screenshots from the local workbench (16:9; demo figures shown are fictional):
 
 ![Trade Workspace Modal](docs/images/trade-modal-16x9.jpg)
 
+### Safe Brokerage CSV Import & Local Encrypted Vault Controls
+
+**Safe Brokerage CSV Import & Field Mapping Preview** — Auto-detects Charles Schwab, Interactive Brokers (IBKR), and Standard CSVs with formula-injection sanitization, cash balance detection, field mapping preview, exact `Decimal` cost-basis calculation, and encrypted local persistence:
+
+![Safe Brokerage CSV Import & Field Mapping Preview](docs/images/route-b-csv-import.png)
+
+**Local Encrypted Vault & Optional Delayed Public Quotes** — Shows local AES-256-GCM + OS Credential Manager vault status, read-only delayed public quote toggle (off by default, HTTPS allowlist only), and Ed25519 evidence journal verification/export controls:
+
+![Local Encrypted Vault & Delayed Public Quotes Settings](docs/images/route-b-local-vault-settings.png)
+
 ## Tech Stack
 
 - **Desktop & Security Core**: Tauri 2 (`2.11.x`), Rust (`rusqlite` bundled, `aes-gcm`, `ed25519-dalek`, `zeroize`, `keyring`, `reqwest` `rustls-tls`, `tauri-plugin-dialog`)

@@ -45,6 +45,16 @@ FolioHelm 是一款本地优先、安全优先的 Windows 桌面端投资组合�
 
 ![交易工作区弹窗](docs/images/trade-modal-16x9.jpg)
 
+### 券商 CSV 安全导入与本地加密金库设置
+
+**券商 CSV 安全导入与字段映射预览** —— 自动识别嘉信理财（Schwab）、盈透证券（IBKR）与通用标准 CSV，展示防公式注入清洗、现金余额识别、字段映射预览、精确 `Decimal` 成本均价核算及加密落盘确认：
+
+![券商 CSV 安全导入与字段映射预览](docs/images/route-b-csv-import.png)
+
+**本地加密金库与公开延迟行情控制** —— 展示操作系统凭证管理器 + AES-256-GCM 加密 SQLite 本地金库状态、默认关闭的只读公开延迟行情 HTTPS 白名单开关，以及 Ed25519 证据日志验签与导出入口：
+
+![本地加密金库与公开延迟行情控制](docs/images/route-b-local-vault-settings.png)
+
 ## 技术栈
 
 - **桌面壳与安全内核**：Tauri 2（`2.11.x`）、Rust（`rusqlite` `bundled`、`aes-gcm`、`ed25519-dalek`、`zeroize`、`keyring`、`reqwest` `rustls-tls`、`tauri-plugin-dialog`）
