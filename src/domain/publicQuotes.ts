@@ -1,5 +1,6 @@
 import { MOCK_BROKER, type PublicQuoteUpdate } from "./mockBroker";
 import {
+  invokeDialogSaveFhvaultFile,
   invokeDialogSaveJsonFile,
   invokeQuotesFetchPublic,
   invokeQuotesLoadCached,
@@ -65,6 +66,7 @@ export async function refreshPublicQuotes(
     price: item.price,
     change: item.change,
     changePct: item.changePct,
+    currency: item.currency,
     asOfUtc: item.asOfUtc,
     provider: item.provider,
     delayed: item.delayed,
@@ -98,6 +100,7 @@ export async function hydrateCachedPublicQuotes(): Promise<number> {
       price: item.price,
       change: item.change,
       changePct: item.changePct,
+      currency: item.currency,
       asOfUtc: item.asOfUtc,
       provider: item.provider,
       delayed: item.delayed,
@@ -122,6 +125,26 @@ export async function saveJsonWithDialogOrBlob(
   }
 
   const blob = new Blob([serialized], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = defaultFileName;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return { kind: "browser-download" };
+}
+
+export async function saveFhvaultWithDialogOrBlob(
+  defaultFileName: string,
+  serialized: string,
+): Promise<SaveJsonOutcome> {
+  if (isTauriRuntime()) {
+    const savedPath = await invokeDialogSaveFhvaultFile(defaultFileName, serialized);
+    if (!savedPath) return { kind: "canceled" };
+    return { kind: "native-saved", path: savedPath };
+  }
+
+  const blob = new Blob([serialized], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

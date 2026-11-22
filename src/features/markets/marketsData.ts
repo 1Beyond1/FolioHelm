@@ -1,8 +1,8 @@
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
-import { findMockHolding, findMockQuote } from "../../domain/mockBroker";
+import { findMockHolding, findMockQuote, MOCK_BROKER } from "../../domain/mockBroker";
 import { formatCurrency, formatSignedCurrency } from "../../formatters";
-import type { DataStatus } from "../../domain/contracts";
+import type { DataStatus, QuoteSourceKind, WorkspaceMode } from "../../domain/contracts";
 
 export type MarketPeriod = "1D" | "1W" | "1M" | "6M" | "1Y";
 
@@ -41,6 +41,12 @@ export interface MarketSecurity {
   holdingValue: number;
   holdingPnl: number;
   status?: DataStatus;
+  mode?: WorkspaceMode;
+  hasHistoricalSeries?: boolean;
+  currency?: string;
+  quoteSource?: QuoteSourceKind;
+  quoteProvider?: string;
+  quoteAsOf?: string;
   stats: MarketStats;
   news: readonly MarketStory[];
 }
@@ -699,6 +705,12 @@ function adaptMarketSecurity(security: MarketSecurity): MarketSecurity {
     holdingValue: canonicalHolding ? decimalToNumber(canonicalHolding.marketValue) : 0,
     holdingPnl: canonicalHolding ? decimalToNumber(canonicalHolding.totalPnl) : 0,
     status: canonicalQuote.status,
+    mode: "mock",
+    hasHistoricalSeries: true,
+    currency: canonicalQuote.currency ?? "USD",
+    quoteSource: canonicalQuote.source ?? "mock",
+    quoteProvider: canonicalQuote.provider,
+    quoteAsOf: canonicalQuote.asOf,
     stats: {
       ...security.stats,
       dayRange: formatPriceRange(alignedChart["1D"], priceValue),
@@ -710,8 +722,40 @@ function adaptMarketSecurity(security: MarketSecurity): MarketSecurity {
 /** Stable fixture-shaped export retained for tests; use getMarketSecurities in views. */
 export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURITIES.map(adaptMarketSecurity);
 
-/** Rebuilds the view model from the current local broker scenario. */
+/** Rebuilds the view model from the current active workspace mode (Mock Demo or Local CSV). */
 export function getMarketSecurities(): readonly MarketSecurity[] {
+  if (MOCK_BROKER.getWorkspaceMode() === "local-csv") {
+    const snapshot = MOCK_BROKER.getSnapshot();
+    const holdingBySymbol = new Map(snapshot.holdings.map((h) => [h.symbol, h]));
+    return snapshot.quotes.map((q): MarketSecurity => {
+      const holding = holdingBySymbol.get(q.symbol);
+      const priceValue = decimalToNumber(q.price);
+      return {
+        symbol: q.symbol,
+        companyEn: q.companyEn,
+        companyZh: q.companyZh,
+        price: priceValue,
+        change: decimalToNumber(q.change),
+        changePct: decimalToNumber(q.changePct),
+        // Strictly honest: never fabricate sparkline or historical price series in local-csv mode.
+        sparkline: [],
+        chart: { ...EMPTY_MARKET_CHART },
+        shares: holding ? decimalToNumber(holding.quantity) : 0,
+        averageCost: holding ? decimalToNumber(holding.averageCost) : 0,
+        holdingValue: holding ? decimalToNumber(holding.marketValue) : 0,
+        holdingPnl: holding ? decimalToNumber(holding.totalPnl) : 0,
+        status: q.status,
+        mode: "local-csv",
+        hasHistoricalSeries: false,
+        currency: q.currency ?? holding?.currency ?? "USD",
+        quoteSource: q.source ?? "csv-import",
+        quoteProvider: q.provider,
+        quoteAsOf: q.asOf,
+        stats: { ...EMPTY_MARKET_STATS },
+        news: [],
+      };
+    });
+  }
   return LEGACY_MARKET_SECURITIES.map(adaptMarketSecurity);
 }
 
@@ -722,11 +766,24 @@ export function getMarketSecurity(symbol: string): MarketSecurity {
 
   if (match) return match;
 
+  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
   const displaySymbol = normalizedSymbol || "DEMO";
   return noDataSecurity(
     displaySymbol,
-    normalizedSymbol ? `No demo data for ${normalizedSymbol}` : "No demo instrument selected",
-    normalizedSymbol ? `${normalizedSymbol} 暂无演示数据` : "尚未选择演示证券",
+    normalizedSymbol
+      ? isLocalMode
+        ? `No local portfolio quote for ${normalizedSymbol}`
+        : `No demo data for ${normalizedSymbol}`
+      : isLocalMode
+        ? "No local instrument selected"
+        : "No demo instrument selected",
+    normalizedSymbol
+      ? isLocalMode
+        ? `本地持仓中暂无 ${normalizedSymbol} 的行情数据`
+        : `${normalizedSymbol} 暂无演示数据`
+      : isLocalMode
+        ? "尚未选择本地持仓证券"
+        : "尚未选择演示证券",
   );
 }
 
@@ -734,12 +791,12 @@ export function companyForLanguage(security: MarketSecurity, language: Language)
   return language === "zh" ? security.companyZh : security.companyEn;
 }
 
-export function formatPrice(value: number, language: Language = "en"): string {
-  return formatCurrency(value, language);
+export function formatPrice(value: number, language: Language = "en", currency = "USD"): string {
+  return formatCurrency(value, language, currency);
 }
 
-export function formatSignedPrice(value: number, language: Language = "en"): string {
-  return formatSignedCurrency(value, language);
+export function formatSignedPrice(value: number, language: Language = "en", currency = "USD"): string {
+  return formatSignedCurrency(value, language, currency);
 }
 
 export function formatSignedPercent(value: number): string {

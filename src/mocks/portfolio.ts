@@ -20,6 +20,9 @@ export const MOCK_DATA_NOTICE = "Demo data · No brokerage connection";
 
 export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
   const snapshot = MOCK_BROKER.getSnapshot();
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const isLocalMode = workspaceMode === "local-csv";
+  const localMeta = MOCK_BROKER.getLocalPortfolioMeta();
   const chinese = language === "zh";
   const quoteBySymbol = new Map(snapshot.quotes.map((item) => [item.symbol, item]));
   const positions: Position[] = snapshot.holdings.map((holding) => ({
@@ -29,6 +32,7 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
     marketValue: decimalToNumber(holding.marketValue),
     unrealizedPnl: decimalToNumber(holding.totalPnl),
     iconClass: holding.symbol.toLowerCase(),
+    currency: holding.currency ?? "USD",
   }));
 
   const portfolioChart: Record<PortfolioPeriod, readonly number[]> = Object.fromEntries(
@@ -49,10 +53,11 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
 
   const activity: ActivityItem[] = snapshot.orders.slice(0, 3).map((order) => {
     const quote = quoteBySymbol.get(order.symbol);
+    const quoteCurr = quote?.currency ?? "USD";
     const isFilled = order.status === "filled";
     const detailPrice = order.limitPrice === null
-      ? quote ? formatCurrency(decimalToNumber(quote.price), language) : chinese ? "市价" : "market"
-      : formatCurrency(decimalToNumber(order.limitPrice), language);
+      ? quote ? formatCurrency(decimalToNumber(quote.price), language, quoteCurr) : chinese ? "市价" : "market"
+      : formatCurrency(decimalToNumber(order.limitPrice), language, quoteCurr);
     const sideLabel = chinese ? order.side === "buy" ? "买入" : "卖出" : order.side === "buy" ? "buy" : "sell";
     const statusLabel = chinese
       ? order.status === "filled" ? "订单已成交" : order.status === "working" ? "订单工作中" : order.status === "canceled" ? "订单已撤销" : order.status === "rejected" ? "订单已拒绝" : "订单状态未知"
@@ -65,6 +70,20 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
       time: new Intl.DateTimeFormat(chinese ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)),
     };
   });
+
+  const currencySubtotals = snapshot.account.currencyBreakdowns?.map((item) => ({
+    currency: item.currency,
+    totalEquity: decimalToNumber(item.totalEquity),
+    cash: decimalToNumber(item.cash),
+    holdingsCount: item.holdingsCount,
+  }));
+
+  const accountLabel = isLocalMode
+    ? (chinese ? "本地持仓 (CSV + 纸上模拟)" : "Local Portfolio (CSV + Paper)")
+    : undefined;
+  const asOfLabel = isLocalMode && localMeta
+    ? `${localMeta.sourceLabel} · ${localMeta.importedAtUtc.slice(0, 16).replace("T", " ")} UTC`
+    : undefined;
 
   return {
     totalValue: decimalToNumber(snapshot.account.totalEquity),
@@ -79,6 +98,12 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
     activeDays: snapshot.activeDays,
     ordersFilled: snapshot.ordersFilled,
     netChange: decimalToNumber(snapshot.yearNetChange),
+    workspaceMode,
+    currency: snapshot.account.currency ?? "USD",
+    isMultiCurrency: Boolean(snapshot.account.isMultiCurrency),
+    currencySubtotals,
+    accountLabel,
+    asOfLabel,
   };
 }
 

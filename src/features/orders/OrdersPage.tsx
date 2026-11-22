@@ -3,6 +3,7 @@ import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import { MOCK_BROKER, MockBrokerError } from "../../domain/mockBroker";
+import { persistPaperOrder } from "../../domain/vaultStorage";
 import { formatCurrency } from "../../formatters";
 import "./orders.css";
 
@@ -31,6 +32,7 @@ export interface OrderRecord {
   qty: number;
   filled: number;
   limit: number | null;
+  currency: string;
   status: OrderStatus;
   submitted: string;
   timeline: OrderTimelineEvent[];
@@ -40,7 +42,9 @@ const STATUS_KEYS: OrderStatus[] = ["working", "filled", "canceled", "rejected",
 
 function readOrders(language: Language): OrderRecord[] {
   const locale = language === "zh" ? "zh-CN" : "en-US";
-  return MOCK_BROKER.getSnapshot().orders.map((order) => ({
+  const snapshot = MOCK_BROKER.getSnapshot();
+  const currencyBySymbol = new Map(snapshot.quotes.map((q) => [q.symbol, q.currency ?? "USD"]));
+  return snapshot.orders.map((order) => ({
     id: order.id,
     symbol: order.symbol,
     side: order.side === "buy" ? "Buy" : "Sell",
@@ -48,6 +52,7 @@ function readOrders(language: Language): OrderRecord[] {
     qty: decimalToNumber(order.quantity),
     filled: decimalToNumber(order.filledQuantity),
     limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
+    currency: currencyBySymbol.get(order.symbol) ?? "USD",
     status: order.status,
     submitted: new Intl.DateTimeFormat(locale, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
     timeline: order.events.map((event) => ({
@@ -190,6 +195,8 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
 
   // Read the canonical local ledger on every render so a newly consumed Mock
   // preview or reconciled order appears immediately.
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const isLocalMode = workspaceMode === "local-csv";
   const orders = readOrders(language);
 
   const statusCounts = useMemo(() => {
@@ -219,6 +226,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   function handleReconcile(orderId: string, symbol: string): void {
     try {
       const reconciled = MOCK_BROKER.reconcileOrder(orderId);
+      void persistPaperOrder(workspaceMode, reconciled);
       setReconcileFeedback({
         kind: "success",
         message: copy.reconcileSuccess(reconciled.id, copy.statuses[reconciled.status]),
@@ -227,7 +235,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
         setExpandedOrderId(null);
       }
       void appendEvidence("reconciliation", {
-        mode: "mock",
+        mode: workspaceMode,
         orderId: reconciled.id,
         symbol: reconciled.symbol,
         previousStatus: "unknown",
@@ -239,7 +247,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
         message: copy.reconcileFailed(orderId),
       });
       void appendEvidence("reconciliation", {
-        mode: "mock",
+        mode: workspaceMode,
         orderId,
         symbol,
         previousStatus: "unknown",
@@ -250,12 +258,20 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   }
 
   return (
-    <main className="fh-page fh-orders-page" data-testid="orders-page">
+    <main className="fh-page fh-orders-page" data-testid="orders-page" data-workspace-mode={workspaceMode}>
       <header className="fh-page-header">
         <div>
-          <p className="fh-eyebrow">{copy.eyebrow}</p>
+          <p className="fh-eyebrow">
+            {isLocalMode
+              ? (language === "zh" ? "本地纸上模拟账本 (CSV + 纸上模拟)" : "Local paper ledger (CSV + Paper)")
+              : copy.eyebrow}
+          </p>
           <h1>{copy.title}</h1>
-          <p className="fh-page-subtitle">{copy.subtitle}</p>
+          <p className="fh-page-subtitle">
+            {isLocalMode
+              ? (language === "zh" ? "本地加密保存的纸上模拟订单，仅用于演练，不连接真实券商。" : "Encrypted local paper-trading orders isolated from Mock Demo. No live brokerage requests exist.")
+              : copy.subtitle}
+          </p>
         </div>
         <button
           type="button"
@@ -359,6 +375,7 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
                     key={order.id}
                     copy={copy}
                     language={language}
+                    isLocalMode={isLocalMode}
                     order={order}
                     expanded={expanded}
                     onToggle={() => setExpandedOrderId(expanded ? null : order.id)}
@@ -384,6 +401,7 @@ type OrdersCopy = (typeof COPY)[Language];
 function OrderRows({
   copy,
   language,
+  isLocalMode,
   order,
   expanded,
   onToggle,
@@ -391,6 +409,7 @@ function OrderRows({
 }: {
   copy: OrdersCopy;
   language: Language;
+  isLocalMode: boolean;
   order: OrderRecord;
   expanded: boolean;
   onToggle: () => void;
@@ -431,7 +450,7 @@ function OrderRows({
           <span>{formatQuantity(order.filled, language)}</span>
           <span className="fh-filled-total">/ {formatQuantity(order.qty, language)}</span>
         </td>
-        <td className="fh-number-cell">{order.limit === null ? "—" : formatCurrency(order.limit, language)}</td>
+        <td className="fh-number-cell">{order.limit === null ? "—" : formatCurrency(order.limit, language, order.currency)}</td>
         <td>
           <span className="fh-status-cell-group">
             <span className={`fh-order-status fh-order-status-${order.status}`}>{statusLabel}</span>
@@ -459,7 +478,11 @@ function OrderRows({
             <div className="fh-order-timeline-heading">
               <div>
                 <strong>{copy.timeline}</strong>
-                <span>{copy.timelineDetail}</span>
+                <span>
+                  {isLocalMode
+                    ? (language === "zh" ? "本地纸上模拟事件历史" : "Local paper event history")
+                    : copy.timelineDetail}
+                </span>
               </div>
               {order.status === "unknown" && (
                 <div className="fh-timeline-actions">

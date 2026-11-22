@@ -4,22 +4,27 @@ function localeFor(language: Language): string {
   return language === "zh" ? "zh-CN" : "en-US";
 }
 
-export function formatCurrency(value: number, language: Language): string {
+export function formatCurrency(value: number, language: Language, currency = "USD"): string {
   if (!Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat(localeFor(language), {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value);
+  const safeCurrency = /^[A-Z]{3}$/.test(currency) && currency !== "MULTI" ? currency : "USD";
+  try {
+    return new Intl.NumberFormat(localeFor(language), {
+      style: "currency",
+      currency: safeCurrency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+  } catch {
+    return `${safeCurrency} ${value.toFixed(2)}`;
+  }
 }
 
-export function formatSignedCurrency(value: number, language: Language): string {
+export function formatSignedCurrency(value: number, language: Language, currency = "USD"): string {
   if (!Number.isFinite(value)) return "—";
-  if (value === 0) return formatCurrency(0, language);
+  if (value === 0) return formatCurrency(0, language, currency);
   return value > 0
-    ? `+${formatCurrency(value, language)}`
-    : `-${formatCurrency(Math.abs(value), language)}`;
+    ? `+${formatCurrency(value, language, currency)}`
+    : `-${formatCurrency(Math.abs(value), language, currency)}`;
 }
 
 export function formatSignedPercent(value: number, language: Language): string {

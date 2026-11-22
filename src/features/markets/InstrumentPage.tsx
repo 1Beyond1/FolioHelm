@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import type { Language } from "../../types";
+import { MOCK_BROKER } from "../../domain/mockBroker";
 import { DataStateNotice } from "../../components/DataStateNotice";
 import {
   blendSeries,
@@ -189,7 +190,13 @@ function InstrumentChart({
 
 export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: InstrumentPageProps) {
   const copy = MARKET_COPY[language];
+  const chinese = language === "zh";
+  const [, setBrokerTick] = useState(0);
+  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+
   const security = getMarketSecurity(symbol);
+  const isLocalMode = security.mode === "local-csv";
+  const securityCurrency = security.currency ?? "USD";
   const [zoomPosition, setZoomPosition] = useState(0);
   const chartFrameRef = useRef<HTMLDivElement>(null);
   const leftPeriodIndex = Math.floor(zoomPosition);
@@ -202,23 +209,50 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
     security.chart[MARKET_PERIODS[rightPeriodIndex]],
     periodBlend,
   );
+  const hasHistoricalSeries = security.hasHistoricalSeries !== false && chartPoints.length > 0;
   const isPositive = security.changePct >= 0;
   const quoteFreshnessValue = security.status === "offline"
-    ? language === "zh" ? "本地快照 · 数据源离线" : "Local snapshot · source offline"
+    ? chinese ? "本地快照 · 数据源离线" : "Local snapshot · source offline"
     : security.status === "reauth-required"
-      ? language === "zh" ? "本地快照 · 需要重新授权" : "Local snapshot · reauthorization required"
+      ? chinese ? "本地快照 · 需要重新授权" : "Local snapshot · reauthorization required"
       : security.status === "stale"
-        ? language === "zh" ? "本地快照 · 报价已过期" : "Local snapshot · stale quote"
-        : copy.quoteFreshnessValue;
-  const stats = [
-    { label: copy.volume, value: security.stats.volume },
-    { label: copy.marketCap, value: security.stats.marketCap },
-    { label: copy.averageVolume, value: security.stats.averageVolume },
-    { label: copy.dayRange, value: security.stats.dayRange },
-    { label: copy.yearRange, value: security.stats.yearRange },
-    { label: copy.peRatio, value: security.stats.peRatio },
-    { label: copy.dividendYield, value: security.stats.dividendYield },
-  ];
+        ? chinese ? "本地快照 · 报价已过期" : "Local snapshot · stale quote"
+        : isLocalMode
+          ? security.quoteSource === "public-delayed"
+            ? chinese
+              ? `延迟只读公开行情 (${security.quoteProvider ?? "public"}) · 不可用于真实下单`
+              : `Delayed read-only public quote (${security.quoteProvider ?? "public"}) · Not for live order execution`
+            : chinese
+              ? `本地 CSV 导入基准价 (${security.quoteAsOf ? security.quoteAsOf.slice(0, 16).replace("T", " ") + " UTC" : "只读"})`
+              : `Local CSV import baseline (${security.quoteAsOf ? security.quoteAsOf.slice(0, 16).replace("T", " ") + " UTC" : "read-only"})`
+          : copy.quoteFreshnessValue;
+  const stats = isLocalMode
+    ? [
+        { label: chinese ? "计价币种" : "Currency", value: securityCurrency },
+        {
+          label: chinese ? "报价来源" : "Quote source",
+          value: security.quoteSource === "public-delayed"
+            ? (chinese ? "公开延迟行情（只读）" : "Delayed public quote (read-only)")
+            : (chinese ? "CSV 导入基准价" : "CSV import baseline"),
+        },
+        { label: chinese ? "数据提供方" : "Provider", value: security.quoteProvider ?? "local-csv" },
+        {
+          label: chinese ? "更新时间" : "As of (UTC)",
+          value: security.quoteAsOf ? security.quoteAsOf.slice(0, 19).replace("T", " ") : "—",
+        },
+        { label: copy.dayRange, value: "—" },
+        { label: copy.yearRange, value: "—" },
+        { label: copy.peRatio, value: "—" },
+      ]
+    : [
+        { label: copy.volume, value: security.stats.volume },
+        { label: copy.marketCap, value: security.stats.marketCap },
+        { label: copy.averageVolume, value: security.stats.averageVolume },
+        { label: copy.dayRange, value: security.stats.dayRange },
+        { label: copy.yearRange, value: security.stats.yearRange },
+        { label: copy.peRatio, value: security.stats.peRatio },
+        { label: copy.dividendYield, value: security.stats.dividendYield },
+      ];
 
   useEffect(() => {
     const element = chartFrameRef.current;
@@ -278,13 +312,17 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
         <div className="instrument-heading-copy">
           <div className="instrument-symbol-row">
             <span className="instrument-symbol">{security.symbol}</span>
-            <span className="instrument-demo-chip">{copy.instrumentKicker}</span>
+            <span className="instrument-demo-chip" data-testid="instrument-mode-chip">
+              {isLocalMode
+                ? (chinese ? "本地持仓 · CSV + 纸上模拟" : "Local Portfolio · CSV + Paper")
+                : copy.instrumentKicker}
+            </span>
           </div>
           <h1>{companyForLanguage(security, language)}</h1>
           <div className="instrument-price-row">
-            <strong>{formatPrice(security.price)}</strong>
+            <strong>{formatPrice(security.price, language, securityCurrency)}</strong>
             <span className={isPositive ? "markets-positive" : "markets-negative"}>
-              {formatSignedPrice(security.change)}
+              {formatSignedPrice(security.change, language, securityCurrency)}
             </span>
             <span className={`instrument-change-pill ${isPositive ? "positive" : "negative"}`}>
               {formatSignedPercent(security.changePct)}
@@ -302,7 +340,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
           data-testid="instrument-trade"
           onClick={() => onOpenTrade(security.symbol)}
         >
-          <span>{copy.trade}</span>
+          <span>{isLocalMode ? (chinese ? "纸上模拟交易" : "Paper trade") : copy.trade}</span>
           <span aria-hidden="true">↗</span>
         </button>
       </header>
@@ -310,65 +348,94 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
       <section className="instrument-chart-card" aria-labelledby="instrument-chart-title">
         <div className="instrument-card-heading">
           <div>
-            <span className="markets-kicker">{copy.priceHistoryKicker}</span>
+            <span className="markets-kicker">
+              {isLocalMode
+                ? (chinese ? "本地持仓基准价" : "Local baseline price")
+                : copy.priceHistoryKicker}
+            </span>
             <h2 id="instrument-chart-title">{copy.priceHistoryTitle}</h2>
-            <p>{copy.priceHistoryDescription}</p>
+            <p>
+              {isLocalMode
+                ? (chinese
+                  ? "本地 CSV 持仓模式不虚构历史 K 线或分时走势；仅展示导入价格或可选公开延迟报价。"
+                  : "Local CSV mode never fabricates historical intraday or multi-month price curves.")
+                : copy.priceHistoryDescription}
+            </p>
           </div>
-          <div className="instrument-period-switcher" role="group" aria-label={copy.priceHistoryTitle}>
-            {MARKET_PERIODS.map((option) => (
-              <button
-                type="button"
-                key={option}
-                className={period === option ? "active" : ""}
-                aria-pressed={period === option}
-                data-testid={`instrument-period-${option}`}
-                onClick={() => setZoomPosition(MARKET_PERIODS.indexOf(option))}
-              >
-                {displayPeriod(option, language)}
-              </button>
-            ))}
-          </div>
+          {hasHistoricalSeries && (
+            <div className="instrument-period-switcher" role="group" aria-label={copy.priceHistoryTitle}>
+              {MARKET_PERIODS.map((option) => (
+                <button
+                  type="button"
+                  key={option}
+                  className={period === option ? "active" : ""}
+                  aria-pressed={period === option}
+                  data-testid={`instrument-period-${option}`}
+                  onClick={() => setZoomPosition(MARKET_PERIODS.indexOf(option))}
+                >
+                  {displayPeriod(option, language)}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
-        <div
-          className="instrument-chart-frame"
-          ref={chartFrameRef}
-          data-testid="instrument-chart-frame"
-          data-chart-zoom={zoomPosition.toFixed(3)}
-        >
-          <InstrumentChart
-            points={chartPoints}
-            symbol={security.symbol}
-            period={period}
-            chartDescription={copy.chartDescription}
-            chartInteractionHint={copy.chartInteractionHint}
-            language={language}
-          />
-          <span className="instrument-chart-hint">{copy.chartInteractionHint}</span>
-          <div className="instrument-chart-scale" aria-hidden="true">
-            <span>{formatPrice(Math.max(...chartPoints))}</span>
-            <span>{formatPrice(Math.min(...chartPoints))}</span>
+        {hasHistoricalSeries ? (
+          <div
+            className="instrument-chart-frame"
+            ref={chartFrameRef}
+            data-testid="instrument-chart-frame"
+            data-chart-zoom={zoomPosition.toFixed(3)}
+          >
+            <InstrumentChart
+              points={chartPoints}
+              symbol={security.symbol}
+              period={period}
+              chartDescription={copy.chartDescription}
+              chartInteractionHint={copy.chartInteractionHint}
+              language={language}
+            />
+            <span className="instrument-chart-hint">{copy.chartInteractionHint}</span>
+            <div className="instrument-chart-scale" aria-hidden="true">
+              <span>{formatPrice(Math.max(...chartPoints), language, securityCurrency)}</span>
+              <span>{formatPrice(Math.min(...chartPoints), language, securityCurrency)}</span>
+            </div>
+            <div className="instrument-chart-dates" aria-hidden="true">
+              <span>{chartBoundaryLabels(period, language)[0]}</span>
+              <span>{chartBoundaryLabels(period, language)[1]}</span>
+            </div>
           </div>
-          <div className="instrument-chart-dates" aria-hidden="true">
-            <span>{chartBoundaryLabels(period, language)[0]}</span>
-            <span>{chartBoundaryLabels(period, language)[1]}</span>
+        ) : (
+          <div className="instrument-no-data-card" data-testid="instrument-no-history">
+            <strong>{formatPrice(security.price, language, securityCurrency)} ({securityCurrency})</strong>
+            <p>
+              {chinese
+                ? "无历史走势序列。为避免误导投资决策，本软件不会为本地导入标的生成模拟价格曲线。"
+                : "No historical series available. FolioHelm intentionally refuses to synthesize fictional charts for locally imported holdings."}
+            </p>
           </div>
-        </div>
+        )}
       </section>
 
       <div className="instrument-lower-grid">
         <section className="instrument-card instrument-holdings-card" aria-labelledby="instrument-holdings-title">
           <div className="instrument-card-heading compact">
             <div>
-              <span className="markets-kicker">{copy.holdingsKicker}</span>
+              <span className="markets-kicker">
+                {isLocalMode ? (chinese ? "你的本地持仓" : "Your local holding") : copy.holdingsKicker}
+              </span>
               <h2 id="instrument-holdings-title">{copy.holdingsTitle}</h2>
-              <p>{copy.holdingsDescription}</p>
+              <p>
+                {isLocalMode
+                  ? (chinese ? "来自您加密保存的本地 CSV 快照 · 仅纸上模拟" : "From your encrypted local CSV snapshot · Paper rehearsal only")
+                  : copy.holdingsDescription}
+              </p>
             </div>
           </div>
           <div className="instrument-holding-total">
             <span>{copy.holdingValue}</span>
-            <strong>{formatPrice(security.holdingValue)}</strong>
+            <strong>{formatPrice(security.holdingValue, language, securityCurrency)}</strong>
             <em className={security.holdingPnl >= 0 ? "positive" : "negative"}>
-              {formatSignedPrice(security.holdingPnl)}
+              {formatSignedPrice(security.holdingPnl, language, securityCurrency)}
             </em>
           </div>
           <dl className="instrument-holding-metrics">
@@ -378,11 +445,13 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
             </div>
             <div>
               <dt>{copy.averageCost}</dt>
-              <dd>{formatPrice(security.averageCost)}</dd>
+              <dd>{formatPrice(security.averageCost, language, securityCurrency)}</dd>
             </div>
             <div>
               <dt>{copy.unrealizedPnl}</dt>
-              <dd className={security.holdingPnl >= 0 ? "positive" : "negative"}>{formatSignedPrice(security.holdingPnl)}</dd>
+              <dd className={security.holdingPnl >= 0 ? "positive" : "negative"}>
+                {formatSignedPrice(security.holdingPnl, language, securityCurrency)}
+              </dd>
             </div>
           </dl>
         </section>
@@ -408,24 +477,40 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
       <section className="instrument-news-section" aria-labelledby="instrument-news-title">
         <div className="instrument-section-heading">
           <div>
-            <span className="markets-kicker">{copy.newsKicker}</span>
+            <span className="markets-kicker">
+              {isLocalMode ? (chinese ? "信息边界说明" : "Data boundary") : copy.newsKicker}
+            </span>
             <h2 id="instrument-news-title">{copy.newsTitle}</h2>
           </div>
-          <p>{copy.newsDescription}</p>
+          <p>
+            {isLocalMode
+              ? (chinese ? "本地持仓模式不展示虚构新闻或假市场评论。" : "Local CSV mode does not fabricate market news or commentary.")
+              : copy.newsDescription}
+          </p>
         </div>
-        <div className="instrument-news-grid">
-          {security.news.map((story, index) => (
-            <article className="instrument-news-card" key={`${security.symbol}-${index}`}>
-              <div className="instrument-news-card-topline">
-                <span>{language === "zh" ? story.tagZh : story.tagEn}</span>
-                <time>{copy.demoContextTime}</time>
-              </div>
-              <h3>{language === "zh" ? story.titleZh : story.titleEn}</h3>
-              <p>{language === "zh" ? story.bodyZh : story.bodyEn}</p>
-              <small>{copy.demoContext}</small>
-            </article>
-          ))}
-        </div>
+        {security.news.length > 0 ? (
+          <div className="instrument-news-grid">
+            {security.news.map((story, index) => (
+              <article className="instrument-news-card" key={`${security.symbol}-${index}`}>
+                <div className="instrument-news-card-topline">
+                  <span>{language === "zh" ? story.tagZh : story.tagEn}</span>
+                  <time>{copy.demoContextTime}</time>
+                </div>
+                <h3>{language === "zh" ? story.titleZh : story.titleEn}</h3>
+                <p>{language === "zh" ? story.bodyZh : story.bodyEn}</p>
+                <small>{copy.demoContext}</small>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="instrument-no-data-card" data-testid="instrument-no-fake-news">
+            <p>
+              {chinese
+                ? "当前处于本地持仓模式，未连接商业资讯源，因此不显示任何虚构新闻卡片。"
+                : "No news feed is connected in Local Portfolio mode; fictional placeholder stories are intentionally suppressed."}
+            </p>
+          </div>
+        )}
       </section>
     </main>
   );

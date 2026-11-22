@@ -32,6 +32,7 @@ export interface Position {
   marketValue: number;
   unrealizedPnl: number;
   iconClass: string;
+  currency?: string;
 }
 
 export type ActivityKind = "filled" | "pending" | "dividend";
@@ -42,6 +43,13 @@ export interface ActivityItem {
   title: string;
   detail: string;
   time: string;
+}
+
+export interface PortfolioCurrencySubtotal {
+  currency: string;
+  totalEquity: number;
+  cash: number;
+  holdingsCount: number;
 }
 
 export interface PortfolioMockData {
@@ -57,4 +65,10 @@ export interface PortfolioMockData {
   activeDays: number;
   ordersFilled: number;
   netChange: number;
+  workspaceMode?: "mock" | "local-csv";
+  currency?: string;
+  isMultiCurrency?: boolean;
+  currencySubtotals?: readonly PortfolioCurrencySubtotal[];
+  accountLabel?: string;
+  asOfLabel?: string;
 }

@@ -15,6 +15,7 @@ interface AppShellProps {
   onLanguageChange: (language: Language) => void;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  onLock?: () => void;
   dataStatus?: DisplayDataStatus | null;
   workspaceMode?: WorkspaceMode;
   publicQuotesEnabled?: boolean;
@@ -30,6 +31,7 @@ export function AppShell({
   onLanguageChange,
   onNavigate,
   onSearch,
+  onLock,
   dataStatus = null,
   workspaceMode = "mock",
   publicQuotesEnabled = false,
@@ -46,6 +48,7 @@ export function AppShell({
         onLanguageChange={onLanguageChange}
         onNavigate={onNavigate}
         onSearch={onSearch}
+        onLock={onLock}
         dataStatus={dataStatus}
         workspaceMode={workspaceMode}
       />

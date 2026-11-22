@@ -37,6 +37,9 @@ export interface TauriEvidenceVerification {
 
 export interface TauriVaultStatus {
   unlocked: boolean;
+  lockState?: "unlocked" | "user-locked" | "error-locked";
+  hasLockPassphrase?: boolean;
+  retryAfterSeconds?: number;
   cipher: string;
   schemaVersion: number;
   keyProvider: string;
@@ -44,6 +47,36 @@ export interface TauriVaultStatus {
   evidenceCount: number;
   hasLocalPortfolio: boolean;
   lockedReason?: string | null;
+}
+
+export interface TauriVaultRestoreSummary {
+  evidenceCount: number;
+  portfolioCount: number;
+  paperOrderCount: number;
+  quoteCount: number;
+  settingCount: number;
+  signerPublicKey: string;
+}
+
+export interface TauriStoredPaperOrderEvent {
+  kind: string;
+  at: string;
+  detailEn: string;
+  detailZh: string;
+}
+
+export interface TauriStoredPaperOrder {
+  id: string;
+  workspaceMode: "mock" | "local-csv";
+  symbol: string;
+  side: "buy" | "sell";
+  orderType: "market" | "limit";
+  quantity: string;
+  filledQuantity: string;
+  limitPrice: string | null;
+  status: "working" | "filled" | "canceled" | "rejected" | "unknown";
+  submittedAt: string;
+  events: TauriStoredPaperOrderEvent[];
 }
 
 export interface TauriStoredPortfolioHolding {
@@ -182,12 +215,54 @@ export function invokeVaultStatus(): Promise<TauriVaultStatus> {
   return invoke<TauriVaultStatus>("vault_status");
 }
 
+export function invokeVaultLock(
+  trigger: "manual" | "idle" = "manual",
+  workspaceMode: "mock" | "local-csv" = "mock",
+): Promise<TauriVaultStatus> {
+  return invoke<TauriVaultStatus>("vault_lock", { trigger, workspaceMode });
+}
+
+export function invokeVaultUnlock(passphrase?: string): Promise<TauriVaultStatus> {
+  return invoke<TauriVaultStatus>("vault_unlock", { passphrase: passphrase ?? null });
+}
+
+export function invokeVaultSetLockPassphrase(
+  currentPassphrase: string | null,
+  newPassphrase: string | null,
+): Promise<TauriVaultStatus> {
+  return invoke<TauriVaultStatus>("vault_set_lock_passphrase", {
+    currentPassphrase,
+    newPassphrase,
+  });
+}
+
+export function invokeVaultExportBackup(passphrase: string): Promise<string> {
+  return invoke<string>("vault_export_backup", { passphrase });
+}
+
+export function invokeVaultRestoreBackup(
+  rawBackup: string,
+  passphrase: string,
+): Promise<TauriVaultRestoreSummary> {
+  return invoke<TauriVaultRestoreSummary>("vault_restore_backup", { rawBackup, passphrase });
+}
+
 export function invokeVaultLoadPortfolio(): Promise<TauriStoredPortfolioSnapshot | null> {
   return invoke<TauriStoredPortfolioSnapshot | null>("vault_load_portfolio");
 }
 
 export function invokeVaultClearPortfolio(): Promise<boolean> {
   return invoke<boolean>("vault_clear_portfolio");
+}
+
+export function invokeVaultSavePaperOrder(order: TauriStoredPaperOrder): Promise<boolean> {
+  return invoke<boolean>("vault_save_paper_order", { order });
+}
+
+export function invokeVaultLoadPaperOrders(
+  workspaceMode: "mock" | "local-csv",
+): Promise<TauriStoredPaperOrder[]> {
+  return invoke<TauriStoredPaperOrder[]>("vault_load_paper_orders", { workspaceMode });
 }
 
 export function invokeVaultClearAll(): Promise<boolean> {
@@ -236,4 +311,15 @@ export function invokeDialogSaveJsonFile(
   content: string,
 ): Promise<string | null> {
   return invoke<string | null>("dialog_save_json_file", { defaultFileName, content });
+}
+
+export function invokeDialogSaveFhvaultFile(
+  defaultFileName: string,
+  content: string,
+): Promise<string | null> {
+  return invoke<string | null>("dialog_save_fhvault_file", { defaultFileName, content });
+}
+
+export function invokeDialogOpenFhvaultFile(): Promise<TauriOpenedTextFile | null> {
+  return invoke<TauriOpenedTextFile | null>("dialog_open_fhvault_file");
 }

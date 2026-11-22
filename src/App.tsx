@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCopy, detectInitialLanguage } from "./i18n";
 import { getMockPortfolio } from "./mocks/portfolio";
 import type { Language, ThemeMode } from "./types";
@@ -9,6 +9,7 @@ import { hasStorageIssue, isStorageAvailable, readStored, STORAGE_ISSUE_EVENT, w
 import { ActivityCard } from "./components/ActivityCard";
 import { AppShell } from "./components/AppShell";
 import { InvestingHeatmap } from "./components/InvestingHeatmap";
+import { LockScreen } from "./components/LockScreen";
 import { PortfolioHero } from "./components/PortfolioHero";
 import { PositionsCard } from "./components/PositionsCard";
 import { SearchPalette } from "./components/SearchPalette";
@@ -21,9 +22,23 @@ import { TradePage } from "./features/trade";
 import { SettingsPage } from "./features/settings";
 import { AutomationPage } from "./features/automation";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "./domain/mockBroker";
-import { loadPersistedLocalPortfolio } from "./domain/csvImport";
-import { invokeVaultStatus, isTauriRuntime } from "./domain/tauriBridge";
-import type { MockScenario } from "./domain/contracts";
+import { appendEvidence } from "./domain/evidenceJournal";
+import {
+  DEFAULT_WORKSPACE_PREFERENCES,
+  hydrateWorkspaceFromVault,
+  normalizeWorkspacePreferences,
+  saveWorkspacePreferences,
+  VAULT_HYDRATED_EVENT,
+  WORKSPACE_PREFS_KEY,
+  type VaultHydrationResult,
+} from "./domain/vaultStorage";
+import {
+  invokeVaultLock,
+  invokeVaultStatus,
+  invokeVaultUnlock,
+  isTauriRuntime,
+} from "./domain/tauriBridge";
+import type { MockScenario, TradePrefill } from "./domain/contracts";
 
 function initialLocation(): AppLocation {
   if (typeof window === "undefined") return { route: "home" };
@@ -78,9 +93,23 @@ export function App() {
   });
   const [searchOpen, setSearchOpen] = useState(false);
   const [location, setLocation] = useState<AppLocation>(initialLocation);
+  const [tradePrefill, setTradePrefill] = useState<TradePrefill | null>(null);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [storageWarning, setStorageWarning] = useState(() => hasStorageIssue() || !isStorageAvailable());
-  const [vaultLockedWarning, setVaultLockedWarning] = useState<string | null>(null);
+  const [vaultLockedReason, setVaultLockedReason] = useState<string | null>(null);
+  const [vaultErrorLocked, setVaultErrorLocked] = useState(false);
+  const [userLocked, setUserLocked] = useState(false);
+  const [lockTrigger, setLockTrigger] = useState<"manual" | "idle">("manual");
+  const [lockedAtUtc, setLockedAtUtc] = useState<string | null>(null);
+  const [hasLockPassphrase, setHasLockPassphrase] = useState(false);
+  const [retryAfterSeconds, setRetryAfterSeconds] = useState(0);
+  const [lockError, setLockError] = useState<string | null>(null);
+  const [unlocking, setUnlocking] = useState(false);
+  const [idleLockMinutes, setIdleLockMinutes] = useState<number>(() =>
+    !isTauriRuntime()
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
+      : DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes,
+  );
   const [, setBrokerRevision] = useState(0);
   const copy = getCopy(language);
   const mockPortfolio = getMockPortfolio(language);
@@ -91,6 +120,12 @@ export function App() {
     ? location.background ?? { route: "home" }
     : { route: location.route, symbol: location.symbol };
   const tradeRequest = location.route === "trade" ? { symbol: location.symbol } : null;
+  const vaultLockedWarning = vaultErrorLocked
+    ? (vaultLockedReason
+      ?? (language === "zh"
+        ? "本地加密库已锁定：操作系统凭证密钥缺失或校验失败，已保留原密文并禁止覆盖。"
+        : "Encrypted local vault is locked: OS credential key missing or integrity check failed; existing ciphertext was preserved."))
+    : null;
 
   useEffect(() => {
     const onStorageIssue = () => setStorageWarning(true);
@@ -122,35 +157,152 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!isTauriRuntime()) return undefined;
     let active = true;
-    void (async () => {
-      try {
-        const status = await invokeVaultStatus();
-        if (!active) return;
-        if (!status.unlocked) {
-          setVaultLockedWarning(
-            status.lockedReason
-              ?? (language === "zh"
-                ? "本地加密库已锁定：操作系统凭证密钥缺失或校验失败，已保留原密文并禁止覆盖。"
-                : "Encrypted local vault is locked: OS credential key missing or integrity check failed; existing ciphertext was preserved."),
-          );
-          return;
-        }
-        if (status.hasLocalPortfolio) {
-          const persisted = await loadPersistedLocalPortfolio();
-          if (active && persisted && !MOCK_BROKER.hasLocalPortfolio()) {
-            MOCK_BROKER.applyLocalPortfolioSnapshot(persisted, { switchMode: false });
+    if (isTauriRuntime()) {
+      void (async () => {
+        try {
+          const { status, preferences } = await hydrateWorkspaceFromVault();
+          if (!active) return;
+          setIdleLockMinutes(preferences.idleLockMinutes);
+          if (status) {
+            setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+            setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+            if (!status.unlocked) {
+              if (status.lockState === "user-locked") {
+                setUserLocked(true);
+                setLockTrigger("manual");
+                setVaultErrorLocked(false);
+                setVaultLockedReason(null);
+              } else {
+                setVaultErrorLocked(true);
+                setVaultLockedReason(status.lockedReason ?? null);
+              }
+            } else {
+              setVaultErrorLocked(false);
+              setVaultLockedReason(null);
+            }
           }
+        } catch {
+          // Keep UI responsive; settings page surfaces explicit vault diagnostics.
         }
-      } catch {
-        // Keep UI responsive; settings page surfaces explicit vault diagnostics.
+      })();
+    }
+
+    const onVaultHydrated = (event: Event) => {
+      const detail = (event as CustomEvent<VaultHydrationResult>).detail;
+      if (!detail) return;
+      if (detail.preferences) {
+        setIdleLockMinutes(detail.preferences.idleLockMinutes);
       }
-    })();
+      if (detail.status) {
+        setHasLockPassphrase(Boolean(detail.status.hasLockPassphrase));
+        setRetryAfterSeconds(detail.status.retryAfterSeconds ?? 0);
+      }
+    };
+    window.addEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     return () => {
       active = false;
+      window.removeEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     };
+  }, []);
+
+  const lockSession = useCallback(async (trigger: "manual" | "idle") => {
+    const mode = MOCK_BROKER.getWorkspaceMode();
+    setSearchOpen(false);
+    setLockTrigger(trigger);
+    setLockedAtUtc(new Date().toISOString());
+    setLockError(null);
+    if (isTauriRuntime()) {
+      try {
+        const status = await invokeVaultLock(trigger, mode);
+        setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+        setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+      } catch {
+        // Still engage UI lock screen fail-closed if IPC reports already locked.
+      }
+      setUserLocked(true);
+      return;
+    }
+    await appendEvidence("session_locked", { trigger, mode }).catch(() => {});
+    setHasLockPassphrase(false);
+    setRetryAfterSeconds(0);
+    setUserLocked(true);
+  }, []);
+
+  const lockSessionRef = useRef(lockSession);
+  useEffect(() => {
+    lockSessionRef.current = lockSession;
+  }, [lockSession]);
+
+  const unlockSession = useCallback(async (passphrase: string) => {
+    setUnlocking(true);
+    setLockError(null);
+    if (!isTauriRuntime()) {
+      setUserLocked(false);
+      setRetryAfterSeconds(0);
+      setUnlocking(false);
+      return;
+    }
+
+    try {
+      const status = await invokeVaultUnlock(passphrase);
+      if (status.unlocked) {
+        setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+        setRetryAfterSeconds(0);
+        setUserLocked(false);
+        setLockError(null);
+        await hydrateWorkspaceFromVault().catch(() => {});
+      } else {
+        setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+        setLockError(
+          status.lockedReason
+            ?? (language === "zh" ? "解锁失败，请重试。" : "Unlock failed. Please try again."),
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      let backoffSeconds = 0;
+      const status = await invokeVaultStatus().catch(() => null);
+      if (status) {
+        setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+        backoffSeconds = status.retryAfterSeconds ?? 0;
+      }
+      if (backoffSeconds === 0) {
+        const match = message.match(/(\d+)\s*seconds?/i);
+        if (match) backoffSeconds = Number(match[1]) || 0;
+      }
+      setRetryAfterSeconds(backoffSeconds);
+      setLockError(message);
+    } finally {
+      setUnlocking(false);
+    }
   }, [language]);
+
+  useEffect(() => {
+    if (userLocked || idleLockMinutes <= 0) return undefined;
+    const timeoutMs = idleLockMinutes * 60 * 1000;
+    let timer = window.setTimeout(() => {
+      void lockSessionRef.current("idle");
+    }, timeoutMs);
+
+    const resetTimer = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void lockSessionRef.current("idle");
+      }, timeoutMs);
+    };
+
+    const events = ["pointerdown", "keydown", "wheel", "focus"] as const;
+    for (const eventName of events) {
+      window.addEventListener(eventName, resetTimer, { passive: true });
+    }
+    return () => {
+      window.clearTimeout(timer);
+      for (const eventName of events) {
+        window.removeEventListener(eventName, resetTimer);
+      }
+    };
+  }, [idleLockMinutes, userLocked]);
 
   useEffect(() => {
     MOCK_BROKER.setScenario(mockScenario);
@@ -224,7 +376,8 @@ export function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
-        !searchOpen
+        !userLocked
+        && !searchOpen
         && !tradeRequest
         && !settingsModalOpen
         && (event.ctrlKey || event.metaKey)
@@ -236,7 +389,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [searchOpen, settingsModalOpen, tradeRequest]);
+  }, [searchOpen, settingsModalOpen, tradeRequest, userLocked]);
 
   const commitLocation = (nextLocation: AppLocation, mode: "push" | "replace" = "push") => {
     const nextHash = serializeLocation(nextLocation);
@@ -252,13 +405,15 @@ export function App() {
     setLocation((current) => sameLocation(current, nextLocation) ? current : nextLocation);
   };
 
-  const navigate = (route: AppRoute, symbol?: string) => {
-    const trimmedSymbol = symbol?.trim() || undefined;
+  const navigate = (route: AppRoute, symbol?: string, prefill?: TradePrefill) => {
+    const trimmedSymbol = symbol?.trim() || prefill?.symbol?.trim() || undefined;
     if (route === "trade") {
+      setTradePrefill(prefill ?? null);
       commitLocation({ route, symbol: trimmedSymbol, background: navigation });
       return;
     }
 
+    setTradePrefill(null);
     if (route === "instrument" && !trimmedSymbol) {
       commitLocation({ route: "markets" });
       return;
@@ -268,6 +423,7 @@ export function App() {
   };
 
   const closeTrade = () => {
+    setTradePrefill(null);
     if (location.route !== "trade") return;
     const background = location.background ?? { route: "home" };
     if (isTradeDialogHistoryState(window.history.state)) {
@@ -278,6 +434,21 @@ export function App() {
     }
     commitLocation(background, "replace");
   };
+
+  if (userLocked) {
+    return (
+      <LockScreen
+        language={language}
+        trigger={lockTrigger}
+        hasPassphrase={hasLockPassphrase}
+        lockedAtUtc={lockedAtUtc}
+        retryAfterSeconds={retryAfterSeconds}
+        errorMessage={lockError}
+        unlocking={unlocking}
+        onUnlock={unlockSession}
+      />
+    );
+  }
 
   const home = (
     <main className="home-page" data-testid="home-page">
@@ -347,7 +518,7 @@ export function App() {
           <PortfolioPage
             language={language}
             onOpenInstrument={(symbol) => navigate("instrument", symbol)}
-            onOpenTrade={(symbol) => navigate("trade", symbol)}
+            onOpenTrade={(symbol, prefill) => navigate("trade", symbol, prefill)}
           />
         );
       case "orders":
@@ -364,6 +535,12 @@ export function App() {
             mockScenario={mockScenario}
             onMockScenarioChange={setMockScenario}
             onModalStateChange={setSettingsModalOpen}
+            idleLockMinutes={idleLockMinutes}
+            onIdleLockMinutesChange={(minutes) => {
+              setIdleLockMinutes(minutes);
+              void saveWorkspacePreferences({ idleLockMinutes: minutes });
+            }}
+            onLockSession={(trigger) => void lockSession(trigger)}
           />
         );
       default:
@@ -380,12 +557,14 @@ export function App() {
         onLanguageChange={setLanguage}
         onNavigate={navigate}
         onSearch={() => setSearchOpen(true)}
+        onLock={() => void lockSession("manual")}
         dataStatus={dataStatus}
         workspaceMode={workspaceMode}
         publicQuotesEnabled={publicQuotesEnabled}
         persistenceWarning={vaultLockedWarning ?? (storageWarning ? copy.localStorageWarning : undefined)}
         onDismissPersistenceWarning={() => {
-          setVaultLockedWarning(null);
+          setVaultErrorLocked(false);
+          setVaultLockedReason(null);
           setStorageWarning(false);
         }}
       >
@@ -412,9 +591,10 @@ export function App() {
           onClose={closeTrade}
         >
           <TradePage
-            key={tradeRequest.symbol ?? "default-trade"}
+            key={`${tradeRequest.symbol ?? "default-trade"}:${tradePrefill?.side ?? ""}:${tradePrefill?.quantity ?? ""}`}
             language={language}
             initialSymbol={tradeRequest.symbol}
+            initialPrefill={tradePrefill ?? undefined}
             onClose={closeTrade}
             onViewOrders={() => navigate("orders")}
           />

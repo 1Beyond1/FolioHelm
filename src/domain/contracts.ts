@@ -50,6 +50,7 @@ export interface BrokerQuote {
   changePct: Percent;
   asOf: string;
   status: DataStatus;
+  currency?: string;
   source?: QuoteSourceKind;
   delayed?: boolean;
   provider?: string;
@@ -65,6 +66,18 @@ export interface BrokerHolding {
   marketValue: Money;
   dayPnl: Money;
   totalPnl: Money;
+  currency?: string;
+}
+
+export interface CurrencySummary {
+  currency: string;
+  cash: Money;
+  buyingPower: Money;
+  holdingsValue: Money;
+  totalEquity: Money;
+  dayPnl: Money;
+  totalPnl: Money;
+  holdingsCount: number;
 }
 
 export interface BrokerAccount {
@@ -77,6 +90,17 @@ export interface BrokerAccount {
   allTimeChange: Money;
   asOf: string;
   status: DataStatus;
+  currency?: string;
+  isMultiCurrency?: boolean;
+  currencyBreakdowns?: readonly CurrencySummary[];
+}
+
+export interface TradePrefill {
+  symbol: BrokerSymbol;
+  side?: BrokerOrderSide;
+  quantity?: string;
+  orderType?: BrokerOrderType;
+  limitPrice?: string;
 }
 
 export interface BrokerOrderEvent {

@@ -13,6 +13,7 @@ interface TopBarProps {
   onLanguageChange: (language: Language) => void;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  onLock?: () => void;
   dataStatus?: DisplayDataStatus | null;
   workspaceMode?: WorkspaceMode;
 }
@@ -40,6 +41,7 @@ export function TopBar({
   onLanguageChange,
   onNavigate,
   onSearch,
+  onLock,
   dataStatus = null,
   workspaceMode = "mock",
 }: TopBarProps) {
@@ -104,6 +106,18 @@ export function TopBar({
         >
           {language === "en" ? "中" : "EN"}
         </button>
+        {onLock && (
+          <button
+            className="icon-button"
+            type="button"
+            data-testid="topbar-lock-button"
+            aria-label={language === "zh" ? "锁定会话" : "Lock session"}
+            title={language === "zh" ? "锁定会话" : "Lock session"}
+            onClick={onLock}
+          >
+            <Icon name="lock" />
+          </button>
+        )}
         <button className={`icon-button ${activeRoute === "settings" ? "active" : ""}`} type="button" aria-label={copy.settings} title={copy.settings} onClick={() => onNavigate("settings")}>
           <Icon name="settings" />
         </button>

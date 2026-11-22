@@ -3,15 +3,43 @@ import type { ChangeEvent } from "react";
 import type { Language, ThemeMode } from "../../types";
 import type { MockScenario } from "../../domain/contracts";
 import { detectInitialLanguage } from "../../i18n";
-import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
-import { appendEvidence, clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
+import { clearFolioHelmStored, readStored } from "../../platform/storage";
+import {
+  appendEvidence,
+  clearEvidence,
+  exportEvidence,
+  importEvidence,
+  MAX_EVIDENCE_IMPORT_BYTES,
+  verifyEvidence,
+} from "../../domain/evidenceJournal";
 import { clearPersistedLocalPortfolio } from "../../domain/csvImport";
 import {
   refreshPublicQuotes,
+  saveFhvaultWithDialogOrBlob,
   saveJsonWithDialogOrBlob,
   type PublicQuoteProviderChoice,
 } from "../../domain/publicQuotes";
-import { invokeVaultClearAll, invokeVaultStatus, isTauriRuntime, type TauriVaultStatus } from "../../domain/tauriBridge";
+import {
+  invokeDialogOpenFhvaultFile,
+  invokeVaultClearAll,
+  invokeVaultExportBackup,
+  invokeVaultRestoreBackup,
+  invokeVaultSetLockPassphrase,
+  invokeVaultStatus,
+  isTauriRuntime,
+  type TauriVaultStatus,
+} from "../../domain/tauriBridge";
+import {
+  DEFAULT_WORKSPACE_PREFERENCES,
+  hydrateWorkspaceFromVault,
+  loadEncryptedSetting,
+  loadWorkspacePreferences,
+  normalizeWorkspacePreferences,
+  PROTECTIONS_SETTING_KEY,
+  saveEncryptedSetting,
+  saveWorkspacePreferences,
+  WORKSPACE_PREFS_KEY,
+} from "../../domain/vaultStorage";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
 import { Modal } from "../../components/Modal";
@@ -25,6 +53,9 @@ export interface SettingsPageProps {
   mockScenario?: MockScenario;
   onMockScenarioChange?: (scenario: MockScenario) => void;
   onModalStateChange?: (open: boolean) => void;
+  idleLockMinutes?: number;
+  onIdleLockMinutesChange?: (minutes: number) => void;
+  onLockSession?: (trigger: "manual" | "idle") => void;
 }
 
 type ProtectionKey = "maxOrderValue" | "priceDeviation" | "autoLock" | "accountAllowlist";
@@ -105,7 +136,7 @@ const COPY = {
     priceDeviation: "Price deviation",
     priceDeviationDetail: "Mock preference only; no live quote comparison is performed in this build.",
     autoLock: "Auto lock",
-    autoLockDetail: "Mock preference only; session auto-lock is not active in this build.",
+    autoLockDetail: "Locks the session on idle timeout, zeroizing in-memory vault keys and writing signed SessionLocked evidence.",
     accountAllowlist: "Account allowlist",
     accountAllowlistDetail: "Mock preference only; this build has no broker account access or account selection.",
     coreRules: "Core rules cannot be disabled",
@@ -209,7 +240,7 @@ const COPY = {
     priceDeviation: "价格偏差",
     priceDeviationDetail: "仅是 Mock 偏好；本版本不会执行实时报价偏差比较。",
     autoLock: "自动锁定",
-    autoLockDetail: "仅是 Mock 偏好；本版本尚未启用会话自动锁定。",
+    autoLockDetail: "空闲超时自动锁屏，立即擦除内存会话密钥并写入 Ed25519 签名锁屏证据。",
     accountAllowlist: "账户允许列表",
     accountAllowlistDetail: "仅是 Mock 偏好；本版本没有券商账户访问或账户选择。",
     coreRules: "核心规则不可关闭",
@@ -308,11 +339,15 @@ export function SettingsPage({
   mockScenario = "healthy",
   onMockScenarioChange = () => undefined,
   onModalStateChange = () => undefined,
+  idleLockMinutes = 15,
+  onIdleLockMinutesChange,
+  onLockSession,
 }: SettingsPageProps) {
   const copy = COPY[language];
+  const chinese = language === "zh";
   const definitions = getProtectionDefinitions(language);
   const [protections, setProtections] = useState<Record<ProtectionKey, boolean>>(() => {
-    const rawStored = readStored<unknown>("protections", {});
+    const rawStored = !isTauriRuntime() ? readStored<unknown>("protections", {}) : {};
     const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
       ? rawStored as Partial<Record<ProtectionKey, boolean>>
       : {};
@@ -336,29 +371,97 @@ export function SettingsPage({
   const [exportPathNote, setExportPathNote] = useState<string | null>(null);
   const [vaultStatus, setVaultStatus] = useState<TauriVaultStatus | null>(null);
   const [publicQuotesEnabled, setPublicQuotesEnabled] = useState<boolean>(() => MOCK_BROKER.isPublicQuotesEnabled());
-  const [quoteProvider, setQuoteProvider] = useState<PublicQuoteProviderChoice>("stooq");
+  const [quoteProvider, setQuoteProvider] = useState<PublicQuoteProviderChoice>(() =>
+    !isTauriRuntime()
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).quoteProvider
+      : "stooq",
+  );
   const [quoteRefreshing, setQuoteRefreshing] = useState(false);
   const [quoteStatusMessage, setQuoteStatusMessage] = useState<string | null>(null);
+  const [localIdleMinutes, setLocalIdleMinutes] = useState<number>(() =>
+    !isTauriRuntime() && !onIdleLockMinutesChange
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
+      : idleLockMinutes,
+  );
+
+  // C2: .fhvault encrypted backup & restore modal state
+  const [backupModalMode, setBackupModalMode] = useState<"export" | "restore" | null>(null);
+  const [backupPassphrase, setBackupPassphrase] = useState("");
+  const [backupPassphraseConfirm, setBackupPassphraseConfirm] = useState("");
+  const [backupRawContent, setBackupRawContent] = useState("");
+  const [backupFileName, setBackupFileName] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupStatusMessage, setBackupStatusMessage] = useState<string | null>(null);
+  const [backupModalError, setBackupModalError] = useState<string | null>(null);
+
+  // C2: App Lock passphrase modal state
+  const [lockPassModalOpen, setLockPassModalOpen] = useState(false);
+  const [currentLockPass, setCurrentLockPass] = useState("");
+  const [newLockPass, setNewLockPass] = useState("");
+  const [confirmLockPass, setConfirmLockPass] = useState("");
+  const [lockPassBusy, setLockPassBusy] = useState(false);
+  const [lockPassMessage, setLockPassMessage] = useState<string | null>(null);
+  const [lockPassError, setLockPassError] = useState<string | null>(null);
+
+  const protectionsHydratedRef = useRef(!isTauriRuntime());
   const importInputRef = useRef<HTMLInputElement>(null);
+  const fhvaultInputRef = useRef<HTMLInputElement>(null);
   const riskScrollRef = useRef<HTMLDivElement>(null);
 
-  const settingsModalOpen = connectionDialogOpen || pendingKey !== null || clearDataDialogOpen;
+  const settingsModalOpen =
+    connectionDialogOpen
+    || pendingKey !== null
+    || clearDataDialogOpen
+    || backupModalMode !== null
+    || lockPassModalOpen;
+
+  useEffect(() => {
+    setLocalIdleMinutes(idleLockMinutes);
+  }, [idleLockMinutes]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
     let active = true;
+    void loadWorkspacePreferences()
+      .then((prefs) => {
+        if (!active) return;
+        setQuoteProvider(prefs.quoteProvider);
+        if (!onIdleLockMinutesChange) setLocalIdleMinutes(prefs.idleLockMinutes);
+      })
+      .catch(() => undefined);
+
     void invokeVaultStatus()
       .then((status) => {
         if (active) setVaultStatus(status);
       })
       .catch(() => undefined);
+
+    void loadEncryptedSetting<unknown>(PROTECTIONS_SETTING_KEY, {}, "protections")
+      .then((rawStored) => {
+        if (!active) return;
+        const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
+          ? rawStored as Partial<Record<ProtectionKey, boolean>>
+          : {};
+        setProtections({
+          maxOrderValue: storedBoolean(stored.maxOrderValue, INITIAL_PROTECTIONS.maxOrderValue),
+          priceDeviation: storedBoolean(stored.priceDeviation, INITIAL_PROTECTIONS.priceDeviation),
+          autoLock: storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock),
+          accountAllowlist: storedBoolean(stored.accountAllowlist, INITIAL_PROTECTIONS.accountAllowlist),
+        });
+        protectionsHydratedRef.current = true;
+      })
+      .catch(() => {
+        if (active) protectionsHydratedRef.current = true;
+      });
+
     return () => {
       active = false;
     };
-  }, []);
+  }, [onIdleLockMinutesChange]);
 
   useEffect(() => {
-    writeStored("protections", protections);
+    if (!protectionsHydratedRef.current) return;
+    void saveEncryptedSetting(PROTECTIONS_SETTING_KEY, protections, "protections");
   }, [protections]);
 
   useEffect(() => {
@@ -432,11 +535,28 @@ export function SettingsPage({
     setPublicQuotesEnabled(next);
     MOCK_BROKER.setPublicQuotesEnabled(next);
     setQuoteStatusMessage(null);
+    void saveWorkspacePreferences({ publicQuotesEnabled: next, quoteProvider });
     void appendEvidence("safety_setting_changed", {
       mode: MOCK_BROKER.getWorkspaceMode(),
       setting: "publicDelayedQuotes",
       enabled: String(next),
       provider: quoteProvider,
+    }).catch(() => undefined);
+  }
+
+  function handleQuoteProviderChange(nextProvider: PublicQuoteProviderChoice): void {
+    setQuoteProvider(nextProvider);
+    void saveWorkspacePreferences({ quoteProvider: nextProvider });
+  }
+
+  function handleIdleLockChange(minutes: number): void {
+    setLocalIdleMinutes(minutes);
+    onIdleLockMinutesChange?.(minutes);
+    void saveWorkspacePreferences({ idleLockMinutes: minutes });
+    void appendEvidence("safety_setting_changed", {
+      mode: MOCK_BROKER.getWorkspaceMode(),
+      setting: "idleAutoLockMinutes",
+      minutes: String(minutes),
     }).catch(() => undefined);
   }
 
@@ -463,6 +583,15 @@ export function SettingsPage({
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
+    if (file.size > MAX_EVIDENCE_IMPORT_BYTES) {
+      setEvidenceStatus({
+        kind: "invalid",
+        reason: chinese
+          ? "导入的证据文件超过 20 MB 安全上限"
+          : "Evidence import file exceeds the 20 MB safety limit",
+      });
+      return;
+    }
     try {
       const result = await importEvidence(await file.text());
       setEvidenceStatus({ kind: "valid", count: result.sequence });
@@ -471,9 +600,189 @@ export function SettingsPage({
     }
   }
 
+  function closeBackupModal(): void {
+    setBackupModalMode(null);
+    setBackupPassphrase("");
+    setBackupPassphraseConfirm("");
+    setBackupRawContent("");
+    setBackupFileName("");
+    setBackupModalError(null);
+    setBackupBusy(false);
+  }
+
+  async function handlePickFhvaultFile(): Promise<void> {
+    setBackupModalError(null);
+    if (isTauriRuntime()) {
+      try {
+        const opened = await invokeDialogOpenFhvaultFile();
+        if (!opened) return;
+        setBackupFileName(opened.fileName);
+        setBackupRawContent(opened.content);
+        return;
+      } catch (error) {
+        setBackupModalError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
+    fhvaultInputRef.current?.click();
+  }
+
+  async function handleFhvaultFileInputChange(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size > MAX_EVIDENCE_IMPORT_BYTES) {
+      setBackupModalError(
+        chinese ? "所选 .fhvault 备份文件超过 20 MB 安全上限。" : "Selected .fhvault backup exceeds the 20 MB safety limit.",
+      );
+      return;
+    }
+    setBackupFileName(file.name);
+    setBackupRawContent(await file.text());
+  }
+
+  async function handleExportFhvaultSubmit(): Promise<void> {
+    setBackupModalError(null);
+    if (backupPassphrase.length < 10) {
+      setBackupModalError(
+        chinese ? "迁移备份口令长度至少需要 10 位字符。" : "Backup passphrase must be at least 10 characters long.",
+      );
+      return;
+    }
+    if (backupPassphrase !== backupPassphraseConfirm) {
+      setBackupModalError(
+        chinese ? "两次输入的口令不一致。" : "Passphrases do not match.",
+      );
+      return;
+    }
+    if (!isTauriRuntime()) {
+      setBackupModalError(
+        chinese ? "浏览器预览模式不含加密 SQLite 金库，请在桌面端导出 .fhvault 备份。" : "Encrypted .fhvault export requires the desktop SQLite vault runtime.",
+      );
+      return;
+    }
+    setBackupBusy(true);
+    const pass = backupPassphrase;
+    setBackupPassphrase("");
+    setBackupPassphraseConfirm("");
+    try {
+      const encryptedJson = await invokeVaultExportBackup(pass);
+      const outcome = await saveFhvaultWithDialogOrBlob("foliohelm-vault-backup.fhvault", encryptedJson);
+      if (outcome.kind === "native-saved") {
+        setBackupStatusMessage(
+          chinese ? `已使用 Argon2id + AES-256-GCM 加密导出至 ${outcome.path}` : `Encrypted backup saved to ${outcome.path}`,
+        );
+      } else if (outcome.kind === "browser-download") {
+        setBackupStatusMessage(
+          chinese ? "已生成加密 .fhvault 备份文件。" : "Encrypted .fhvault backup generated.",
+        );
+      }
+      closeBackupModal();
+    } catch (error) {
+      setBackupModalError(error instanceof Error ? error.message : String(error));
+      setBackupBusy(false);
+    }
+  }
+
+  async function handleRestoreFhvaultSubmit(): Promise<void> {
+    setBackupModalError(null);
+    if (!backupRawContent) {
+      setBackupModalError(
+        chinese ? "请先选择一个 .fhvault 备份文件。" : "Please select a .fhvault backup file first.",
+      );
+      return;
+    }
+    if (!backupPassphrase) {
+      setBackupModalError(
+        chinese ? "请输入解密口令。" : "Please enter the backup passphrase.",
+      );
+      return;
+    }
+    if (!isTauriRuntime()) {
+      setBackupModalError(
+        chinese ? "浏览器预览模式不支持 .fhvault 金库恢复，请在桌面端执行。" : "Encrypted .fhvault restore requires the desktop SQLite vault runtime.",
+      );
+      return;
+    }
+    setBackupBusy(true);
+    const pass = backupPassphrase;
+    setBackupPassphrase("");
+    try {
+      const summary = await invokeVaultRestoreBackup(backupRawContent, pass);
+      const hydrated = await hydrateWorkspaceFromVault();
+      if (hydrated.status) setVaultStatus(hydrated.status);
+      setBackupStatusMessage(
+        chinese
+          ? `已验签并原子恢复金库（${summary.portfolioCount} 份持仓快照、${summary.paperOrderCount} 笔纸上订单、${summary.evidenceCount} 条签名证据）。`
+          : `Verified and restored vault atomically (${summary.portfolioCount} snapshots, ${summary.paperOrderCount} paper orders, ${summary.evidenceCount} signed evidence entries).`,
+      );
+      closeBackupModal();
+    } catch (error) {
+      setBackupModalError(
+        chinese
+          ? `恢复失败（Fail-Closed，原加密库未被修改）：${error instanceof Error ? error.message : String(error)}`
+          : `Restore failed (Fail-Closed; existing vault untouched): ${error instanceof Error ? error.message : String(error)}`,
+      );
+      setBackupBusy(false);
+    }
+  }
+
+  function closeLockPassModal(): void {
+    setLockPassModalOpen(false);
+    setCurrentLockPass("");
+    setNewLockPass("");
+    setConfirmLockPass("");
+    setLockPassError(null);
+    setLockPassBusy(false);
+  }
+
+  async function handleSaveLockPassphrase(removeExisting = false): Promise<void> {
+    setLockPassError(null);
+    if (!isTauriRuntime()) {
+      setLockPassError(
+        chinese ? "桌面端才支持 Argon2id 锁屏口令保护。" : "Argon2id App Lock passphrases require the desktop runtime.",
+      );
+      return;
+    }
+    if (!removeExisting) {
+      if (newLockPass.length < 10) {
+        setLockPassError(
+          chinese ? "锁屏口令长度至少需要 10 位字符。" : "Lock passphrase must be at least 10 characters.",
+        );
+        return;
+      }
+      if (newLockPass !== confirmLockPass) {
+        setLockPassError(
+          chinese ? "两次输入的新口令不一致。" : "New passphrases do not match.",
+        );
+        return;
+      }
+    }
+    setLockPassBusy(true);
+    const cur = currentLockPass || null;
+    const next = removeExisting ? null : newLockPass;
+    setCurrentLockPass("");
+    setNewLockPass("");
+    setConfirmLockPass("");
+    try {
+      const updated = await invokeVaultSetLockPassphrase(cur, next);
+      setVaultStatus(updated);
+      setLockPassMessage(
+        removeExisting
+          ? (chinese ? "已清除自定义锁屏口令（锁屏仍会擦除内存密钥）。" : "Custom lock passphrase removed (locking still wipes in-memory keys).")
+          : (chinese ? "已通过 Argon2id 配置锁屏口令（明文绝不落盘）。" : "App Lock passphrase configured via Argon2id (never stored in plaintext)."),
+      );
+      closeLockPassModal();
+    } catch (error) {
+      setLockPassError(error instanceof Error ? error.message : String(error));
+      setLockPassBusy(false);
+    }
+  }
+
   async function clearLocalData(): Promise<void> {
+    const mode = MOCK_BROKER.getWorkspaceMode();
     await appendEvidence("state_changed", {
-      mode: "mock",
+      mode,
       action: "local_data_reset_requested",
     }).catch(() => undefined);
     let preferencesCleared = false;
@@ -558,7 +867,7 @@ export function SettingsPage({
     setProtections((current) => ({ ...current, [key]: true }));
     setWarningKey(null);
     void appendEvidence("safety_setting_changed", {
-      mode: "mock",
+      mode: MOCK_BROKER.getWorkspaceMode(),
       setting: key,
       enabled: "true",
       action: "enabled",
@@ -582,7 +891,7 @@ export function SettingsPage({
     setWarningKey(confirmedKey);
     handleCancelDisable();
     void appendEvidence("safety_setting_changed", {
-      mode: "mock",
+      mode: MOCK_BROKER.getWorkspaceMode(),
       setting: confirmedKey,
       enabled: "false",
       action: "disabled",
@@ -784,7 +1093,7 @@ export function SettingsPage({
                 className="settings-scenario-select"
                 aria-label={copy.publicQuotesProvider}
                 value={quoteProvider}
-                onChange={(event) => setQuoteProvider(event.target.value as PublicQuoteProviderChoice)}
+                onChange={(event) => handleQuoteProviderChange(event.target.value as PublicQuoteProviderChoice)}
               >
                 <option value="stooq">Stooq (stooq.com)</option>
                 <option value="yahoo">Yahoo Finance (query1.finance.yahoo.com)</option>
@@ -805,6 +1114,119 @@ export function SettingsPage({
           )}
         </div>
 
+        <div className="settings-quotes-panel" data-testid="app-lock-panel">
+          <div className="settings-protection">
+            <div className="settings-protection__copy">
+              <div className="settings-protection__title-line">
+                <strong>{chinese ? "会话锁屏与自动锁定 (App Lock)" : "Session & idle App Lock"}</strong>
+                <span className="settings-badge settings-badge--lime">
+                  {vaultStatus?.hasLockPassphrase
+                    ? (chinese ? "Argon2id 口令已启用" : "Argon2id passphrase active")
+                    : (chinese ? "OS 密钥重校验" : "OS key re-verify")}
+                </span>
+              </div>
+              <span>
+                {chinese
+                  ? "锁定后立即释放并 Zeroizing 擦除内存会话密钥、写入 Ed25519 签名锁屏证据并遮罩界面；解锁失败自动启用指数退避防爆破。"
+                  : "Locking immediately wipes in-memory session keys via Zeroizing, writes an Ed25519 SessionLocked record, and enforces exponential backoff on failed unlocks."}
+              </span>
+            </div>
+          </div>
+          <div className="settings-quotes-controls">
+            <label>
+              <span>{chinese ? "空闲自动锁屏" : "Idle auto-lock"}</span>
+              <select
+                className="settings-scenario-select"
+                data-testid="idle-lock-select"
+                aria-label={chinese ? "空闲自动锁屏" : "Idle auto-lock"}
+                value={String(localIdleMinutes)}
+                onChange={(event) => handleIdleLockChange(Number(event.target.value))}
+              >
+                <option value="0">{chinese ? "关闭" : "Off"}</option>
+                <option value="5">{chinese ? "5 分钟" : "5 minutes"}</option>
+                <option value="15">{chinese ? "15 分钟" : "15 minutes"}</option>
+                <option value="30">{chinese ? "30 分钟" : "30 minutes"}</option>
+                <option value="60">{chinese ? "60 分钟" : "60 minutes"}</option>
+              </select>
+            </label>
+            <button
+              className="settings-button settings-button--secondary"
+              type="button"
+              data-testid="settings-lock-now"
+              onClick={() => onLockSession?.("manual")}
+            >
+              {chinese ? "立即锁屏" : "Lock now"}
+            </button>
+            <button
+              className="settings-button settings-button--secondary"
+              type="button"
+              data-testid="settings-configure-lock-passphrase"
+              onClick={() => {
+                setLockPassError(null);
+                setLockPassModalOpen(true);
+              }}
+            >
+              {vaultStatus?.hasLockPassphrase
+                ? (chinese ? "修改/移除锁屏口令" : "Change / remove passphrase")
+                : (chinese ? "设置锁屏口令" : "Set lock passphrase")}
+            </button>
+          </div>
+          {lockPassMessage && (
+            <p className="settings-quote-status" role="status" data-testid="lock-passphrase-status">{lockPassMessage}</p>
+          )}
+        </div>
+
+        <div className="settings-quotes-panel" data-testid="fhvault-backup-panel">
+          <div className="settings-protection">
+            <div className="settings-protection__copy">
+              <div className="settings-protection__title-line">
+                <strong>{chinese ? ".fhvault 口令加密离线迁移备份" : ".fhvault passphrase-encrypted offline backup"}</strong>
+                <span className="settings-badge settings-badge--lime">Argon2id + AES-256-GCM</span>
+              </div>
+              <span>
+                {chinese
+                  ? "使用 Argon2id + 随机 128-bit 盐 + AES-256-GCM + 格式版本 AAD 导出全库加密快照；恢复时先验签后原子替换，失败绝不破坏现有金库（≤ 20 MB）。"
+                  : "Exports the entire vault encrypted with Argon2id + random 128-bit salt + AES-256-GCM + version AAD. Restore verifies signatures before atomic replacement; failure never harms your existing vault (max 20 MB)."}
+              </span>
+            </div>
+          </div>
+          <div className="settings-evidence-actions">
+            <button
+              className="settings-button settings-button--secondary"
+              type="button"
+              data-testid="fhvault-export-open"
+              onClick={() => {
+                setBackupModalError(null);
+                setBackupModalMode("export");
+              }}
+            >
+              {chinese ? "导出 .fhvault 备份" : "Export .fhvault backup"}
+            </button>
+            <button
+              className="settings-button settings-button--secondary"
+              type="button"
+              data-testid="fhvault-restore-open"
+              onClick={() => {
+                setBackupModalError(null);
+                setBackupModalMode("restore");
+              }}
+            >
+              {chinese ? "验签并恢复 .fhvault" : "Verify & restore .fhvault"}
+            </button>
+            <input
+              ref={fhvaultInputRef}
+              className="settings-hidden-file"
+              data-testid="fhvault-file-input"
+              type="file"
+              accept=".fhvault,application/json,.json"
+              onChange={(event) => void handleFhvaultFileInputChange(event)}
+            />
+          </div>
+          {backupStatusMessage && (
+            <p className="settings-quote-status" role="status" data-testid="fhvault-backup-status">{backupStatusMessage}</p>
+          )}
+        </div>
+
         <div className="settings-evidence-row">
           <div>
             <strong>{copy.evidence}</strong>
@@ -818,7 +1240,7 @@ export function SettingsPage({
             <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleExportEvidence()}>{copy.export}</button>
             <button className="settings-button settings-button--secondary" type="button" data-testid="export-diagnostics" onClick={() => void handleExportDiagnostics()}>{copy.exportDiagnostics}</button>
             <button className="settings-button settings-button--secondary" type="button" onClick={() => importInputRef.current?.click()}>{copy.import}</button>
-            <input ref={importInputRef} className="settings-hidden-file" type="file" accept="application/json,.json" onChange={(event) => void handleImportEvidence(event)} />
+            <input ref={importInputRef} className="settings-hidden-file" data-testid="evidence-import-input" type="file" accept="application/json,.json" onChange={(event) => void handleImportEvidence(event)} />
           </div>
         </div>
         <button className="settings-button settings-button--danger" type="button" onClick={() => setClearDataDialogOpen(true)}>{copy.clearData}</button>
@@ -939,6 +1361,184 @@ export function SettingsPage({
           <div className="settings-modal__actions">
             <button className="settings-button settings-button--secondary" type="button" onClick={() => setClearDataDialogOpen(false)}>{copy.cancel}</button>
             <button className="settings-button settings-button--danger" type="button" onClick={() => void clearLocalData()}>{copy.confirmClear}</button>
+          </div>
+        </Modal>
+      )}
+
+      {backupModalMode !== null && (
+        <Modal
+          className="settings-modal"
+          backdropClassName="settings-modal-backdrop"
+          labelledBy="settings-fhvault-modal-title"
+          testId={backupModalMode === "export" ? "fhvault-export-modal" : "fhvault-restore-modal"}
+          onClose={closeBackupModal}
+        >
+          <span className="settings-badge settings-badge--lime">Argon2id + AES-256-GCM</span>
+          <h2 id="settings-fhvault-modal-title">
+            {backupModalMode === "export"
+              ? (chinese ? "导出加密 .fhvault 迁移备份" : "Export encrypted .fhvault backup")
+              : (chinese ? "验签并恢复 .fhvault 迁移备份" : "Verify & restore .fhvault backup")}
+          </h2>
+          <p>
+            {backupModalMode === "export"
+              ? (chinese
+                ? "请设置至少 10 位强口令。口令绝不落盘或写入日志，请务必妥善离线保管。"
+                : "Choose a strong passphrase (at least 10 characters). It is never written to disk or logs.")
+              : (chinese
+                ? "恢复前会校验 Argon2id + AES-256-GCM 认证标签与整条 Ed25519 证据链签名；任何校验失败都会 Fail-Closed 终止且不改动现有金库。"
+                : "AES-256-GCM authentication and full Ed25519 evidence verification run before any replacement; failures leave your current vault untouched.")}
+          </p>
+
+          {backupModalMode === "restore" && (
+            <div className="settings-quotes-controls">
+              <button
+                type="button"
+                className="settings-button settings-button--secondary"
+                data-testid="fhvault-choose-file"
+                onClick={() => void handlePickFhvaultFile()}
+              >
+                {chinese ? "选择 .fhvault 文件" : "Choose .fhvault file"}
+              </button>
+              {backupFileName && <span data-testid="fhvault-selected-name">{backupFileName}</span>}
+            </div>
+          )}
+
+          <label className="settings-field">
+            <span>{chinese ? "加密/解密口令（≥ 10 位）" : "Passphrase (min 10 chars)"}</span>
+            <input
+              type="password"
+              data-testid="fhvault-passphrase-input"
+              autoComplete="new-password"
+              value={backupPassphrase}
+              onChange={(event) => setBackupPassphrase(event.target.value)}
+            />
+          </label>
+
+          {backupModalMode === "export" && (
+            <label className="settings-field">
+              <span>{chinese ? "确认口令" : "Confirm passphrase"}</span>
+              <input
+                type="password"
+                data-testid="fhvault-passphrase-confirm"
+                autoComplete="new-password"
+                value={backupPassphraseConfirm}
+                onChange={(event) => setBackupPassphraseConfirm(event.target.value)}
+              />
+            </label>
+          )}
+
+          {backupModalError && (
+            <p className="settings-warning" role="alert" data-testid="fhvault-modal-error">
+              {backupModalError}
+            </p>
+          )}
+
+          <div className="settings-modal__actions">
+            <button className="settings-button settings-button--secondary" type="button" onClick={closeBackupModal}>
+              {copy.cancel}
+            </button>
+            <button
+              className="settings-button settings-button--primary"
+              type="button"
+              data-testid="fhvault-modal-submit"
+              disabled={backupBusy}
+              onClick={() =>
+                void (backupModalMode === "export" ? handleExportFhvaultSubmit() : handleRestoreFhvaultSubmit())
+              }
+            >
+              {backupBusy
+                ? (chinese ? "处理中…" : "Processing…")
+                : backupModalMode === "export"
+                  ? (chinese ? "加密并导出" : "Encrypt & export")
+                  : (chinese ? "验签并恢复" : "Verify & restore")}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {lockPassModalOpen && (
+        <Modal
+          className="settings-modal"
+          backdropClassName="settings-modal-backdrop"
+          labelledBy="settings-lock-pass-title"
+          testId="lock-passphrase-modal"
+          onClose={closeLockPassModal}
+        >
+          <span className="settings-badge settings-badge--lime">App Lock · Argon2id</span>
+          <h2 id="settings-lock-pass-title">
+            {chinese ? "配置会话锁屏口令" : "Configure App Lock passphrase"}
+          </h2>
+          <p>
+            {chinese
+              ? "系统仅保存 Argon2id 盐与哈希校验器，绝不明文保存口令。"
+              : "Only an Argon2id salt + verifier hash is stored; plaintext passphrases are never persisted or logged."}
+          </p>
+
+          {vaultStatus?.hasLockPassphrase && (
+            <label className="settings-field">
+              <span>{chinese ? "当前锁屏口令" : "Current passphrase"}</span>
+              <input
+                type="password"
+                data-testid="lock-pass-current"
+                autoComplete="current-password"
+                value={currentLockPass}
+                onChange={(event) => setCurrentLockPass(event.target.value)}
+              />
+            </label>
+          )}
+
+          <label className="settings-field">
+            <span>{chinese ? "新锁屏口令（≥ 10 位）" : "New passphrase (min 10 chars)"}</span>
+            <input
+              type="password"
+              data-testid="lock-pass-new"
+              autoComplete="new-password"
+              value={newLockPass}
+              onChange={(event) => setNewLockPass(event.target.value)}
+            />
+          </label>
+
+          <label className="settings-field">
+            <span>{chinese ? "确认新口令" : "Confirm new passphrase"}</span>
+            <input
+              type="password"
+              data-testid="lock-pass-confirm"
+              autoComplete="new-password"
+              value={confirmLockPass}
+              onChange={(event) => setConfirmLockPass(event.target.value)}
+            />
+          </label>
+
+          {lockPassError && (
+            <p className="settings-warning" role="alert" data-testid="lock-pass-error">
+              {lockPassError}
+            </p>
+          )}
+
+          <div className="settings-modal__actions">
+            <button className="settings-button settings-button--secondary" type="button" onClick={closeLockPassModal}>
+              {copy.cancel}
+            </button>
+            {vaultStatus?.hasLockPassphrase && (
+              <button
+                className="settings-button settings-button--danger"
+                type="button"
+                data-testid="lock-pass-remove"
+                disabled={lockPassBusy}
+                onClick={() => void handleSaveLockPassphrase(true)}
+              >
+                {chinese ? "移除口令" : "Remove passphrase"}
+              </button>
+            )}
+            <button
+              className="settings-button settings-button--primary"
+              type="button"
+              data-testid="lock-pass-save"
+              disabled={lockPassBusy}
+              onClick={() => void handleSaveLockPassphrase(false)}
+            >
+              {lockPassBusy ? (chinese ? "保存中…" : "Saving…") : (chinese ? "保存锁屏口令" : "Save passphrase")}
+            </button>
           </div>
         </Modal>
       )}

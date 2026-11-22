@@ -14,6 +14,7 @@ import {
 const SCHEMA_VERSION = 1;
 const GENESIS_HASH = "0".repeat(64);
 const STORAGE_KEY = "evidence-journal";
+export const MAX_EVIDENCE_IMPORT_BYTES = 20 * 1024 * 1024;
 const EVIDENCE_KINDS = [
   "order_intent",
   "user_confirmation",
@@ -24,6 +25,7 @@ const EVIDENCE_KINDS = [
   "automation_run",
   "safety_setting_changed",
   "portfolio_import",
+  "session_locked",
 ] as const;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const EVIDENCE_RECORD_KEYS = [
@@ -93,7 +95,8 @@ export type LocalEvidenceKind =
   | "reconciliation"
   | "automation_run"
   | "safety_setting_changed"
-  | "portfolio_import";
+  | "portfolio_import"
+  | "session_locked";
 
 export interface LocalEvidenceRecord {
   schemaVersion: number;
@@ -414,6 +417,10 @@ export function exportEvidence(): Promise<string> {
 }
 
 async function importEvidenceNow(serialized: string): Promise<EvidenceVerification> {
+  const byteSize = new TextEncoder().encode(serialized).byteLength;
+  if (byteSize > MAX_EVIDENCE_IMPORT_BYTES) {
+    throw new Error("Evidence import file exceeds the 20 MB safety limit");
+  }
   if (isTauriRuntime()) {
     return fromTauriVerification(await invokeEvidenceImport(serialized));
   }
@@ -426,7 +433,7 @@ async function importEvidenceNow(serialized: string): Promise<EvidenceVerificati
     || !hasExactKeys(parsed, EVIDENCE_BUNDLE_KEYS)
     || parsed.format !== "foliohelm-local-evidence"
     || parsed.schemaVersion !== SCHEMA_VERSION
-    || parsed.mode !== "mock"
+    || (parsed.mode !== "mock" && parsed.mode !== "local-csv")
     || !isCanonicalUtcTimestamp(parsed.exportedAtUtc)
     || !Array.isArray(parsed.records)
   ) {

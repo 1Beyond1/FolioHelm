@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Language } from "../../types";
+import { MOCK_BROKER } from "../../domain/mockBroker";
 import {
   chartLinePath,
   companyForLanguage,
@@ -62,16 +63,25 @@ function ArrowIcon() {
 
 export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: MarketsPageProps) {
   const copy = MARKET_COPY[language];
+  const chinese = language === "zh";
   const [query, setQuery] = useState("");
   const [moverMode, setMoverMode] = useState<MoverMode>("gainers");
+  const [, setBrokerTick] = useState(0);
+  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+
+  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
   const marketSecurities = getMarketSecurities();
   const degradedStatus = marketSecurities.some((security) => security.status === "offline")
-    ? language === "zh" ? { title: "数据源离线", note: "展示最近的本地快照" } : { title: "Data source offline", note: "Showing the latest local snapshot" }
+    ? chinese ? { title: "数据源离线", note: "展示最近的本地快照" } : { title: "Data source offline", note: "Showing the latest local snapshot" }
     : marketSecurities.some((security) => security.status === "reauth-required")
-      ? language === "zh" ? { title: "需要重新授权", note: "暂不刷新报价" } : { title: "Reauthorization required", note: "Quotes are not being refreshed" }
+      ? chinese ? { title: "需要重新授权", note: "暂不刷新报价" } : { title: "Reauthorization required", note: "Quotes are not being refreshed" }
       : marketSecurities.some((security) => security.status === "stale")
-        ? language === "zh" ? { title: "报价已过期", note: "当前页面不是实时行情" } : { title: "Quotes are stale", note: "This page is not live" }
-        : { title: copy.marketStatus, note: copy.marketStatusNote };
+        ? chinese ? { title: "报价已过期", note: "当前页面不是实时行情" } : { title: "Quotes are stale", note: "This page is not live" }
+        : isLocalMode
+          ? chinese
+            ? { title: "本地持仓 · 只读行情", note: "CSV 导入基准价 / 可选公开延迟行情" }
+            : { title: "Local Portfolio · Read-only", note: "CSV import baseline / optional delayed public quotes" }
+          : { title: copy.marketStatus, note: copy.marketStatusNote };
 
   const filteredSecurities = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -107,13 +117,24 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
             <strong>{degradedStatus.title}</strong>
             <small>{degradedStatus.note}</small>
           </span>
-          <span className="markets-demo-chip">{copy.demo}</span>
+          <span className="markets-demo-chip">
+            {isLocalMode ? (chinese ? "本地 CSV" : "Local CSV") : copy.demo}
+          </span>
         </div>
       </header>
 
-      <div className="markets-demo-banner" role="note">
+      <div className="markets-demo-banner" role="note" data-testid="markets-mode-banner">
         <span className="markets-demo-banner-mark" aria-hidden="true">✦</span>
-        <span><strong>{copy.fictionalData}</strong>{copy.fictionalDataDescription}</span>
+        {isLocalMode ? (
+          <span>
+            <strong>{chinese ? "本地持仓 (CSV + 纸上模拟)" : "Local Portfolio (CSV + Paper)"}</strong>{" "}
+            {chinese
+              ? "展示您本地导入的真实标的与 CSV 基准价（或显式开启的只读公开延迟行情），绝不生成虚构历史走势或假新闻。"
+              : "Showing your imported symbols with CSV baseline prices (or opted-in delayed read-only public quotes). No fabricated charts or fake news."}
+          </span>
+        ) : (
+          <span><strong>{copy.fictionalData}</strong>{copy.fictionalDataDescription}</span>
+        )}
       </div>
 
       <section className="markets-search-card" aria-labelledby="markets-search-title">
@@ -146,36 +167,38 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
         <p className="markets-search-hint">{copy.searchHint}</p>
       </section>
 
-      <section className="markets-overview-section" aria-labelledby="markets-overview-title">
-        <div className="markets-section-heading">
-          <div>
-            <span className="markets-kicker">{copy.marketOverviewKicker}</span>
-            <h2 id="markets-overview-title">{copy.marketOverviewTitle}</h2>
+      {!isLocalMode && (
+        <section className="markets-overview-section" aria-labelledby="markets-overview-title">
+          <div className="markets-section-heading">
+            <div>
+              <span className="markets-kicker">{copy.marketOverviewKicker}</span>
+              <h2 id="markets-overview-title">{copy.marketOverviewTitle}</h2>
+            </div>
+            <p>{copy.marketOverviewDescription}</p>
           </div>
-          <p>{copy.marketOverviewDescription}</p>
-        </div>
-        <div className="markets-overview-grid">
-          {MARKET_OVERVIEW.map((market) => (
-            <article className="markets-overview-card" key={market.symbol}>
-              <div className="markets-overview-card-topline">
-                <span className="markets-overview-symbol">{market.symbol}</span>
-                <span className={market.changePct >= 0 ? "markets-positive" : "markets-negative"}>
-                  {formatSignedPercent(market.changePct)}
-                </span>
-              </div>
-              <strong className="markets-overview-name">{language === "zh" ? market.labelZh : market.labelEn}</strong>
-              <div className="markets-overview-card-bottomline">
-                <span>{market.value}</span>
-                <Sparkline
-                  points={market.sparkline}
-                  positive={market.changePct >= 0}
-                  label={`${market.symbol} ${copy.trend}`}
-                />
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+          <div className="markets-overview-grid">
+            {MARKET_OVERVIEW.map((market) => (
+              <article className="markets-overview-card" key={market.symbol}>
+                <div className="markets-overview-card-topline">
+                  <span className="markets-overview-symbol">{market.symbol}</span>
+                  <span className={market.changePct >= 0 ? "markets-positive" : "markets-negative"}>
+                    {formatSignedPercent(market.changePct)}
+                  </span>
+                </div>
+                <strong className="markets-overview-name">{language === "zh" ? market.labelZh : market.labelEn}</strong>
+                <div className="markets-overview-card-bottomline">
+                  <span>{market.value}</span>
+                  <Sparkline
+                    points={market.sparkline}
+                    positive={market.changePct >= 0}
+                    label={`${market.symbol} ${copy.trend}`}
+                  />
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="markets-main-grid">
         <section className="markets-card markets-watchlist-card" aria-labelledby="markets-watchlist-title">
@@ -220,19 +243,29 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
                       <td className="markets-company-cell" title={companyForLanguage(security, language)}>
                         {companyForLanguage(security, language)}
                       </td>
-                      <td className="markets-number-cell markets-price-cell">{formatPrice(security.price)}</td>
+                      <td className="markets-number-cell markets-price-cell">
+                        {formatPrice(security.price, language, security.currency)}
+                      </td>
                       <td className={`markets-number-cell ${isPositive ? "markets-positive" : "markets-negative"}`}>
-                        {formatSignedPrice(security.change)}
+                        {formatSignedPrice(security.change, language, security.currency)}
                       </td>
                       <td className={`markets-number-cell ${isPositive ? "markets-positive" : "markets-negative"}`}>
                         {formatSignedPercent(security.changePct)}
                       </td>
                       <td>
-                        <Sparkline
-                          points={security.sparkline}
-                          positive={isPositive}
-                          label={`${security.symbol} ${copy.trend}`}
-                        />
+                        {security.hasHistoricalSeries === false || security.sparkline.length === 0 ? (
+                          <span className="markets-demo-chip" data-testid={`quote-source-tag-${security.symbol}`}>
+                            {security.quoteSource === "public-delayed"
+                              ? (chinese ? "延迟行情" : "Delayed")
+                              : (chinese ? "CSV 基准" : "CSV base")}
+                          </span>
+                        ) : (
+                          <Sparkline
+                            points={security.sparkline}
+                            positive={isPositive}
+                            label={`${security.symbol} ${copy.trend}`}
+                          />
+                        )}
                       </td>
                       <td className="markets-action-cell">
                         <button
@@ -241,7 +274,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
                           data-testid={`trade-${security.symbol}`}
                           onClick={() => onOpenTrade(security.symbol)}
                         >
-                          {copy.trade}
+                          {isLocalMode ? (chinese ? "纸上模拟" : "Paper trade") : copy.trade}
                         </button>
                       </td>
                     </tr>

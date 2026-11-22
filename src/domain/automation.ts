@@ -3,7 +3,7 @@ import type { BrokerOrderSide, BrokerSymbol } from "./contracts";
 
 const AUTOMATION_MODES: readonly AutomationMode[] = ["mock", "paper", "dry-run", "real"];
 const AUTOMATION_SCHEDULES: readonly AutomationSchedule[] = ["manual", "5m", "15m", "hourly", "daily"];
-const BROKER_SYMBOLS: readonly BrokerSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
+const VALID_SYMBOL_RE = /^[A-Z0-9][A-Z0-9.-]{0,9}$/;
 const ZERO_MONEY = money("0");
 const RATE_WINDOW_MS = 60_000;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -90,7 +90,7 @@ function isAutomationSchedule(value: unknown): value is AutomationSchedule {
 }
 
 function isBrokerSymbol(value: unknown): value is BrokerSymbol {
-  return typeof value === "string" && BROKER_SYMBOLS.includes(value as BrokerSymbol);
+  return typeof value === "string" && VALID_SYMBOL_RE.test(value);
 }
 
 function isBrokerOrderSide(value: unknown): value is BrokerOrderSide {

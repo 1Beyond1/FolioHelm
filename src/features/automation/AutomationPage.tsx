@@ -10,17 +10,23 @@ import {
 } from "../../domain/automation";
 import { decimalCompare, money, price, quantity, decimalToNumber, type Money } from "../../domain/decimal";
 import { findMockQuote, MOCK_BROKER } from "../../domain/mockBroker";
+import { isTauriRuntime } from "../../domain/tauriBridge";
+import {
+  AUTOMATION_SETTING_KEY,
+  loadEncryptedSetting,
+  saveEncryptedSetting,
+} from "../../domain/vaultStorage";
 import { formatCurrency } from "../../formatters";
 import type { BrokerSymbol } from "../../domain/contracts";
 import type { Language } from "../../types";
-import { readStored, writeStored } from "../../platform/storage";
+import { readStored } from "../../platform/storage";
 import "./automation.css";
 
 interface AutomationPageProps {
   language: Language;
 }
 
-const SYMBOLS: readonly BrokerSymbol[] = ["SPY", "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "TSLA"];
+const DEFAULT_SYMBOLS: readonly BrokerSymbol[] = ["SPY", "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "TSLA"];
 
 const COPY = {
   en: {
@@ -186,22 +192,37 @@ function createRunIdempotencyKey(symbol: BrokerSymbol): string {
 
 type EvidenceSaveStatus = "idle" | "saving" | "saved" | "failed";
 
-function hydrateAutomationState(): AutomationState {
-  const stored = readStored<unknown>("automation", null);
-  if (stored !== null) {
-    AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(stored));
+function hydrateAutomationStateSync(): AutomationState {
+  if (!isTauriRuntime()) {
+    const stored = readStored<unknown>("automation", null);
+    if (stored !== null) {
+      AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(stored));
+    }
   }
   return AUTOMATION_CONTROLLER.getState();
 }
 
 export function AutomationPage({ language }: AutomationPageProps) {
   const copy = COPY[language];
-  const [state, setState] = useState<AutomationState>(hydrateAutomationState);
+  const [state, setState] = useState<AutomationState>(hydrateAutomationStateSync);
   const [selectedSymbol, setSelectedSymbol] = useState<BrokerSymbol>(() => state.policy.allowedSymbols[0] ?? "SPY");
   const [lastResult, setLastResult] = useState<AutomationState["logs"][number] | null>(null);
   const [evidenceStatus, setEvidenceStatus] = useState<EvidenceSaveStatus>("idle");
+  const [brokerTick, setBrokerTick] = useState(0);
+  const hydratedRef = useRef(!isTauriRuntime());
   const evidenceAttemptRef = useRef(0);
   const selectedMode = state.mode;
+
+  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+
+  const availableSymbols = useMemo<readonly BrokerSymbol[]>(() => {
+    void brokerTick;
+    const set = new Set<string>(DEFAULT_SYMBOLS);
+    const snap = MOCK_BROKER.getSnapshot();
+    for (const h of snap.holdings) set.add(h.symbol);
+    for (const s of state.policy.allowedSymbols) set.add(s);
+    return [...set];
+  }, [brokerTick, state.policy.allowedSymbols]);
 
   useEffect(() => {
     return AUTOMATION_CONTROLLER.subscribe(() => {
@@ -210,7 +231,27 @@ export function AutomationPage({ language }: AutomationPageProps) {
   }, []);
 
   useEffect(() => {
-    writeStored("automation", persistableState(state));
+    if (!isTauriRuntime()) return undefined;
+    let active = true;
+    void loadEncryptedSetting<unknown>(AUTOMATION_SETTING_KEY, null, "automation")
+      .then((loaded) => {
+        if (!active) return;
+        if (loaded !== null) {
+          AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(loaded));
+        }
+        hydratedRef.current = true;
+      })
+      .catch(() => {
+        if (active) hydratedRef.current = true;
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    void saveEncryptedSetting(AUTOMATION_SETTING_KEY, persistableState(state), "automation");
   }, [state]);
 
   const dailyPercent = useMemo(() => {
@@ -323,8 +364,8 @@ export function AutomationPage({ language }: AutomationPageProps) {
       <section className="automation-card automation-card--wide">
         <div className="automation-card-heading"><div><span>03</span><h2>{copy.allowlist}</h2></div><span className="automation-fixed">{copy.session}</span></div>
         <p className="automation-muted">{copy.sessionBody}</p>
-        <div className="automation-symbols">{SYMBOLS.map((symbol) => <label key={symbol}><input type="checkbox" checked={state.policy.allowedSymbols.includes(symbol)} onChange={() => toggleSymbol(symbol)} /><span>{symbol}</span></label>)}</div>
-        <div className="automation-run-row"><label className="automation-field"><span>{copy.selectSymbol}</span><select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value as BrokerSymbol)}>{SYMBOLS.map((symbol) => <option key={symbol} value={symbol} disabled={!state.policy.allowedSymbols.includes(symbol)}>{symbol}</option>)}</select></label><button className="automation-primary" type="button" onClick={runNow}>{copy.runNow}</button></div>
+        <div className="automation-symbols">{availableSymbols.map((symbol) => <label key={symbol}><input type="checkbox" checked={state.policy.allowedSymbols.includes(symbol)} onChange={() => toggleSymbol(symbol)} /><span>{symbol}</span></label>)}</div>
+        <div className="automation-run-row"><label className="automation-field"><span>{copy.selectSymbol}</span><select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value as BrokerSymbol)}>{availableSymbols.map((symbol) => <option key={symbol} value={symbol} disabled={!state.policy.allowedSymbols.includes(symbol)}>{symbol}</option>)}</select></label><button className="automation-primary" type="button" onClick={runNow}>{copy.runNow}</button></div>
       </section>
 
       <section className={`automation-kill ${state.killSwitchTripped ? "is-tripped" : ""}`}>

@@ -24,12 +24,14 @@ export function SearchPalette({
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const chinese = language === "zh";
+  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
   const symbols = MOCK_BROKER.getSnapshot().quotes.map((quote) => ({
     symbol: quote.symbol,
     companyEn: quote.companyEn,
     companyZh: quote.companyZh,
     price: decimalToNumber(quote.price),
     change: decimalToNumber(quote.changePct),
+    currency: quote.currency ?? "USD",
   }));
   const results = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -107,7 +109,11 @@ export function SearchPalette({
         <button type="button" onClick={onClose}>Esc</button>
       </div>
       <div className="search-palette-caption">
-        <span>{chinese ? "虚构行情 · 仅供界面演示" : "Fictional quotes · Interface demo only"}</span>
+        <span>
+          {isLocalMode
+            ? (chinese ? "本地持仓与只读行情 · CSV + 纸上模拟" : "Local holdings & read-only quotes · CSV + Paper")
+            : (chinese ? "虚构行情 · 仅供界面演示" : "Fictional quotes · Interface demo only")}
+        </span>
         <button type="button" onClick={onOpenMarkets}>{chinese ? "打开市场页" : "Open Markets"} →</button>
       </div>
       <div className="search-results" id="search-results" aria-label={chinese ? "搜索结果" : "Search results"}>
@@ -123,10 +129,16 @@ export function SearchPalette({
           >
             <span className="search-symbol-mark">{item.symbol.slice(0, 1)}</span>
             <span><b>{item.symbol}</b><small>{chinese ? item.companyZh : item.companyEn}</small></span>
-            <span className="search-price"><b>{formatCurrency(item.price, language)}</b><small className={item.change >= 0 ? "positive" : "negative"}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</small></span>
+            <span className="search-price"><b>{formatCurrency(item.price, language, item.currency)}</b><small className={item.change >= 0 ? "positive" : "negative"}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</small></span>
           </button>
         ))}
-        {results.length === 0 && <p>{chinese ? "没有匹配的演示证券" : "No demo instruments match"}</p>}
+        {results.length === 0 && (
+          <p>
+            {isLocalMode
+              ? (chinese ? "当前本地持仓中没有匹配的标的" : "No matching symbols in Local Portfolio")
+              : (chinese ? "没有匹配的演示证券" : "No demo instruments match")}
+          </p>
+        )}
       </div>
     </Modal>
   );

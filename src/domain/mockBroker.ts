@@ -25,6 +25,7 @@ import type {
   BrokerOrderEvent,
   BrokerQuote,
   BrokerSnapshot,
+  CurrencySummary,
   MockErrorCode,
   MockScenario,
   MockPreview,
@@ -40,6 +41,8 @@ export interface LocalPortfolioMeta {
   sourceLabel: string;
   importedAtUtc: string;
   currency: string;
+  currencies: readonly string[];
+  isMultiCurrency: boolean;
   holdingsCount: number;
   transactionsCount: number;
   warnings: readonly string[];
@@ -50,6 +53,7 @@ export interface PublicQuoteUpdate {
   price: string;
   change: string;
   changePct: string;
+  currency?: string;
   asOfUtc: string;
   provider: string;
   delayed: boolean;
@@ -146,6 +150,7 @@ interface HoldingSeed {
   quantity: Quantity;
   availableQuantity: Quantity;
   averageCost: Price;
+  currency?: string;
 }
 
 function holdingSeed(
@@ -154,6 +159,7 @@ function holdingSeed(
   companyZh: string,
   quantityValue: string,
   averageCost: string,
+  currency = "USD",
 ): HoldingSeed {
   const parsedQty = quantity(quantityValue);
   return {
@@ -163,6 +169,7 @@ function holdingSeed(
     quantity: parsedQty,
     availableQuantity: parsedQty,
     averageCost: price(averageCost),
+    currency,
   };
 }
 
@@ -192,6 +199,7 @@ function deriveHoldings(
       marketValue,
       dayPnl,
       totalPnl,
+      currency: seed.currency ?? matchedQuote?.currency ?? "USD",
     };
   });
 }
@@ -558,7 +566,10 @@ function scenarioError(scenario: MockScenario): MockBrokerError | undefined {
 function cloneSnapshot(snapshot: BrokerSnapshot): BrokerSnapshot {
   return {
     ...snapshot,
-    account: { ...snapshot.account },
+    account: {
+      ...snapshot.account,
+      currencyBreakdowns: snapshot.account.currencyBreakdowns?.map((item) => ({ ...item })),
+    },
     quotes: snapshot.quotes.map((item) => ({ ...item })),
     holdings: snapshot.holdings.map((item) => ({ ...item })),
     orders: snapshot.orders.map((order) => ({
@@ -591,6 +602,33 @@ function cloneOrder(order: BrokerOrder): BrokerOrder {
   };
 }
 
+function buyingPowerForCurrency(account: BrokerAccount, currency: string): Money {
+  if (account.isMultiCurrency && account.currencyBreakdowns) {
+    const match = account.currencyBreakdowns.find((item) => item.currency === currency);
+    return match ? match.buyingPower : ZERO_MONEY;
+  }
+  return account.buyingPower;
+}
+
+function deriveLocalCurrencies(imported: ImportedPortfolioSnapshot): string[] {
+  if (imported.currencies && imported.currencies.length > 0) {
+    return [...new Set(imported.currencies)].sort();
+  }
+  const set = new Set<string>();
+  for (const h of imported.holdings) {
+    if (h.currency) set.add(h.currency);
+  }
+  if (imported.cashByCurrency) {
+    for (const [curr, amt] of Object.entries(imported.cashByCurrency)) {
+      if (decimalCompare(money(amt), ZERO_MONEY) !== 0) set.add(curr);
+    }
+  }
+  if (set.size === 0) {
+    set.add(imported.currency && imported.currency !== "MULTI" ? imported.currency : "USD");
+  }
+  return [...set].sort();
+}
+
 function buildLocalSnapshotFromCsv(
   imported: ImportedPortfolioSnapshot,
   existingOrders: readonly BrokerOrder[] = [],
@@ -602,9 +640,12 @@ function buildLocalSnapshotFromCsv(
   for (const holding of imported.holdings) {
     seenSymbols.add(holding.symbol);
     const livePublic = publicQuoteMap?.get(holding.symbol);
-    const unitPrice = price(livePublic ? livePublic.price : holding.lastPrice);
-    const dailyChange = price(livePublic ? livePublic.change : "0");
-    const changePct = livePublic
+    const usePublic = Boolean(
+      livePublic && (!livePublic.currency || livePublic.currency === holding.currency),
+    );
+    const unitPrice = price(usePublic && livePublic ? livePublic.price : holding.lastPrice);
+    const dailyChange = price(usePublic && livePublic ? livePublic.change : "0");
+    const changePct = usePublic && livePublic
       ? percent(livePublic.changePct)
       : deriveChangePct(unitPrice, dailyChange);
     quotes.push({
@@ -614,15 +655,16 @@ function buildLocalSnapshotFromCsv(
       price: unitPrice,
       change: dailyChange,
       changePct,
-      asOf: livePublic ? livePublic.asOfUtc : imported.importedAtUtc,
+      asOf: usePublic && livePublic ? livePublic.asOfUtc : imported.importedAtUtc,
       status: "available",
-      source: livePublic ? "public-delayed" : "csv-import",
-      delayed: livePublic ? livePublic.delayed : true,
-      provider: livePublic ? livePublic.provider : imported.sourceFormat,
+      currency: holding.currency || "USD",
+      source: usePublic ? "public-delayed" : "csv-import",
+      delayed: usePublic && livePublic ? livePublic.delayed : true,
+      provider: usePublic && livePublic ? livePublic.provider : imported.sourceFormat,
     });
   }
 
-  // Keep default watchlist quotes available for market browsing without mixing them into holdings.
+  // Keep cached public quotes for non-held symbols available without mixing fictional mock prices.
   for (const baseQuote of QUOTES) {
     if (!seenSymbols.has(baseQuote.symbol)) {
       const livePublic = publicQuoteMap?.get(baseQuote.symbol);
@@ -634,6 +676,7 @@ function buildLocalSnapshotFromCsv(
           changePct: percent(livePublic.changePct),
           asOf: livePublic.asOfUtc,
           status: "available",
+          currency: livePublic.currency ?? "USD",
           source: "public-delayed",
           delayed: livePublic.delayed,
           provider: livePublic.provider,
@@ -649,24 +692,75 @@ function buildLocalSnapshotFromCsv(
     quantity: quantity(item.quantity),
     availableQuantity: quantity(item.quantity),
     averageCost: price(item.averageCost),
+    currency: item.currency || "USD",
   }));
 
   const holdings = deriveHoldings(holdingSeeds, quotes);
-  const cashMoney = money(imported.cash);
-  const account = deriveAccountSummary(
-    {
-      accountKey: `local-csv-${imported.fingerprint.slice(0, 8)}`,
-      cash: cashMoney,
-      buyingPower: cashMoney,
-      totalEquity: ZERO_MONEY,
-      todayChange: ZERO_MONEY,
-      todayChangePct: percent("0"),
-      allTimeChange: ZERO_MONEY,
-      asOf: imported.importedAtUtc,
-      status: "available",
-    },
-    holdings,
-  );
+  const currencies = deriveLocalCurrencies(imported);
+  const isMultiCurrency = Boolean(imported.isMultiCurrency) || currencies.length > 1;
+
+  const currencyBreakdowns: CurrencySummary[] = currencies.map((curr) => {
+    const currHoldings = holdings.filter((h) => (h.currency ?? "USD") === curr);
+    const holdingsValue = currHoldings.reduce<Money>(
+      (total, item) => decimalAdd(total, item.marketValue) as Money,
+      ZERO_MONEY,
+    );
+    const dayPnl = currHoldings.reduce<Money>(
+      (total, item) => decimalAdd(total, item.dayPnl) as Money,
+      ZERO_MONEY,
+    );
+    const totalPnl = currHoldings.reduce<Money>(
+      (total, item) => decimalAdd(total, item.totalPnl) as Money,
+      ZERO_MONEY,
+    );
+    const rawCash = imported.cashByCurrency?.[curr]
+      ?? (!isMultiCurrency && curr === imported.currency ? imported.cash : "0");
+    const cash = money(rawCash);
+    return {
+      currency: curr,
+      cash,
+      buyingPower: cash,
+      holdingsValue,
+      totalEquity: decimalAdd(holdingsValue, cash) as Money,
+      dayPnl,
+      totalPnl,
+      holdingsCount: currHoldings.length,
+    };
+  });
+
+  const account: BrokerAccount = isMultiCurrency
+    ? {
+        accountKey: `local-csv-${imported.fingerprint.slice(0, 8)}`,
+        // Fail-safe: never sum cross-currency balances into a combined total.
+        cash: ZERO_MONEY,
+        buyingPower: ZERO_MONEY,
+        totalEquity: ZERO_MONEY,
+        todayChange: ZERO_MONEY,
+        todayChangePct: percent("0"),
+        allTimeChange: ZERO_MONEY,
+        asOf: imported.importedAtUtc,
+        status: "available",
+        currency: "MULTI",
+        isMultiCurrency: true,
+        currencyBreakdowns,
+      }
+    : deriveAccountSummary(
+        {
+          accountKey: `local-csv-${imported.fingerprint.slice(0, 8)}`,
+          cash: currencyBreakdowns[0]?.cash ?? money(imported.cash),
+          buyingPower: currencyBreakdowns[0]?.buyingPower ?? money(imported.cash),
+          totalEquity: ZERO_MONEY,
+          todayChange: ZERO_MONEY,
+          todayChangePct: percent("0"),
+          allTimeChange: ZERO_MONEY,
+          asOf: imported.importedAtUtc,
+          status: "available",
+          currency: currencies[0] ?? "USD",
+          isMultiCurrency: false,
+          currencyBreakdowns,
+        },
+        holdings,
+      );
 
   // Use flat baseline points anchored to real imported total equity rather than fictional demo curves.
   const flatSeries = (len: number): readonly Money[] =>
@@ -809,6 +903,8 @@ export class MockBroker implements BrokerAdapter {
     imported: ImportedPortfolioSnapshot,
     options: { switchMode?: boolean } = {},
   ): void {
+    const currencies = deriveLocalCurrencies(imported);
+    const isMultiCurrency = Boolean(imported.isMultiCurrency) || currencies.length > 1;
     this.localImported = imported;
     this.localMeta = {
       id: imported.id,
@@ -816,7 +912,9 @@ export class MockBroker implements BrokerAdapter {
       sourceFormat: imported.sourceFormat,
       sourceLabel: imported.sourceLabel,
       importedAtUtc: imported.importedAtUtc,
-      currency: imported.currency,
+      currency: isMultiCurrency ? "MULTI" : (currencies[0] ?? imported.currency ?? "USD"),
+      currencies,
+      isMultiCurrency,
       holdingsCount: imported.holdings.length,
       transactionsCount: imported.transactions.length,
       warnings: [...imported.warnings],
@@ -831,6 +929,47 @@ export class MockBroker implements BrokerAdapter {
     }
     this.previews.clear();
     this.previewIssuedAt.clear();
+    this.notify();
+  }
+
+  hydratePaperOrders(mode: WorkspaceMode, persistedOrders: readonly BrokerOrder[]): void {
+    if (persistedOrders.length === 0) return;
+
+    for (const order of persistedOrders) {
+      const match = /^(?:PAPER|MOCK)-ORDER-(\d+)$/.exec(order.id);
+      if (match) {
+        const parsed = Number(match[1]);
+        if (Number.isSafeInteger(parsed) && parsed > this.sequence) {
+          this.sequence = parsed;
+        }
+      }
+    }
+
+    const mergeOrders = (existing: readonly BrokerOrder[]): BrokerOrder[] => {
+      const byId = new Map<string, BrokerOrder>();
+      for (const order of persistedOrders) byId.set(order.id, cloneOrder(order));
+      for (const order of existing) {
+        if (!byId.has(order.id)) byId.set(order.id, cloneOrder(order));
+      }
+      return [...byId.values()].sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
+    };
+
+    if (mode === "local-csv") {
+      if (!this.localSnapshot) return;
+      const merged = mergeOrders(this.localSnapshot.orders);
+      this.localSnapshot = {
+        ...this.localSnapshot,
+        orders: merged,
+        ordersFilled: merged.filter((o) => o.status === "filled").length,
+      };
+    } else {
+      const merged = mergeOrders(this.snapshot.orders);
+      this.snapshot = {
+        ...this.snapshot,
+        orders: merged,
+        ordersFilled: merged.filter((o) => o.status === "filled").length,
+      };
+    }
     this.notify();
   }
 
@@ -946,8 +1085,10 @@ export class MockBroker implements BrokerAdapter {
     }
 
     const unitPrice = draft.limitPrice ?? matchedQuote.price;
+    const quoteCurrency = matchedQuote.currency ?? "USD";
+    const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(decimalMultiply(unitPrice, draft.quantity), 2, "half-even") as Money;
-    if (draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
+    if (draft.side === "buy" && decimalCompare(estimatedAmount, availableBuyingPower) > 0) {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
     if (draft.side === "sell") {
@@ -999,12 +1140,14 @@ export class MockBroker implements BrokerAdapter {
     if (!matchedQuote || matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
+    const quoteCurrency = matchedQuote.currency ?? "USD";
+    const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(
       decimalMultiply(preview.draft.limitPrice ?? matchedQuote.price, preview.draft.quantity),
       2,
       "half-even",
     ) as Money;
-    if (preview.draft.side === "buy" && decimalCompare(estimatedAmount, snapshot.account.buyingPower) > 0) {
+    if (preview.draft.side === "buy" && decimalCompare(estimatedAmount, availableBuyingPower) > 0) {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
     if (preview.draft.side === "sell") {
@@ -1045,12 +1188,25 @@ export class MockBroker implements BrokerAdapter {
 
     const activeTarget = isLocalMode ? this.localSnapshot! : this.snapshot;
     const nextAccount: BrokerAccount = preview.draft.side === "buy"
-      ? {
-          ...activeTarget.account,
-          buyingPower: decimalCompare(activeTarget.account.buyingPower, estimatedAmount) > 0
-            ? decimalSubtract(activeTarget.account.buyingPower, estimatedAmount) as Money
-            : ZERO_MONEY,
-        }
+      ? activeTarget.account.isMultiCurrency && activeTarget.account.currencyBreakdowns
+        ? {
+            ...activeTarget.account,
+            currencyBreakdowns: activeTarget.account.currencyBreakdowns.map((item) => {
+              if (item.currency !== quoteCurrency) return item;
+              return {
+                ...item,
+                buyingPower: decimalCompare(item.buyingPower, estimatedAmount) > 0
+                  ? decimalSubtract(item.buyingPower, estimatedAmount) as Money
+                  : ZERO_MONEY,
+              };
+            }),
+          }
+        : {
+            ...activeTarget.account,
+            buyingPower: decimalCompare(activeTarget.account.buyingPower, estimatedAmount) > 0
+              ? decimalSubtract(activeTarget.account.buyingPower, estimatedAmount) as Money
+              : ZERO_MONEY,
+          }
       : activeTarget.account;
 
     const nextHoldings: readonly BrokerHolding[] = preview.draft.side === "sell"

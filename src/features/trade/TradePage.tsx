@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
-import { decimalCompare, decimalMultiply, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
+import { decimalCompare, decimalMultiply, decimalToNumber, money, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
 import { findMockHolding, findMockQuote, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
 import { appendEvidence } from "../../domain/evidenceJournal";
+import { persistPaperOrder } from "../../domain/vaultStorage";
 import { formatCurrency } from "../../formatters";
-import type { BrokerOrder, BrokerOrderStatus, BrokerSymbol, DataStatus, MockPreview, OrderDraft } from "../../domain/contracts";
+import type { BrokerOrder, BrokerOrderStatus, BrokerSymbol, DataStatus, MockPreview, OrderDraft, QuoteSourceKind, TradePrefill } from "../../domain/contracts";
 import "./TradePage.css";
 
 export type TradeSymbol = BrokerSymbol;
@@ -15,6 +16,7 @@ export type OrderType = "Market" | "Limit";
 export interface TradePageProps {
   language: Language;
   initialSymbol?: string;
+  initialPrefill?: TradePrefill;
   onClose: () => void;
   onViewOrders: () => void;
 }
@@ -29,6 +31,9 @@ interface Quote {
   heldShares: Quantity;
   asOf: string;
   status: DataStatus;
+  currency: string;
+  source?: QuoteSourceKind;
+  provider?: string;
 }
 
 interface DemoReceipt {
@@ -38,9 +43,8 @@ interface DemoReceipt {
   draftHash: string;
   estimatedAmount: Money;
   status: BrokerOrderStatus;
+  currency: string;
 }
-
-const SYMBOLS: readonly TradeSymbol[] = ["AAPL", "NVDA", "MSFT", "SPY", "TSLA", "AMD", "AMZN"];
 
 function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
   const canonicalQuote = findMockQuote(symbol);
@@ -52,20 +56,33 @@ function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
     heldShares: canonicalHolding?.availableQuantity ?? makeQuantity("0"),
     asOf: canonicalQuote?.asOf ?? "",
     status: canonicalQuote?.status ?? "no-data",
+    currency: canonicalQuote?.currency ?? canonicalHolding?.currency ?? "USD",
+    source: canonicalQuote?.source,
+    provider: canonicalQuote?.provider,
   };
 }
 
-function formatQuoteFreshness(asOf: string, language: Language): string {
+function formatQuoteFreshness(
+  asOf: string,
+  language: Language,
+  isLocalMode: boolean,
+  source?: QuoteSourceKind,
+): string {
+  const prefix = isLocalMode
+    ? source === "public-delayed"
+      ? (language === "zh" ? "延迟只读公开行情" : "Delayed public quote")
+      : (language === "zh" ? "CSV 导入基准价" : "CSV baseline")
+    : (language === "zh" ? "模拟快照" : "Mock snapshot");
   const parsed = Date.parse(asOf);
   if (!Number.isFinite(parsed)) {
-    return language === "zh" ? "模拟快照" : "Mock snapshot";
+    return prefix;
   }
   const ageSeconds = Math.floor((Date.now() - parsed) / 1000);
-  if (ageSeconds >= 0 && ageSeconds < 60) {
+  if (ageSeconds >= 0 && ageSeconds < 60 && !isLocalMode) {
     return language === "zh" ? `${ageSeconds} 秒前` : `${ageSeconds} seconds old`;
   }
   const stamp = new Date(parsed).toISOString().slice(0, 16).replace("T", " ");
-  return language === "zh" ? `模拟快照 · ${stamp} UTC` : `Mock snapshot · ${stamp} UTC`;
+  return `${prefix} · ${stamp} UTC`;
 }
 
 const COPY = {
@@ -237,49 +254,86 @@ const COPY = {
   },
 } as const;
 
-function normalizeTradeSymbol(value: string | undefined): TradeSymbol | undefined {
+function normalizeTradeSymbol(
+  value: string | undefined,
+  availableSymbols: readonly TradeSymbol[],
+): TradeSymbol | undefined {
   const normalized = value?.trim().toUpperCase();
-  return normalized && SYMBOLS.includes(normalized as TradeSymbol)
-    ? normalized as TradeSymbol
+  return normalized && availableSymbols.includes(normalized)
+    ? normalized
     : undefined;
 }
 
-function formatMoney(amount: Money | Price, language: Language): string {
-  return formatCurrency(decimalToNumber(amount), language);
+function formatMoney(amount: Money | Price, language: Language, currency = "USD"): string {
+  return formatCurrency(decimalToNumber(amount), language, currency);
 }
 
 const WHOLE_QUANTITY_RE = /^[1-9]\d*$/;
 const POSITIVE_PRICE_RE = /^(?:\d+(?:\.\d{1,2})?|\.\d{1,2})$/;
 const ZERO_PRICE = price("0");
 
-export function TradePage({ language, initialSymbol, onClose, onViewOrders }: TradePageProps) {
+export function TradePage({ language, initialSymbol, initialPrefill, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
-  const initialTradeSymbol = normalizeTradeSymbol(initialSymbol);
-  const hasUnsupportedInitialSymbol = initialSymbol !== undefined && initialTradeSymbol === undefined;
-  const unsupportedSymbol = initialSymbol?.trim().toUpperCase() || "—";
-  const demoSnapshot = MOCK_BROKER.getSnapshot();
-  const demoAccount = language === "zh"
-    ? `演示券商 · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
-    : `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
-  const demoBuyingPower = demoSnapshot.account.buyingPower;
-  const [step, setStep] = useState<TradeStep>("ticket");
-  const [symbol, setSymbol] = useState<TradeSymbol>(() => initialTradeSymbol ?? "AAPL");
-  const [side, setSide] = useState<TradeSide>("Buy");
-  const [orderType, setOrderType] = useState<OrderType>("Market");
-  const [quantity, setQuantity] = useState("");
-  const [limitPrice, setLimitPrice] = useState("");
-  const [errors, setErrors] = useState<TicketErrors>({});
-  const [acknowledged, setAcknowledged] = useState(false);
-  const [preview, setPreview] = useState<MockPreview | null>(null);
-  const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
-  const [flowError, setFlowError] = useState<string | null>(null);
+  const chinese = language === "zh";
   const [, setBrokerRevision] = useState(0);
 
   useEffect(() => {
     return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
   }, []);
 
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const isLocalMode = workspaceMode === "local-csv";
+  const demoSnapshot = MOCK_BROKER.getSnapshot();
+  const availableSymbols = useMemo<readonly TradeSymbol[]>(() => {
+    const set = new Set<string>();
+    for (const h of demoSnapshot.holdings) set.add(h.symbol);
+    for (const q of demoSnapshot.quotes) set.add(q.symbol);
+    return [...set];
+  }, [demoSnapshot.holdings, demoSnapshot.quotes]);
+
+  const requestedSymbol = initialPrefill?.symbol ?? initialSymbol;
+  const initialTradeSymbol = normalizeTradeSymbol(requestedSymbol, availableSymbols);
+  const hasUnsupportedInitialSymbol = requestedSymbol !== undefined && initialTradeSymbol === undefined;
+  const unsupportedSymbol = requestedSymbol?.trim().toUpperCase() || "—";
+
+  const demoAccount = isLocalMode
+    ? chinese
+      ? `本地持仓 (CSV + 纸上模拟) · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
+      : `Local Portfolio (CSV + Paper) · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
+    : chinese
+      ? `演示券商 · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
+      : `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
+
+  const [step, setStep] = useState<TradeStep>("ticket");
+  const [symbol, setSymbol] = useState<TradeSymbol>(() => initialTradeSymbol ?? availableSymbols[0] ?? "AAPL");
+  const [side, setSide] = useState<TradeSide>(() => (initialPrefill?.side === "sell" ? "Sell" : "Buy"));
+  const [orderType, setOrderType] = useState<OrderType>(() => (initialPrefill?.orderType === "limit" ? "Limit" : "Market"));
+  const [quantity, setQuantity] = useState(() => initialPrefill?.quantity ?? "");
+  const [limitPrice, setLimitPrice] = useState(() => initialPrefill?.limitPrice ?? "");
+  const [errors, setErrors] = useState<TicketErrors>({});
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [preview, setPreview] = useState<MockPreview | null>(null);
+  const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
+
   const currentQuote = getTradeQuote(symbol, language);
+  const quoteCurrency = currentQuote.currency;
+  const demoBuyingPower: Money = demoSnapshot.account.isMultiCurrency && demoSnapshot.account.currencyBreakdowns
+    ? (demoSnapshot.account.currencyBreakdowns.find((b) => b.currency === quoteCurrency)?.buyingPower ?? money("0"))
+    : demoSnapshot.account.buyingPower;
+
+  const badgeText = isLocalMode
+    ? (chinese ? "本地持仓 · 纸上模拟" : "Local CSV + Paper")
+    : copy.demoOnly;
+  const eyebrowText = isLocalMode
+    ? (chinese ? "本地纸上模拟流程" : "Local paper rehearsal flow")
+    : copy.eyebrow;
+  const quoteHeadingText = isLocalMode
+    ? currentQuote.source === "public-delayed"
+      ? (chinese ? "公开延迟报价（只读）" : "Delayed public quote")
+      : (chinese ? "CSV 导入基准价" : "CSV baseline price")
+    : copy.quote;
+
   const draft = useMemo<OrderDraft | null>(() => {
     if (!WHOLE_QUANTITY_RE.test(quantity.trim())) return null;
     if (orderType === "Limit" && !POSITIVE_PRICE_RE.test(limitPrice.trim())) return null;
@@ -307,25 +361,30 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
   const positionReady = side === "Sell"
     && accountReady
     && quoteReady
-    && MOCK_BROKER.getScenario() !== "insufficient-quantity"
+    && (isLocalMode || MOCK_BROKER.getScenario() !== "insufficient-quantity")
     && draft !== null
     && decimalCompare(draft.quantity, currentQuote.heldShares) <= 0;
   const previewBlockedScenarios = ["offline", "reauth-required", "request-failed", "rate-limited", "timeout", "stale-quote", "market-closed"] as const;
-  const executionReady = !previewBlockedScenarios.includes(MOCK_BROKER.getScenario() as (typeof previewBlockedScenarios)[number]);
+  const executionReady = isLocalMode
+    || !previewBlockedScenarios.includes(MOCK_BROKER.getScenario() as (typeof previewBlockedScenarios)[number]);
   const safetyChecks = [
     {
       key: "account",
       passed: accountReady,
       title: copy.accountMatch,
-      detail: accountReady ? copy.matchedDemo : copy.accountUnavailable,
-      suffix: copy.demoOnly,
+      detail: accountReady
+        ? isLocalMode
+          ? (chinese ? "已匹配 · 本地持仓组合" : "Matched · local CSV portfolio")
+          : copy.matchedDemo
+        : copy.accountUnavailable,
+      suffix: badgeText,
     },
     {
       key: "quote",
       passed: quoteReady,
       title: copy.quoteAge,
-      detail: quoteReady ? formatQuoteFreshness(currentQuote.asOf, language) : copy.quoteUnavailable,
-      suffix: copy.quote,
+      detail: quoteReady ? formatQuoteFreshness(currentQuote.asOf, language, isLocalMode, currentQuote.source) : copy.quoteUnavailable,
+      suffix: quoteHeadingText,
     },
     {
       key: side === "Buy" ? "buying-power" : "position",
@@ -333,19 +392,19 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       title: side === "Buy" ? copy.buyingPowerCheck : copy.positionRisk,
       detail: side === "Buy"
         ? buyingPowerReady
-          ? `${copy.available} · ${formatMoney(demoBuyingPower, language)}`
-          : `${copy.insufficientBuyingPower} · ${formatMoney(demoBuyingPower, language)} ${copy.availableSuffix}`
+          ? `${copy.available} · ${formatMoney(demoBuyingPower, language, quoteCurrency)}`
+          : `${copy.insufficientBuyingPower} · ${formatMoney(demoBuyingPower, language, quoteCurrency)} ${copy.availableSuffix}`
         : positionReady
           ? `${copy.positionAvailable} · ${currentQuote.heldShares} ${copy.shares}`
           : `${copy.positionInsufficient} · ${currentQuote.heldShares} ${copy.shares}`,
-      suffix: side === "Buy" ? copy.dollars : copy.shares,
+      suffix: side === "Buy" ? quoteCurrency : copy.shares,
     },
     {
       key: "execution",
       passed: executionReady,
       title: copy.executionGate,
       detail: executionReady ? copy.executionReady : copy.executionBlocked,
-      suffix: copy.demoOnly,
+      suffix: badgeText,
     },
   ];
 
@@ -398,7 +457,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       setFlowError(null);
       setStep("preview");
       void appendEvidence("preview_created", {
-        mode: "mock",
+        mode: workspaceMode,
         symbol: nextPreview.draft.symbol,
         side: nextPreview.draft.side,
         orderType: nextPreview.draft.type,
@@ -412,7 +471,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       setFlowError(copy.previewBlocked);
       setStep("safety");
       void appendEvidence("order_intent", {
-        mode: "mock",
+        mode: workspaceMode,
         symbol: draft.symbol,
         side: draft.side,
         orderType: draft.type,
@@ -430,23 +489,25 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       const currentDraftHash = mockDraftHash(draft);
       const simulatedOrder: BrokerOrder = MOCK_BROKER.consumePreview(preview.previewId, currentDraftHash);
 
+      void persistPaperOrder(workspaceMode, simulatedOrder);
       setReceipt({
-        receiptId: `DEMO-RECEIPT-${simulatedOrder.id}`,
+        receiptId: `${isLocalMode ? "PAPER-RECEIPT" : "DEMO-RECEIPT"}-${simulatedOrder.id}`,
         orderId: simulatedOrder.id,
         previewId: preview.previewId,
         draftHash: currentDraftHash,
         estimatedAmount: preview.estimatedAmount,
         status: simulatedOrder.status,
+        currency: quoteCurrency,
       });
       setStep("receipt");
       void appendEvidence("user_confirmation", {
-        mode: "mock",
+        mode: workspaceMode,
         symbol: draft.symbol,
         previewId: preview.previewId,
         draftHash: currentDraftHash,
       }).catch(() => undefined);
       void appendEvidence("mock_response", {
-        mode: "mock",
+        mode: workspaceMode,
         orderId: simulatedOrder.id,
         symbol: simulatedOrder.symbol,
         side: simulatedOrder.side,
@@ -461,7 +522,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
       setFlowError(error instanceof MockBrokerError && error.code === "preview-expired" ? copy.previewExpired : copy.simulationFailed);
       setStep("safety");
       void appendEvidence("mock_response", {
-        mode: "mock",
+        mode: workspaceMode,
         symbol: draft.symbol,
         previewId: preview.previewId,
         status: "failed",
@@ -528,7 +589,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
     >
       <header className="trade-page__header">
         <div>
-          <p className="trade-page__eyebrow">{copy.eyebrow}</p>
+          <p className="trade-page__eyebrow">{eyebrowText}</p>
           <h1 id="trade-page-title">{copy.title}</h1>
         </div>
         <div className="trade-page__header-actions">
@@ -545,7 +606,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
           </button>
           <div className="trade-page__demo-state">
             <span className="trade-page__demo-dot" aria-hidden="true" />
-            <strong>{copy.demoOnly}</strong>
+            <strong>{badgeText}</strong>
             <span>{copy.noConnection}</span>
           </div>
         </div>
@@ -573,7 +634,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
               <p className="trade-card__kicker">01 / 04</p>
               <h2>{copy.ticket}</h2>
             </div>
-            <span className="trade-badge">{copy.demoOnly}</span>
+            <span className="trade-badge">{badgeText}</span>
           </div>
 
           <div className="trade-ticket__layout">
@@ -589,7 +650,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
                     clearTicketErrors();
                   }}
                 >
-                  {SYMBOLS.map((option) => (
+                  {availableSymbols.map((option) => (
                     <option key={option} value={option}>
                       {option} · {getTradeQuote(option, language).company}
                     </option>
@@ -704,23 +765,23 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
                         clearTicketErrors();
                       }}
                     />
-                    <span>{copy.dollars}</span>
+                    <span>{quoteCurrency}</span>
                   </div>
                   {errors.limitPrice && <small id="trade-limit-price-error" className="trade-error" role="alert">{errors.limitPrice}</small>}
                 </label>
               )}
             </div>
 
-            <aside className="trade-quote-panel" aria-label={copy.quote}>
+            <aside className="trade-quote-panel" aria-label={quoteHeadingText}>
               <div className="trade-quote-panel__topline">
-                <span>{copy.quote}</span>
-                <span className="trade-quote-panel__fictional">{copy.demoOnly}</span>
+                <span>{quoteHeadingText}</span>
+                <span className="trade-quote-panel__fictional">{badgeText}</span>
               </div>
               <div className="trade-quote-panel__symbol">
                 <strong>{symbol}</strong>
                 <span>{currentQuote.company}</span>
               </div>
-              <div className="trade-quote-panel__price">{formatMoney(currentQuote.price, language)}</div>
+              <div className="trade-quote-panel__price">{formatMoney(currentQuote.price, language, quoteCurrency)}</div>
               <div className={`trade-quote-panel__change ${decimalCompare(currentQuote.changePct, ZERO_PRICE) < 0 ? "is-negative" : ""}`}>
                 {decimalCompare(currentQuote.changePct, ZERO_PRICE) >= 0 ? "+" : ""}{decimalToNumber(currentQuote.changePct).toFixed(2)}% {copy.quoteChange}
               </div>
@@ -731,7 +792,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
                 </div>
                 <div>
                   <dt>{copy.buyingPower}</dt>
-                  <dd>{formatMoney(demoBuyingPower, language)}</dd>
+                  <dd>{formatMoney(demoBuyingPower, language, quoteCurrency)}</dd>
                 </div>
                 <div>
                   <dt>{copy.positionRisk}</dt>
@@ -764,8 +825,8 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
               <strong>{side === "Buy" ? copy.buy : copy.sell} {quantity} {copy.shares} {symbol} · {orderType === "Market" ? copy.market : copy.limit}</strong>
             </div>
             <div>
-              <span>{copy.quote}</span>
-              <strong>{formatMoney(currentQuote.price, language)}</strong>
+              <span>{quoteHeadingText}</span>
+              <strong>{formatMoney(currentQuote.price, language, quoteCurrency)}</strong>
             </div>
           </div>
 
@@ -811,19 +872,19 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
               <p className="trade-card__kicker">03 / 04</p>
               <h2>{copy.preview}</h2>
             </div>
-            <span className="trade-badge">{copy.demoOnly}</span>
+            <span className="trade-badge">{badgeText}</span>
           </div>
 
           <p className="trade-section-lede">{copy.previewTitle}</p>
           <div className="trade-natural-summary" data-testid="trade-summary">
             <span>{copy.naturalLanguage}</span>
             <p>
-               {side === "Buy" ? copy.buy : copy.sell} {quantity} {copy.shares} {symbol} {orderType === "Market" ? copy.marketAtQuote : `${copy.limitAt} ${preview?.draft.limitPrice ? formatMoney(preview.draft.limitPrice, language) : "—"}`}.
+               {side === "Buy" ? copy.buy : copy.sell} {quantity} {copy.shares} {symbol} {orderType === "Market" ? copy.marketAtQuote : `${copy.limitAt} ${preview?.draft.limitPrice ? formatMoney(preview.draft.limitPrice, language, quoteCurrency) : "—"}`}.
             </p>
           </div>
 
           <dl className="trade-preview-facts">
-             <div><dt>{copy.estimatedAmount}</dt><dd>{preview ? formatMoney(preview.estimatedAmount, language) : "—"}</dd></div>
+             <div><dt>{copy.estimatedAmount}</dt><dd>{preview ? formatMoney(preview.estimatedAmount, language, quoteCurrency) : "—"}</dd></div>
              <div><dt>{copy.validity}</dt><dd>{preview ? copy.validityValue : copy.previewFailed}</dd></div>
              <div><dt>{copy.previewId}</dt><dd>{preview?.previewId ?? "—"}</dd></div>
           </dl>
@@ -867,7 +928,7 @@ export function TradePage({ language, initialSymbol, onClose, onViewOrders }: Tr
           </div>
           <dl className="trade-preview-facts">
             <div><dt>{copy.symbol}</dt><dd>{symbol}</dd></div>
-             <div><dt>{copy.estimatedAmount}</dt><dd>{formatMoney(receipt.estimatedAmount, language)}</dd></div>
+             <div><dt>{copy.estimatedAmount}</dt><dd>{formatMoney(receipt.estimatedAmount, language, receipt.currency)}</dd></div>
              <div><dt>{copy.receiptId}</dt><dd>{receipt.receiptId}</dd></div>
              <div><dt>{copy.previewId}</dt><dd data-testid="trade-receipt-preview-id">{receipt.previewId}</dd></div>
           </dl>
