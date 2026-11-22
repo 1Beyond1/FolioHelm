@@ -1141,7 +1141,14 @@ pub fn parse_yahoo_history_json(
         let Ok(micros) = fixed_1e8_to_micros(fixed) else {
             continue;
         };
+        let year = dt.year();
+        if !(1900..=9999).contains(&year) {
+            continue;
+        }
         let date = dt.format("%Y-%m-%d").to_string();
+        if date.len() != 10 || NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+            continue;
+        }
         by_date.insert(date, micros);
     }
 
@@ -1464,5 +1471,16 @@ mod tests {
         assert_eq!(spy_series.symbol, "SPY");
         assert_eq!(spy_series.points.len(), 1);
         assert_eq!(spy_series.points[0].close_micros, 580_125_000);
+
+        // P1-6 regression: corrupted negative/out-of-range Yahoo timestamps are skipped
+        // cleanly without poisoning the entire benchmark batch.
+        let yahoo_with_bad_ts = r#"{"chart":{"result":[{"timestamp":[-100000000000,1763510400,300000000000,1763596800],"indicators":{"quote":[{"close":[100.0,580.125,999.0,590.50]}]}}]}}"#;
+        let cleaned_series =
+            parse_yahoo_history_json("SPY", "USD", yahoo_with_bad_ts, "2026-11-22T00:00:00.000Z")
+                .expect("bad timestamps skipped cleanly");
+        assert_eq!(cleaned_series.points.len(), 2);
+        assert!(cleaned_series.points.iter().all(|pt| pt.date.len() == 10));
+        assert_eq!(cleaned_series.points[0].close_micros, 580_125_000);
+        assert_eq!(cleaned_series.points[1].close_micros, 590_500_000);
     }
 }

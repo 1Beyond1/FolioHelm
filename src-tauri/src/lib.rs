@@ -1064,9 +1064,10 @@ fn vault_load_portfolio(
 
 #[tauri::command]
 fn vault_clear_portfolio(state: State<'_, VaultRuntimeState>) -> Result<bool, String> {
-    state.with_unlocked(|db, _| {
+    state.with_unlocked_and_cache(|db, _, cache| {
         db.clear_portfolio_snapshots()
             .map_err(|error| error.to_string())?;
+        cache.reload_from_db(db);
         Ok(true)
     })
 }
@@ -2655,6 +2656,19 @@ mod tests {
         assert_eq!(hkd_snaps.len(), 1);
         assert_eq!(hkd_snaps[0].net_value_micros, 50_000_000_000);
         assert_eq!(acct_snaps.len(), 2);
+
+        // P0-5: Clearing local portfolio clears nav_snapshots, accounts (leaving clean default),
+        // and reloads VaultRuntimeCache immediately so stale NAV cannot resurrect.
+        state
+            .with_unlocked_and_cache(|db, _, cache| {
+                db.clear_portfolio_snapshots().map_err(|e| e.to_string())?;
+                cache.reload_from_db(db);
+                Ok(())
+            })
+            .expect("clear portfolio and reload cache");
+        let (cached_accts, cached_navs, _) = state.runtime_cache_counts();
+        assert_eq!(cached_accts, 1);
+        assert_eq!(cached_navs, 0);
 
         // Lock clears all runtime caches cleanly
         state

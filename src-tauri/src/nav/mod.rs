@@ -479,13 +479,10 @@ pub fn aggregate_nav_snapshots_for_currency(
             if let Some(today_snap) = date_map.get(&date) {
                 let is_first_for_account = !latest_by_account.contains_key(acct_id);
                 let effective_cf = if is_first_for_account && date > first_global_date {
-                    // Account newly added on a later date: treat initial funding as external CF
-                    // so aggregate TWR reflects investment performance rather than account onboarding.
-                    if today_snap.external_cash_flow_micros == 0 {
-                        today_snap.net_value_micros
-                    } else {
-                        today_snap.external_cash_flow_micros
-                    }
+                    // Account newly added on a later date: its full opening NAV on entry day
+                    // represents external capital onboarding into the aggregate portfolio
+                    // (even if the account also recorded a partial same-day cash flow).
+                    today_snap.net_value_micros
                 } else {
                     today_snap.external_cash_flow_micros
                 };
@@ -533,14 +530,17 @@ pub fn aggregate_nav_snapshots_for_currency(
 /// Computes pure `i128` fixed-point Time-Weighted Return (TWR) across chronologically
 /// ordered snapshots within one currency bucket.
 ///
-/// Sub-period formula: `sub_factor = (V_end - CF) / V_start` (scaled by `10^9`).
-/// Cumulative TWR factor: `cum_factor = cum_factor * sub_factor / 10^9`.
+/// Sub-period formula (GIPS BOD-inflow / EOD-outflow convention, scaled by `10^9`):
+/// - For inflows (`CF > 0`): `sub_factor = V_end / (V_start + CF)` so large deposits on a
+///   small base with an intraday drawdown never collapse `cum_factor` to `0` (`-100.00%`).
+/// - For outflows or zero flow (`CF <= 0`): `sub_factor = (V_end - CF) / V_start`.
+/// - Cumulative TWR factor: `cum_factor = cum_factor * sub_factor / 10^9`.
 ///
 /// Edge-case guarantees:
 /// - Empty (`0` points): `has_enough_points = false`, `cumulative_twr_pct = None`.
 /// - Single day (`1` point): `has_enough_points = false`, `cumulative_twr_pct = None` (never fabricates a 2nd point!).
 /// - `V_start <= 0`: sub-period return is undefined -> neutral factor `1.0`, `daily_return_pct = None`.
-/// - `V_end - CF < 0`: wealth factor floored at `0` (`-100.00%`) without sign flip or overflow.
+/// - Total wipeout (`V_end <= 0` for inflows, or `V_end - CF <= 0` for outflows/zero-CF): floored at `0` (`-100.00%`).
 /// - Extreme `i128` boundaries: checked arithmetic returns `Err(NavError::ArithmeticOverflow)` instead of panicking.
 pub fn compute_twr_series(
     raw_snapshots: &[StoredNavSnapshot],
@@ -605,6 +605,18 @@ pub fn compute_twr_series(
 
         let (sub_factor, daily_return_pct) = if v_start <= 0 {
             (TWR_FACTOR_SCALE, None)
+        } else if cf > 0 {
+            // Beginning-of-day inflow convention: capital base is `V_start + CF`.
+            let capital_base = v_start
+                .checked_add(cf)
+                .ok_or(NavError::ArithmeticOverflow)?;
+            if v_end <= 0 {
+                (0_i128, Some("-100.00".to_string()))
+            } else {
+                let factor = mul_div_round_i128(v_end, TWR_FACTOR_SCALE, capital_base)?;
+                let pct = format_return_pct_from_factor(factor)?;
+                (factor, Some(pct))
+            }
         } else if adjusted_end <= 0 {
             (0_i128, Some("-100.00".to_string()))
         } else {
@@ -649,11 +661,12 @@ pub fn compute_twr_series(
 }
 
 /// Aligns a cached read-only benchmark series to portfolio snapshot dates and computes
-/// exact `i128` cumulative benchmark TWR starting at `0.00%` on `dates[0]`.
+/// exact `i128` cumulative benchmark TWR starting at `0.00%` on the first overlapping date.
 ///
 /// For weekend/holiday portfolio dates, carries forward the latest benchmark close on or
-/// before that date. Returns an empty `points` vector if fewer than 2 dates exist or no
-/// benchmark close is available on or before `dates[0]`.
+/// before that date. When benchmark history starts after `dates[0]`, anchors at the first
+/// common overlapping date instead of dropping the entire series. Returns an empty `points`
+/// vector if fewer than 2 portfolio dates exist or no overlapping benchmark close exists.
 pub fn compute_benchmark_twr_series(
     dates: &[String],
     benchmark: &StoredBenchmarkSeries,
@@ -684,24 +697,17 @@ pub fn compute_benchmark_twr_series(
             .map(|(_, &close)| close)
     };
 
-    let Some(base_close) = find_close_on_or_before(dates[0].as_str()) else {
-        return Ok(BenchmarkTwrSeriesDto {
-            symbol: benchmark.symbol.clone(),
-            currency: benchmark.currency.clone(),
-            provider: benchmark.provider.clone(),
-            as_of_utc: benchmark.as_of_utc.clone(),
-            aligned_count: 0,
-            cumulative_twr_pct: None,
-            points: Vec::new(),
-        });
-    };
-
+    let mut base_close: Option<i128> = None;
     let mut aligned = Vec::with_capacity(dates.len());
     for date in dates {
         let Some(close) = find_close_on_or_before(date.as_str()) else {
             continue;
         };
-        let factor = mul_div_round_i128(close, TWR_FACTOR_SCALE, base_close)?;
+        if close <= 0 {
+            continue;
+        }
+        let anchor = *base_close.get_or_insert(close);
+        let factor = mul_div_round_i128(close, TWR_FACTOR_SCALE, anchor)?;
         let pct = format_return_pct_from_factor(factor)?;
         aligned.push(BenchmarkTwrPointDto {
             date: date.clone(),
@@ -840,12 +846,12 @@ mod tests {
     #[test]
     fn twr_strips_cross_day_inflows_and_outflows_accurately_with_pure_i128() {
         // Day 1: $10,000
-        // Day 2: market +10% -> $11,000, user deposits +$5,000 => V_end = $16,000, CF = +$5,000
-        //        sub-period 1: (16_000 - 5_000) / 10_000 = 1.10 (+10.00%)
-        // Day 3: market -10% on $16,000 -> $14,400, user withdraws -$4,400 => V_end = $10,000, CF = -$4,400
-        //        sub-period 2: (10_000 - (-4_400)) / 16_000 = 14_400 / 16_000 = 0.90 (-10.00%)
+        // Day 2: BOD deposit +$5,000 (capital base $15,000), market +10% => V_end = $16,500, CF = +$5,000
+        //        sub-period 1: 16_500 / (10_000 + 5_000) = 1.10 (+10.00%), P&L = +$1,500
+        // Day 3: market -10% on $16,500 -> $14,850, EOD withdrawal -$4,850 => V_end = $10,000, CF = -$4,850
+        //        sub-period 2: (10_000 - (-4_850)) / 16_500 = 14_850 / 16_500 = 0.90 (-10.00%), P&L = -$1,650
         // Cumulative TWR = 1.10 * 0.90 - 1 = 0.99 - 1 = -1.00%
-        // True P&L = +$1,000 - $1,600 = -$600 (even though V_end == V_start == $10,000!)
+        // True P&L = +$1,500 - $1,650 = -$150 (even though V_end == V_start == $10,000!)
         let series = compute_twr_series(
             &[
                 snap(
@@ -859,7 +865,7 @@ mod tests {
                     "2026-11-19",
                     "acct_default",
                     "USD",
-                    16_000 * MICROS_PER_UNIT,
+                    16_500 * MICROS_PER_UNIT,
                     5_000 * MICROS_PER_UNIT,
                 ),
                 snap(
@@ -867,7 +873,7 @@ mod tests {
                     "acct_default",
                     "USD",
                     10_000 * MICROS_PER_UNIT,
-                    -4_400 * MICROS_PER_UNIT,
+                    -4_850 * MICROS_PER_UNIT,
                 ),
             ],
             "USD",
@@ -882,7 +888,7 @@ mod tests {
         assert_eq!(series.points[2].daily_return_pct.as_deref(), Some("-10.00"));
         assert_eq!(series.points[2].cumulative_twr_pct, "-1.00");
         assert_eq!(series.cumulative_twr_pct.as_deref(), Some("-1.00"));
-        assert_eq!(series.period_pnl_micros, -600 * MICROS_PER_UNIT);
+        assert_eq!(series.period_pnl_micros, -150 * MICROS_PER_UNIT);
     }
 
     #[test]
@@ -917,7 +923,53 @@ mod tests {
         );
         assert_eq!(zero_start.cumulative_twr_pct.as_deref(), Some("10.00"));
 
-        // 2. Negative adjusted end (V_end - CF < 0) floors wealth factor at 0 (-100.00%) without sign flip
+        // 2. P0-6 regression: small base ($100) + large deposit (+$10,000) + -2% intraday drop ($9,898)
+        //    must NEVER lock cum_factor at 0 (-100.00%); Day 3 +50% ($14,847) recovers cleanly to +47.00%!
+        let large_inflow_dip = compute_twr_series(
+            &[
+                snap(
+                    "2026-11-18",
+                    "acct_default",
+                    "USD",
+                    100 * MICROS_PER_UNIT,
+                    0,
+                ),
+                snap(
+                    "2026-11-19",
+                    "acct_default",
+                    "USD",
+                    9_898 * MICROS_PER_UNIT,
+                    10_000 * MICROS_PER_UNIT,
+                ),
+                snap(
+                    "2026-11-20",
+                    "acct_default",
+                    "USD",
+                    14_847 * MICROS_PER_UNIT,
+                    0,
+                ),
+            ],
+            "USD",
+            "acct_default",
+        )
+        .expect("large inflow dip safe");
+        assert_eq!(
+            large_inflow_dip.points[1].daily_return_pct.as_deref(),
+            Some("-2.00")
+        );
+        assert_eq!(large_inflow_dip.points[1].cumulative_twr_pct, "-2.00");
+        assert_eq!(
+            large_inflow_dip.points[2].daily_return_pct.as_deref(),
+            Some("50.00")
+        );
+        assert_eq!(
+            large_inflow_dip.cumulative_twr_pct.as_deref(),
+            Some("47.00")
+        );
+        assert_eq!(large_inflow_dip.cumulative_factor, 1_470_000_000);
+        assert_eq!(large_inflow_dip.period_pnl_micros, 4_747 * MICROS_PER_UNIT);
+
+        // 3. Genuine total wipeout (V_end = 0, CF = 0) still floors cleanly at -100.00% without sign flip
         let wiped = compute_twr_series(
             &[
                 snap(
@@ -927,22 +979,16 @@ mod tests {
                     1_000 * MICROS_PER_UNIT,
                     0,
                 ),
-                snap(
-                    "2026-11-19",
-                    "acct_default",
-                    "USD",
-                    100 * MICROS_PER_UNIT,
-                    500 * MICROS_PER_UNIT,
-                ),
+                snap("2026-11-19", "acct_default", "USD", 0, 0),
             ],
             "USD",
             "acct_default",
         )
-        .expect("negative adjusted end safe");
+        .expect("wipeout safe");
         assert_eq!(wiped.points[1].daily_return_pct.as_deref(), Some("-100.00"));
         assert_eq!(wiped.cumulative_twr_pct.as_deref(), Some("-100.00"));
 
-        // 3. Extreme i128::MAX / i128::MIN overflow is caught gracefully as Err, never panics
+        // 4. Extreme i128::MAX / i128::MIN overflow is caught gracefully as Err, never panics
         let overflow_err = compute_twr_series(
             &[
                 snap("2026-11-18", "acct_default", "USD", 1, 0),
@@ -954,7 +1000,7 @@ mod tests {
         .expect_err("must detect i128 overflow");
         assert_eq!(overflow_err, NavError::ArithmeticOverflow);
 
-        // 4. Rejects cross-currency MULTI bucket
+        // 5. Rejects cross-currency MULTI bucket
         let multi_err = compute_twr_series(&[], "MULTI", "ALL").expect_err("reject MULTI");
         assert!(matches!(multi_err, NavError::InvalidCurrency(_)));
     }
@@ -962,7 +1008,8 @@ mod tests {
     #[test]
     fn aggregates_multiple_accounts_per_currency_without_fake_onboarding_return_spike() {
         // Account A starts Day 1 at $10,000, grows 10% on Day 2 to $11,000.
-        // Account B is newly onboarded on Day 2 with $20,000.
+        // Account B is newly onboarded on Day 2 with $20,000 AND an internal same-day CF of $1,000:
+        // its FULL $20,000 onboarding NAV must be counted as aggregate external CF (P1-1), NOT $1,000!
         // Account C is in HKD (must be strictly excluded from USD bucket!).
         let snaps = vec![
             snap(
@@ -984,7 +1031,7 @@ mod tests {
                 "acct_schwab_ira",
                 "USD",
                 20_000 * MICROS_PER_UNIT,
-                0,
+                1_000 * MICROS_PER_UNIT,
             ),
             snap(
                 "2026-11-19",
@@ -1006,8 +1053,9 @@ mod tests {
         );
 
         let twr = compute_twr_series(&usd_agg, "USD", "ALL").expect("agg twr");
-        // True TWR = (31_000 - 20_000) / 10_000 - 1 = +10.00% (NO fake +210% spike!)
-        assert_eq!(twr.cumulative_twr_pct.as_deref(), Some("10.00"));
+        // True P&L = +$1,000 (not +$20,000); BOD inflow return = 31_000 / (10_000 + 20_000) - 1 = +3.33%
+        assert_eq!(twr.period_pnl_micros, 1_000 * MICROS_PER_UNIT);
+        assert_eq!(twr.cumulative_twr_pct.as_deref(), Some("3.33"));
     }
 
     #[test]
@@ -1108,5 +1156,38 @@ mod tests {
         assert_eq!(weights[0].weight_pct, "60.00");
         assert_eq!(weights[1].weight_pct, "30.00");
         assert_eq!(weights[2].weight_pct, "10.00");
+    }
+
+    #[test]
+    fn aligns_benchmark_from_first_common_date_when_benchmark_starts_later() {
+        let bench = StoredBenchmarkSeries {
+            symbol: "SPY".to_string(),
+            currency: "USD".to_string(),
+            provider: "yahoo".to_string(),
+            as_of_utc: "2026-11-22T00:00:00.000Z".to_string(),
+            points: vec![
+                BenchmarkPricePoint {
+                    date: "2026-11-18".to_string(),
+                    close_micros: 500 * MICROS_PER_UNIT,
+                },
+                BenchmarkPricePoint {
+                    date: "2026-11-20".to_string(),
+                    close_micros: 550 * MICROS_PER_UNIT,
+                },
+            ],
+        };
+        let portfolio_dates = vec![
+            "2024-01-15".to_string(),
+            "2025-06-01".to_string(),
+            "2026-11-18".to_string(),
+            "2026-11-20".to_string(),
+        ];
+        let aligned = compute_benchmark_twr_series(&portfolio_dates, &bench).expect("common start");
+        assert_eq!(aligned.aligned_count, 2);
+        assert_eq!(aligned.points[0].date, "2026-11-18");
+        assert_eq!(aligned.points[0].cumulative_twr_pct, "0.00");
+        assert_eq!(aligned.points[1].date, "2026-11-20");
+        assert_eq!(aligned.points[1].cumulative_twr_pct, "10.00");
+        assert_eq!(aligned.cumulative_twr_pct.as_deref(), Some("10.00"));
     }
 }

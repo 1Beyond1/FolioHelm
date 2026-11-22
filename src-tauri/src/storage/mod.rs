@@ -746,8 +746,11 @@ impl EncryptedVaultDb {
 
     /// Persist a normalized CSV portfolio snapshot encrypted at rest.
     ///
-    /// Idempotent by deterministic `fingerprint`: re-importing the identical
-    /// snapshot returns `deduplicated = true` and preserves the existing record.
+    /// Idempotent by deterministic `fingerprint`: re-importing the currently active
+    /// snapshot for that account returns `deduplicated = true` and refreshes its
+    /// `imported_at_utc`. Re-importing an earlier historical snapshot (`S1 -> S2 -> S1`)
+    /// promotes it back to the latest snapshot for that account so restarts never
+    /// roll back to `S2`.
     pub fn save_portfolio_snapshot(
         &mut self,
         snapshot: &StoredPortfolioSnapshot,
@@ -770,9 +773,63 @@ impl EncryptedVaultDb {
         if let Some((existing_id, ciphertext)) = existing {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &existing_id);
             let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
-            let stored: StoredPortfolioSnapshot = serde_json::from_slice(&plaintext)?;
+            let mut stored: StoredPortfolioSnapshot = serde_json::from_slice(&plaintext)?;
+
+            let target_acct = if stored.account_id.trim().is_empty() {
+                DEFAULT_ACCOUNT_ID.to_string()
+            } else {
+                stored.account_id.clone()
+            };
+            let is_already_latest = self
+                .load_latest_portfolio_snapshots_per_account()?
+                .into_iter()
+                .find(|snap| snap.account_id == target_acct)
+                .is_some_and(|latest| latest.fingerprint == stored.fingerprint);
+
+            let max_imported_at: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT MAX(imported_at_utc) FROM portfolio_snapshots",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let refreshed_ts = match max_imported_at {
+                Some(ref max_ts) if snapshot.imported_at_utc.as_str() < max_ts.as_str() => {
+                    max_ts.clone()
+                }
+                _ => snapshot.imported_at_utc.clone(),
+            };
+            stored.imported_at_utc = refreshed_ts;
+
+            let updated_plaintext = serde_json::to_vec(&stored)?;
+            let updated_ciphertext =
+                encrypt_record(self.keys.db_master_key(), &aad, &updated_plaintext)?;
+
+            // Atomically refresh both `imported_at_utc` and `rowid` while preserving `id`
+            // and `fingerprint`, ensuring deterministic newest-first ordering even within
+            // the same millisecond.
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "DELETE FROM portfolio_snapshots WHERE id = ?1",
+                params![existing_id],
+            )?;
+            tx.execute(
+                "INSERT INTO portfolio_snapshots (id, fingerprint, source_format, imported_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    existing_id,
+                    stored.fingerprint,
+                    stored.source_format,
+                    stored.imported_at_utc,
+                    updated_ciphertext
+                ],
+            )?;
+            tx.commit()?;
+
             return Ok(PortfolioSaveOutcome {
-                deduplicated: true,
+                deduplicated: is_already_latest,
                 snapshot: stored,
             });
         }
@@ -834,7 +891,14 @@ impl EncryptedVaultDb {
     pub fn clear_portfolio_snapshots(&mut self) -> Result<(), StorageError> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM portfolio_snapshots", [])?;
+        tx.execute("DELETE FROM nav_snapshots", [])?;
+        tx.execute(
+            "DELETE FROM paper_orders WHERE workspace_mode = 'local-csv'",
+            [],
+        )?;
+        tx.execute("DELETE FROM accounts", [])?;
         tx.commit()?;
+        self.ensure_default_account_if_missing()?;
         Ok(())
     }
 
@@ -1260,31 +1324,39 @@ impl EncryptedVaultDb {
                 "default account cannot be deleted".to_string(),
             ));
         }
+
+        // Identify all portfolio snapshots and paper orders scoped to this account first
+        // so all four tables (`accounts`, `nav_snapshots`, `portfolio_snapshots`, `paper_orders`)
+        // are removed atomically inside a single SQLite transaction.
+        let snap_ids_to_remove: Vec<String> = self
+            .load_all_portfolio_snapshots()?
+            .into_iter()
+            .filter(|snap| snap.account_id == trimmed)
+            .map(|snap| snap.id)
+            .collect();
+        let order_ids_to_remove: Vec<String> = self
+            .load_all_paper_orders()?
+            .into_iter()
+            .filter(|order| order.account_id == trimmed)
+            .map(|order| order.id)
+            .collect();
+
         let tx = self.conn.transaction()?;
         let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![trimmed])?;
         tx.execute(
             "DELETE FROM nav_snapshots WHERE account_id = ?1",
             params![trimmed],
         )?;
-        tx.commit()?;
-
-        // Also remove any portfolio snapshots scoped to the deleted account.
-        let all_snaps = self.load_all_portfolio_snapshots()?;
-        let ids_to_remove: Vec<String> = all_snaps
-            .into_iter()
-            .filter(|snap| snap.account_id == trimmed)
-            .map(|snap| snap.id)
-            .collect();
-        if !ids_to_remove.is_empty() {
-            let tx2 = self.conn.transaction()?;
-            for snap_id in ids_to_remove {
-                tx2.execute(
-                    "DELETE FROM portfolio_snapshots WHERE id = ?1",
-                    params![snap_id],
-                )?;
-            }
-            tx2.commit()?;
+        for snap_id in snap_ids_to_remove {
+            tx.execute(
+                "DELETE FROM portfolio_snapshots WHERE id = ?1",
+                params![snap_id],
+            )?;
         }
+        for order_id in order_ids_to_remove {
+            tx.execute("DELETE FROM paper_orders WHERE id = ?1", params![order_id])?;
+        }
+        tx.commit()?;
 
         Ok(deleted > 0)
     }
@@ -3305,5 +3377,203 @@ mod tests {
         cleanup_temp_db(&src_path);
         cleanup_temp_db(&dst_path);
         cleanup_temp_db(&v1_dst_path);
+    }
+
+    #[test]
+    fn clear_portfolio_delete_account_and_reimport_historical_snapshot_stay_consistent() {
+        let db_path = unique_temp_db("stage5-storage-hardening");
+        let keys = InMemoryKeyStore::new();
+        let mut db =
+            EncryptedVaultDb::open(&db_path, &keys, "in-memory-test").expect("open vault db");
+
+        // Create second account + snapshots S1 -> S2 -> S1 (P1-8)
+        db.upsert_account(&StoredAccount {
+            id: "acct_schwab".to_string(),
+            name: "Schwab".to_string(),
+            broker: "Schwab".to_string(),
+            account_type: "taxable".to_string(),
+            base_currency: "USD".to_string(),
+            created_at: "2026-11-20T00:00:00.000Z".to_string(),
+        })
+        .expect("upsert acct_schwab");
+
+        let make_snap =
+            |id: &str, acct: &str, fp: &str, ts: &str, cash: &str| StoredPortfolioSnapshot {
+                id: id.to_string(),
+                account_id: acct.to_string(),
+                fingerprint: fp.to_string(),
+                source_format: "generic_csv".to_string(),
+                source_label: "test.csv".to_string(),
+                imported_at_utc: ts.to_string(),
+                account_label: acct.to_string(),
+                currency: "USD".to_string(),
+                cash: cash.to_string(),
+                cash_by_currency: BTreeMap::from([("USD".to_string(), cash.to_string())]),
+                currencies: vec!["USD".to_string()],
+                is_multi_currency: false,
+                holdings: vec![],
+                transactions: vec![],
+                warnings: vec![],
+            };
+
+        let s1 = make_snap(
+            "snap-s1",
+            DEFAULT_ACCOUNT_ID,
+            "fp-s1",
+            "2026-11-20T10:00:00.000Z",
+            "1000.00",
+        );
+        let s2 = make_snap(
+            "snap-s2",
+            DEFAULT_ACCOUNT_ID,
+            "fp-s2",
+            "2026-11-21T10:00:00.000Z",
+            "2000.00",
+        );
+        let s1_reimport = make_snap(
+            "snap-s1-again",
+            DEFAULT_ACCOUNT_ID,
+            "fp-s1",
+            "2026-11-22T10:00:00.000Z",
+            "1000.00",
+        );
+        assert!(!db.save_portfolio_snapshot(&s1).expect("s1").deduplicated);
+        assert!(!db.save_portfolio_snapshot(&s2).expect("s2").deduplicated);
+        let reimported = db
+            .save_portfolio_snapshot(&s1_reimport)
+            .expect("reimport s1");
+        assert!(!reimported.deduplicated);
+        assert_eq!(reimported.snapshot.fingerprint, "fp-s1");
+        assert_eq!(
+            reimported.snapshot.imported_at_utc,
+            "2026-11-22T10:00:00.000Z"
+        );
+        // Consecutive duplicate of S1 returns deduplicated = true
+        assert!(
+            db.save_portfolio_snapshot(&s1_reimport)
+                .expect("dup s1")
+                .deduplicated
+        );
+        let per_acct = db
+            .load_latest_portfolio_snapshots_per_account()
+            .expect("per acct");
+        let default_latest = per_acct
+            .iter()
+            .find(|s| s.account_id == DEFAULT_ACCOUNT_ID)
+            .expect("default latest");
+        assert_eq!(default_latest.fingerprint, "fp-s1");
+
+        // P1-7: delete_account removes paper_orders + nav_snapshots + portfolio_snapshots for acct_schwab
+        db.save_portfolio_snapshot(&make_snap(
+            "snap-schwab",
+            "acct_schwab",
+            "fp-schwab",
+            "2026-11-22T11:00:00.000Z",
+            "5000.00",
+        ))
+        .expect("schwab snap");
+        db.upsert_nav_snapshot(
+            &StoredNavSnapshot {
+                date: "2026-11-22".to_string(),
+                account_id: "acct_schwab".to_string(),
+                currency: "USD".to_string(),
+                net_value_micros: 5_000_000_000,
+                cash_micros: 5_000_000_000,
+                positions_micros: 0,
+                external_cash_flow_micros: 0,
+                source: "csv-import".to_string(),
+                updated_at: "2026-11-22T11:00:00.000Z".to_string(),
+            },
+            true,
+        )
+        .expect("schwab nav");
+        db.save_paper_order(&StoredPaperOrder {
+            id: "PAPER-SCHWAB-1".to_string(),
+            workspace_mode: "local-csv".to_string(),
+            account_id: "acct_schwab".to_string(),
+            symbol: "AAPL".to_string(),
+            side: "buy".to_string(),
+            order_type: "market".to_string(),
+            quantity: "5".to_string(),
+            filled_quantity: "0".to_string(),
+            limit_price: None,
+            currency: "USD".to_string(),
+            status: "working".to_string(),
+            submitted_at: "2026-11-22T11:05:00.000Z".to_string(),
+            events: vec![],
+        })
+        .expect("schwab order");
+        db.save_paper_order(&StoredPaperOrder {
+            id: "PAPER-DEFAULT-1".to_string(),
+            workspace_mode: "local-csv".to_string(),
+            account_id: DEFAULT_ACCOUNT_ID.to_string(),
+            symbol: "VOO".to_string(),
+            side: "buy".to_string(),
+            order_type: "market".to_string(),
+            quantity: "1".to_string(),
+            filled_quantity: "0".to_string(),
+            limit_price: None,
+            currency: "USD".to_string(),
+            status: "working".to_string(),
+            submitted_at: "2026-11-22T11:06:00.000Z".to_string(),
+            events: vec![],
+        })
+        .expect("default order");
+        db.save_paper_order(&StoredPaperOrder {
+            id: "MOCK-ORDER-KEEP".to_string(),
+            workspace_mode: "mock".to_string(),
+            account_id: DEFAULT_ACCOUNT_ID.to_string(),
+            symbol: "MSFT".to_string(),
+            side: "buy".to_string(),
+            order_type: "market".to_string(),
+            quantity: "1".to_string(),
+            filled_quantity: "0".to_string(),
+            limit_price: None,
+            currency: "USD".to_string(),
+            status: "working".to_string(),
+            submitted_at: "2026-11-22T11:07:00.000Z".to_string(),
+            events: vec![],
+        })
+        .expect("mock order");
+
+        assert!(db.delete_account("acct_schwab").expect("delete schwab"));
+        let local_orders_after_del = db.load_paper_orders("local-csv").expect("orders");
+        assert_eq!(local_orders_after_del.len(), 1);
+        assert_eq!(local_orders_after_del[0].id, "PAPER-DEFAULT-1");
+        assert!(db
+            .load_nav_snapshots(Some("acct_schwab"), None)
+            .expect("nav")
+            .is_empty());
+
+        // P0-5: clear_portfolio_snapshots wipes local-csv snapshots, nav_snapshots, local-csv paper_orders,
+        // and resets accounts to clean acct_default while preserving mock demo orders.
+        db.upsert_nav_snapshot(
+            &StoredNavSnapshot {
+                date: "2026-11-22".to_string(),
+                account_id: DEFAULT_ACCOUNT_ID.to_string(),
+                currency: "USD".to_string(),
+                net_value_micros: 1_000_000_000,
+                cash_micros: 1_000_000_000,
+                positions_micros: 0,
+                external_cash_flow_micros: 0,
+                source: "csv-import".to_string(),
+                updated_at: "2026-11-22T11:10:00.000Z".to_string(),
+            },
+            true,
+        )
+        .expect("default nav");
+        db.clear_portfolio_snapshots().expect("clear portfolio");
+        assert!(db.load_all_portfolio_snapshots().expect("snaps").is_empty());
+        assert!(db.load_all_nav_snapshots().expect("navs").is_empty());
+        assert!(db
+            .load_paper_orders("local-csv")
+            .expect("local orders")
+            .is_empty());
+        assert_eq!(db.load_paper_orders("mock").expect("mock orders").len(), 1);
+        let accounts_after_clear = db.list_accounts().expect("accounts");
+        assert_eq!(accounts_after_clear.len(), 1);
+        assert_eq!(accounts_after_clear[0].id, DEFAULT_ACCOUNT_ID);
+
+        cleanup_temp_db(&db_path);
     }
 }
