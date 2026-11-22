@@ -1,8 +1,17 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
 import { MOCK_BROKER } from "../../domain/mockBroker";
+import {
+  clearPersistedLocalPortfolio,
+  commitBrokerCsv,
+  MAX_CSV_BYTES,
+  previewBrokerCsv,
+  type CsvImportPreview,
+} from "../../domain/csvImport";
+import { invokeDialogOpenCsvFile, isTauriRuntime } from "../../domain/tauriBridge";
 import { DataStateNotice } from "../../components/DataStateNotice";
+import { Modal } from "../../components/Modal";
 import { formatCurrency, formatSignedCurrency } from "../../formatters";
 import "./portfolio.css";
 
@@ -79,11 +88,13 @@ const COPY = {
     cash: "Cash",
     buyingPower: "Buying power",
     account: "Individual brokerage · •••• 1234",
+    localAccount: "Local Portfolio (CSV + Paper)",
     updated: "Updated just now",
     allocation: "Account allocation",
     allocationHint: "Across the account",
     holdings: "Holdings",
     holdingsHint: "Market value at the latest fictional quote",
+    holdingsHintLocal: "Market value from imported CSV baseline or delayed public quotes (read-only)",
     symbol: "Symbol",
     shares: "Shares",
     avgCost: "Avg cost",
@@ -95,13 +106,35 @@ const COPY = {
     trade: "Trade",
     returnCurve: "Return curve",
     returnHint: "Indexed performance · last 12 months",
+    returnHintLocal: "Anchored to imported CSV equity baseline (no fictional history)",
     fictionalData: "Fictional data",
     fictionalBody: "Quotes, balances, and returns are fictional and for interface review only.",
     fictionalTag: "No brokerage connection",
+    localDataTitle: "Local encrypted CSV portfolio",
+    localDataBody: "Holdings and cash come from your local broker CSV import and are isolated from Mock Demo. Paper orders remain simulated only.",
+    localDataTag: "AES-256-GCM encrypted · Read-only",
     sortBy: (label: string) => `Sort by ${label}`,
     allocationLabel: "Account allocation donut",
     returnLabel: "Mock portfolio return curve",
     negative: "negative",
+    modeMock: "Mock Demo",
+    modeLocal: "Local Portfolio (CSV + Paper)",
+    importCsv: "Import Broker CSV",
+    clearLocal: "Clear CSV portfolio",
+    importModalTitle: "Import brokerage CSV",
+    importModalSubtitle: "Supports Charles Schwab, IBKR Activity/Positions, and standard CSV (max 5 MB, formula-sanitized, exact Decimal).",
+    chooseCsvFile: "Choose CSV file",
+    detectedFormat: "Detected format",
+    columnMapping: "Field mapping",
+    previewCash: "Detected cash",
+    previewHoldings: "Holdings preview",
+    previewWarnings: "Safety & normalization notices",
+    duplicateNotice: "Identical snapshot fingerprint already exists. Confirming will deduplicate instead of doubling positions.",
+    confirmImport: "Confirm encrypted import",
+    cancel: "Cancel",
+    importSuccess: (count: number) => `Imported ${count} holdings into Local Portfolio (CSV + Paper) and recorded tamper-evident evidence.`,
+    importDeduplicated: "Snapshot already imported (deduplicated safely; no positions were doubled).",
+    fileTooLarge: "Selected CSV exceeds the 5 MB safety limit.",
   },
   zh: {
     eyebrow: "账户概览",
@@ -112,11 +145,13 @@ const COPY = {
     cash: "现金",
     buyingPower: "购买力",
     account: "个人证券账户 · •••• 1234",
+    localAccount: "本地持仓组合 (CSV + 纸上模拟)",
     updated: "刚刚更新",
     allocation: "账户分配",
     allocationHint: "账户整体配置",
     holdings: "持仓",
     holdingsHint: "按最新虚构报价计算的市值",
+    holdingsHintLocal: "按导入的 CSV 基准价或延迟公开只读行情计算的市值",
     symbol: "代码",
     shares: "股数",
     avgCost: "平均成本",
@@ -128,13 +163,35 @@ const COPY = {
     trade: "交易",
     returnCurve: "收益曲线",
     returnHint: "指数化表现 · 过去 12 个月",
+    returnHintLocal: "以本地导入权益为基准锚定（不虚构历史曲线）",
     fictionalData: "虚构数据",
     fictionalBody: "报价、余额和收益均为虚构内容，仅用于界面评审。",
     fictionalTag: "未连接券商",
+    localDataTitle: "本地加密 CSV 持仓",
+    localDataBody: "当前持仓与现金来自您导入的本地券商 CSV，与 Mock 演示数据完全隔离；所有纸上模拟订单均不连接券商下单。",
+    localDataTag: "AES-256-GCM 加密 · 仅本地只读",
     sortBy: (label: string) => `按${label}排序`,
     allocationLabel: "账户分配环形图",
     returnLabel: "模拟组合收益曲线",
     negative: "负值",
+    modeMock: "Mock 演示模式",
+    modeLocal: "本地持仓 (CSV + 纸上模拟)",
+    importCsv: "导入券商 CSV",
+    clearLocal: "清除本地 CSV 组合",
+    importModalTitle: "安全导入券商 CSV",
+    importModalSubtitle: "自动识别嘉信理财 (Schwab)、盈透证券 (IBKR) 与通用标准 CSV（≤ 5 MB、防公式注入清洗、精确 Decimal 核算）。",
+    chooseCsvFile: "选择 CSV 文件",
+    detectedFormat: "识别格式",
+    columnMapping: "字段映射预览",
+    previewCash: "识别现金余额",
+    previewHoldings: "持仓差异预览",
+    previewWarnings: "安全与规范化告警",
+    duplicateNotice: "检测到与已导入快照完全一致的 SHA-256 指纹：确认后将幂等去重，不会把持仓翻倍。",
+    confirmImport: "确认并加密落盘",
+    cancel: "取消",
+    importSuccess: (count: number) => `已安全导入 ${count} 项持仓至本地组合，并写入防篡改证据链。`,
+    importDeduplicated: "该份 CSV 快照已导入过（已幂等去重跳过，未重复叠加持仓）。",
+    fileTooLarge: "所选 CSV 超过 5 MB 安全上限。",
   },
 } as const;
 
@@ -180,7 +237,7 @@ function formatMoney(value: number, language: Language, withSign = false): strin
 
 function formatShares(value: number, language: Language): string {
   return value.toLocaleString(language === "zh" ? "zh-CN" : "en-US", {
-    maximumFractionDigits: 2,
+    maximumFractionDigits: 4,
   });
 }
 
@@ -227,6 +284,13 @@ function SortButton({
 
 export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: PortfolioPageProps) {
   const copy = COPY[language];
+  const [, setBrokerTick] = useState(0);
+  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const isLocalMode = workspaceMode === "local-csv";
+  const hasLocalPortfolio = MOCK_BROKER.hasLocalPortfolio();
+  const localMeta = MOCK_BROKER.getLocalPortfolioMeta();
   const snapshot = MOCK_BROKER.getSnapshot();
   const account = snapshot.account;
   const holdings = buildHoldings(language);
@@ -235,6 +299,15 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     key: HoldingSortKey;
     direction: SortDirection;
   }>({ key: "marketValue", direction: "desc" });
+
+  const [importOpen, setImportOpen] = useState(false);
+  const [pendingRawCsv, setPendingRawCsv] = useState<string>("");
+  const [pendingFileName, setPendingFileName] = useState<string>("");
+  const [csvPreview, setCsvPreview] = useState<CsvImportPreview | null>(null);
+  const [csvError, setCsvError] = useState<string | null>(null);
+  const [importFeedback, setImportFeedback] = useState<string | null>(null);
+  const [committing, setCommitting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sortedHoldings = useMemo(() => {
     return [...holdings].sort((left, right) => {
@@ -272,6 +345,80 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     }
   }
 
+  function resetImportModal() {
+    setImportOpen(false);
+    setPendingRawCsv("");
+    setPendingFileName("");
+    setCsvPreview(null);
+    setCsvError(null);
+    setCommitting(false);
+  }
+
+  async function processCsvText(rawText: string, fileName: string) {
+    setCsvError(null);
+    setCsvPreview(null);
+    setPendingRawCsv(rawText);
+    setPendingFileName(fileName);
+    try {
+      const preview = await previewBrokerCsv(rawText, fileName);
+      setCsvPreview(preview);
+    } catch (error) {
+      setCsvError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleChooseCsvFile() {
+    if (isTauriRuntime()) {
+      try {
+        const opened = await invokeDialogOpenCsvFile();
+        if (!opened) return;
+        await processCsvText(opened.content, opened.fileName);
+        return;
+      } catch (error) {
+        setCsvError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+    }
+    fileInputRef.current?.click();
+  }
+
+  async function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size > MAX_CSV_BYTES) {
+      setCsvError(copy.fileTooLarge);
+      return;
+    }
+    const text = await file.text();
+    await processCsvText(text, file.name);
+  }
+
+  async function handleConfirmCsvImport() {
+    if (!pendingRawCsv || !csvPreview) return;
+    setCommitting(true);
+    setCsvError(null);
+    try {
+      const result = await commitBrokerCsv(pendingRawCsv, pendingFileName || "imported.csv");
+      MOCK_BROKER.applyLocalPortfolioSnapshot(result.snapshot, { switchMode: true });
+      setImportFeedback(
+        result.deduplicated
+          ? copy.importDeduplicated
+          : copy.importSuccess(result.snapshot.holdings.length),
+      );
+      resetImportModal();
+    } catch (error) {
+      setCsvError(error instanceof Error ? error.message : String(error));
+      setCommitting(false);
+    }
+  }
+
+  async function handleClearLocalPortfolio() {
+    await clearPersistedLocalPortfolio();
+    MOCK_BROKER.clearLocalPortfolio();
+    setImportFeedback(null);
+  }
+
   return (
     <main className="fh-page fh-portfolio-page">
       <header className="fh-page-header">
@@ -280,17 +427,62 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
           <h1>{copy.title}</h1>
           <p className="fh-page-subtitle">{copy.subtitle}</p>
         </div>
-        <div className="fh-account-meta">
-          <span>{copy.account}</span>
-          <span>{copy.updated}</span>
+        <div className="fh-portfolio-controls">
+          <div className="fh-mode-switcher" role="group" aria-label={language === "zh" ? "工作区模式" : "Workspace mode"}>
+            <button
+              type="button"
+              className={`fh-mode-pill ${!isLocalMode ? "is-active" : ""}`}
+              data-testid="workspace-mode-mock"
+              aria-pressed={!isLocalMode}
+              onClick={() => MOCK_BROKER.setWorkspaceMode("mock")}
+            >
+              {copy.modeMock}
+            </button>
+            <button
+              type="button"
+              className={`fh-mode-pill ${isLocalMode ? "is-active" : ""}`}
+              data-testid="workspace-mode-local"
+              aria-pressed={isLocalMode}
+              onClick={() => {
+                if (hasLocalPortfolio) {
+                  MOCK_BROKER.setWorkspaceMode("local-csv");
+                } else {
+                  setImportOpen(true);
+                }
+              }}
+            >
+              {copy.modeLocal}
+            </button>
+          </div>
+          <div className="fh-portfolio-actions">
+            <button
+              type="button"
+              className="fh-import-csv-button"
+              data-testid="open-csv-import"
+              onClick={() => setImportOpen(true)}
+            >
+              {copy.importCsv}
+            </button>
+            <div className="fh-account-meta">
+              <span>{isLocalMode ? copy.localAccount : copy.account}</span>
+              <span>{isLocalMode && localMeta ? `${localMeta.sourceLabel} · ${localMeta.fingerprint.slice(0, 8)}` : copy.updated}</span>
+            </div>
+          </div>
         </div>
       </header>
+
+      {importFeedback && (
+        <section className="fh-import-feedback" role="status" data-testid="csv-import-feedback">
+          <span>{importFeedback}</span>
+          <button type="button" onClick={() => setImportFeedback(null)}>×</button>
+        </section>
+      )}
 
       <section className="fh-summary-grid" aria-label={copy.title}>
         <article className="fh-summary-card fh-summary-card-primary">
           <span>{copy.totalEquity}</span>
           <strong>{formatMoney(decimalToNumber(account.totalEquity), language)}</strong>
-          <small>USD</small>
+          <small>{localMeta && isLocalMode ? localMeta.currency : "USD"}</small>
         </article>
         <article className="fh-summary-card">
           <span>{copy.todayChange}</span>
@@ -300,12 +492,12 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         <article className="fh-summary-card">
           <span>{copy.cash}</span>
           <strong>{formatMoney(decimalToNumber(account.cash), language)}</strong>
-          <small>USD</small>
+          <small>{localMeta && isLocalMode ? localMeta.currency : "USD"}</small>
         </article>
         <article className="fh-summary-card">
           <span>{copy.buyingPower}</span>
           <strong>{formatMoney(decimalToNumber(account.buyingPower), language)}</strong>
-          <small>USD</small>
+          <small>{localMeta && isLocalMode ? localMeta.currency : "USD"}</small>
         </article>
       </section>
 
@@ -365,7 +557,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
           <div className="fh-panel-heading">
             <div>
               <h2>{copy.returnCurve}</h2>
-              <p>{copy.returnHint}</p>
+              <p>{isLocalMode ? copy.returnHintLocal : copy.returnHint}</p>
             </div>
             <span className={`fh-return-stat ${returnChart.changePercent < 0 ? "fh-negative" : "fh-positive"}`} data-testid="portfolio-return-stat">{formatPercent(returnChart.changePercent, language, true)}</span>
           </div>
@@ -401,7 +593,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         <div className="fh-panel-heading fh-holdings-heading">
           <div>
             <h2 id="fh-holdings-title">{copy.holdings}</h2>
-            <p>{copy.holdingsHint}</p>
+            <p>{isLocalMode ? copy.holdingsHintLocal : copy.holdingsHint}</p>
           </div>
           <span className="fh-holdings-count">{holdings.length}</span>
         </div>
@@ -492,11 +684,151 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       <aside className="fh-data-quality" data-testid="portfolio-data-quality" role="note">
         <span className="fh-quality-mark">i</span>
         <div>
-          <strong>{copy.fictionalData}</strong>
-          <p>{copy.fictionalBody}</p>
+          <strong>{isLocalMode ? copy.localDataTitle : copy.fictionalData}</strong>
+          <p>{isLocalMode ? copy.localDataBody : copy.fictionalBody}</p>
         </div>
-        <span className="fh-quality-tag">{copy.fictionalTag}</span>
+        <div className="fh-quality-actions">
+          <span className="fh-quality-tag">{isLocalMode ? copy.localDataTag : copy.fictionalTag}</span>
+          {isLocalMode && (
+            <button
+              type="button"
+              className="fh-clear-local-button"
+              data-testid="clear-local-portfolio"
+              onClick={() => void handleClearLocalPortfolio()}
+            >
+              {copy.clearLocal}
+            </button>
+          )}
+        </div>
       </aside>
+
+      {importOpen && (
+        <Modal
+          className="fh-csv-modal"
+          backdropClassName="fh-csv-backdrop"
+          labelledBy="fh-csv-modal-title"
+          testId="csv-import-modal"
+          onClose={resetImportModal}
+        >
+          <div className="fh-csv-modal-header">
+            <div>
+              <p className="fh-eyebrow">{copy.modeLocal}</p>
+              <h2 id="fh-csv-modal-title">{copy.importModalTitle}</h2>
+              <p className="fh-page-subtitle">{copy.importModalSubtitle}</p>
+            </div>
+            <button type="button" className="fh-csv-close" aria-label={copy.cancel} onClick={resetImportModal}>×</button>
+          </div>
+
+          <div className="fh-csv-picker-row">
+            <button
+              type="button"
+              className="fh-import-csv-button"
+              data-testid="csv-choose-file"
+              onClick={() => void handleChooseCsvFile()}
+            >
+              {copy.chooseCsvFile}
+            </button>
+            {pendingFileName && <span className="fh-csv-filename">{pendingFileName}</span>}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="fh-hidden-file"
+              data-testid="csv-file-input"
+              onChange={(event) => void handleFileInputChange(event)}
+            />
+          </div>
+
+          {csvError && (
+            <div className="fh-csv-error" role="alert" data-testid="csv-import-error">
+              {csvError}
+            </div>
+          )}
+
+          {csvPreview && (
+            <div className="fh-csv-preview" data-testid="csv-import-preview">
+              <div className="fh-csv-meta-grid">
+                <div>
+                  <span>{copy.detectedFormat}</span>
+                  <strong>{language === "zh" ? csvPreview.formatLabelZh : csvPreview.formatLabelEn}</strong>
+                </div>
+                <div>
+                  <span>{copy.previewCash}</span>
+                  <strong>{formatMoney(Number(csvPreview.snapshot.cash), language)} ({csvPreview.snapshot.currency})</strong>
+                </div>
+                <div>
+                  <span>{copy.previewHoldings}</span>
+                  <strong>{csvPreview.snapshot.holdings.length}</strong>
+                </div>
+              </div>
+
+              {csvPreview.columnMappings.length > 0 && (
+                <div className="fh-csv-mappings">
+                  <span>{copy.columnMapping}:</span>
+                  <div className="fh-csv-mapping-chips">
+                    {csvPreview.columnMappings.map((mapping) => (
+                      <code key={mapping.canonicalField}>{mapping.canonicalField} ← {mapping.sourceHeader}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {csvPreview.alreadyImported && (
+                <p className="fh-csv-warning" role="status" data-testid="csv-duplicate-warning">
+                  {copy.duplicateNotice}
+                </p>
+              )}
+
+              {csvPreview.warnings.length > 0 && (
+                <div className="fh-csv-warning" role="status" data-testid="csv-safety-warnings">
+                  <strong>{copy.previewWarnings}</strong>
+                  <ul>
+                    {csvPreview.warnings.map((warning, index) => (
+                      <li key={index}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div className="fh-csv-preview-table-wrap">
+                <table className="fh-csv-preview-table">
+                  <thead>
+                    <tr>
+                      <th>{copy.symbol}</th>
+                      <th>{copy.shares}</th>
+                      <th>{copy.avgCost}</th>
+                      <th>{copy.last}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {csvPreview.snapshot.holdings.slice(0, 12).map((item) => (
+                      <tr key={item.symbol}>
+                        <td><strong>{item.symbol}</strong> <small>{item.company}</small></td>
+                        <td>{item.quantity}</td>
+                        <td>{item.averageCost}</td>
+                        <td>{item.lastPrice}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          <div className="fh-csv-modal-actions">
+            <button type="button" className="fh-csv-cancel" onClick={resetImportModal}>{copy.cancel}</button>
+            <button
+              type="button"
+              className="fh-import-csv-button"
+              data-testid="csv-confirm-import"
+              disabled={!csvPreview || committing}
+              onClick={() => void handleConfirmCsvImport()}
+            >
+              {copy.confirmImport}
+            </button>
+          </div>
+        </Modal>
+      )}
     </main>
   );
 }

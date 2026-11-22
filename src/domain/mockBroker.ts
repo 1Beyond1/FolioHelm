@@ -29,7 +29,31 @@ import type {
   MockScenario,
   MockPreview,
   OrderDraft,
+  WorkspaceMode,
 } from "./contracts";
+import type { ImportedPortfolioSnapshot } from "./csvImport";
+
+export interface LocalPortfolioMeta {
+  id: string;
+  fingerprint: string;
+  sourceFormat: string;
+  sourceLabel: string;
+  importedAtUtc: string;
+  currency: string;
+  holdingsCount: number;
+  transactionsCount: number;
+  warnings: readonly string[];
+}
+
+export interface PublicQuoteUpdate {
+  symbol: string;
+  price: string;
+  change: string;
+  changePct: string;
+  asOfUtc: string;
+  provider: string;
+  delayed: boolean;
+}
 
 const AS_OF = "2026-08-10T16:00:00Z";
 const PREVIEW_EXPIRY_MS = 60_000;
@@ -567,11 +591,127 @@ function cloneOrder(order: BrokerOrder): BrokerOrder {
   };
 }
 
+function buildLocalSnapshotFromCsv(
+  imported: ImportedPortfolioSnapshot,
+  existingOrders: readonly BrokerOrder[] = [],
+  publicQuoteMap?: ReadonlyMap<string, PublicQuoteUpdate>,
+): BrokerSnapshot {
+  const quotes: BrokerQuote[] = [];
+  const seenSymbols = new Set<string>();
+
+  for (const holding of imported.holdings) {
+    seenSymbols.add(holding.symbol);
+    const livePublic = publicQuoteMap?.get(holding.symbol);
+    const unitPrice = price(livePublic ? livePublic.price : holding.lastPrice);
+    const dailyChange = price(livePublic ? livePublic.change : "0");
+    const changePct = livePublic
+      ? percent(livePublic.changePct)
+      : deriveChangePct(unitPrice, dailyChange);
+    quotes.push({
+      symbol: holding.symbol,
+      companyEn: holding.company || holding.symbol,
+      companyZh: holding.company || holding.symbol,
+      price: unitPrice,
+      change: dailyChange,
+      changePct,
+      asOf: livePublic ? livePublic.asOfUtc : imported.importedAtUtc,
+      status: "available",
+      source: livePublic ? "public-delayed" : "csv-import",
+      delayed: livePublic ? livePublic.delayed : true,
+      provider: livePublic ? livePublic.provider : imported.sourceFormat,
+    });
+  }
+
+  // Keep default watchlist quotes available for market browsing without mixing them into holdings.
+  for (const baseQuote of QUOTES) {
+    if (!seenSymbols.has(baseQuote.symbol)) {
+      const livePublic = publicQuoteMap?.get(baseQuote.symbol);
+      if (livePublic) {
+        quotes.push({
+          ...baseQuote,
+          price: price(livePublic.price),
+          change: price(livePublic.change),
+          changePct: percent(livePublic.changePct),
+          asOf: livePublic.asOfUtc,
+          status: "available",
+          source: "public-delayed",
+          delayed: livePublic.delayed,
+          provider: livePublic.provider,
+        });
+      }
+    }
+  }
+
+  const holdingSeeds: HoldingSeed[] = imported.holdings.map((item) => ({
+    symbol: item.symbol,
+    companyEn: item.company || item.symbol,
+    companyZh: item.company || item.symbol,
+    quantity: quantity(item.quantity),
+    availableQuantity: quantity(item.quantity),
+    averageCost: price(item.averageCost),
+  }));
+
+  const holdings = deriveHoldings(holdingSeeds, quotes);
+  const cashMoney = money(imported.cash);
+  const account = deriveAccountSummary(
+    {
+      accountKey: `local-csv-${imported.fingerprint.slice(0, 8)}`,
+      cash: cashMoney,
+      buyingPower: cashMoney,
+      totalEquity: ZERO_MONEY,
+      todayChange: ZERO_MONEY,
+      todayChangePct: percent("0"),
+      allTimeChange: ZERO_MONEY,
+      asOf: imported.importedAtUtc,
+      status: "available",
+    },
+    holdings,
+  );
+
+  // Use flat baseline points anchored to real imported total equity rather than fictional demo curves.
+  const flatSeries = (len: number): readonly Money[] =>
+    Array.from({ length: len }, () => account.totalEquity);
+  const emptyHeatmap = BASE_SNAPSHOT.heatmap.map((entry) => ({
+    ...entry,
+    status: "no-data" as const,
+    activityLevel: 0 as const,
+    actions: 0,
+    dailyReturnPct: null,
+    dailyReturnUsd: null,
+  }));
+
+  return {
+    mode: "local-csv",
+    account,
+    quotes,
+    holdings,
+    orders: [...existingOrders],
+    portfolioChart: {
+      "1D": flatSeries(10),
+      "1W": flatSeries(8),
+      "1M": flatSeries(10),
+      "6M": flatSeries(9),
+      "1Y": flatSeries(9),
+    },
+    heatmap: emptyHeatmap,
+    activeDays: 0,
+    ordersFilled: existingOrders.filter((o) => o.status === "filled").length,
+    yearNetChange: account.allTimeChange,
+  };
+}
+
 export class MockBroker implements BrokerAdapter {
   readonly id = "mock-broker";
-  readonly mode = "mock" as const;
   readonly capabilities = capabilities;
+  private workspaceMode: WorkspaceMode = "mock";
   private snapshot: BrokerSnapshot = BASE_SNAPSHOT;
+  private localImported: ImportedPortfolioSnapshot | null = null;
+  private localSnapshot: BrokerSnapshot | null = null;
+  private localMeta: LocalPortfolioMeta | null = null;
+  private publicQuotesEnabled = false;
+  private publicQuotes = new Map<string, PublicQuoteUpdate>();
+  private publicQuoteProvider: string | null = null;
+  private publicQuoteLastUpdatedUtc: string | null = null;
   private readonly previews = new Map<string, MockPreview>();
   private readonly previewIssuedAt = new Map<string, number>();
   private readonly listeners = new Set<() => void>();
@@ -580,8 +720,161 @@ export class MockBroker implements BrokerAdapter {
 
   constructor(private readonly clock: () => number = () => Date.now()) {}
 
+  get mode(): WorkspaceMode {
+    return this.workspaceMode;
+  }
+
+  getWorkspaceMode(): WorkspaceMode {
+    return this.workspaceMode;
+  }
+
+  hasLocalPortfolio(): boolean {
+    return this.localSnapshot !== null;
+  }
+
+  getLocalPortfolioMeta(): LocalPortfolioMeta | null {
+    return this.localMeta ? { ...this.localMeta, warnings: [...this.localMeta.warnings] } : null;
+  }
+
+  isPublicQuotesEnabled(): boolean {
+    return this.publicQuotesEnabled;
+  }
+
+  getPublicQuoteStatus(): {
+    enabled: boolean;
+    provider: string | null;
+    lastUpdatedUtc: string | null;
+    cachedCount: number;
+  } {
+    return {
+      enabled: this.publicQuotesEnabled,
+      provider: this.publicQuoteProvider,
+      lastUpdatedUtc: this.publicQuoteLastUpdatedUtc,
+      cachedCount: this.publicQuotes.size,
+    };
+  }
+
+  setPublicQuotesEnabled(enabled: boolean): void {
+    if (this.publicQuotesEnabled === enabled) return;
+    this.publicQuotesEnabled = enabled;
+    if (!enabled && this.localImported) {
+      // Revert local portfolio quotes cleanly to CSV-imported baseline prices.
+      this.localSnapshot = buildLocalSnapshotFromCsv(
+        this.localImported,
+        this.localSnapshot?.orders ?? [],
+      );
+    } else if (enabled && this.localImported && this.publicQuotes.size > 0) {
+      this.localSnapshot = buildLocalSnapshotFromCsv(
+        this.localImported,
+        this.localSnapshot?.orders ?? [],
+        this.publicQuotes,
+      );
+    }
+    this.notify();
+  }
+
+  applyPublicQuotes(updates: readonly PublicQuoteUpdate[], provider?: string): void {
+    if (updates.length === 0) return;
+    let latestTs = this.publicQuoteLastUpdatedUtc;
+    for (const item of updates) {
+      this.publicQuotes.set(item.symbol.toUpperCase(), {
+        ...item,
+        symbol: item.symbol.toUpperCase(),
+      });
+      if (!latestTs || item.asOfUtc > latestTs) latestTs = item.asOfUtc;
+    }
+    this.publicQuoteProvider = provider ?? updates[0]?.provider ?? this.publicQuoteProvider;
+    this.publicQuoteLastUpdatedUtc = latestTs;
+
+    if (this.publicQuotesEnabled && this.localImported) {
+      this.localSnapshot = buildLocalSnapshotFromCsv(
+        this.localImported,
+        this.localSnapshot?.orders ?? [],
+        this.publicQuotes,
+      );
+    }
+    this.notify();
+  }
+
+  setWorkspaceMode(mode: WorkspaceMode): void {
+    if (mode === "local-csv" && !this.localSnapshot) return;
+    if (this.workspaceMode === mode) return;
+    this.workspaceMode = mode;
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.notify();
+  }
+
+  applyLocalPortfolioSnapshot(
+    imported: ImportedPortfolioSnapshot,
+    options: { switchMode?: boolean } = {},
+  ): void {
+    this.localImported = imported;
+    this.localMeta = {
+      id: imported.id,
+      fingerprint: imported.fingerprint,
+      sourceFormat: imported.sourceFormat,
+      sourceLabel: imported.sourceLabel,
+      importedAtUtc: imported.importedAtUtc,
+      currency: imported.currency,
+      holdingsCount: imported.holdings.length,
+      transactionsCount: imported.transactions.length,
+      warnings: [...imported.warnings],
+    };
+    this.localSnapshot = buildLocalSnapshotFromCsv(
+      imported,
+      this.localSnapshot?.orders ?? [],
+      this.publicQuotesEnabled ? this.publicQuotes : undefined,
+    );
+    if (options.switchMode !== false) {
+      this.workspaceMode = "local-csv";
+    }
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.notify();
+  }
+
+  clearLocalPortfolio(): void {
+    this.localImported = null;
+    this.localSnapshot = null;
+    this.localMeta = null;
+    this.workspaceMode = "mock";
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.notify();
+  }
+
   getSnapshot(): BrokerSnapshot {
-    return cloneSnapshot(scenarioSnapshot(this.snapshot, this.scenario));
+    if (this.workspaceMode === "local-csv" && this.localSnapshot) {
+      return cloneSnapshot(this.localSnapshot);
+    }
+    const base = scenarioSnapshot(this.snapshot, this.scenario);
+    if (this.publicQuotesEnabled && this.publicQuotes.size > 0 && this.scenario === "healthy") {
+      const updatedQuotes = base.quotes.map((item) => {
+        const live = this.publicQuotes.get(item.symbol);
+        if (!live) return item;
+        return {
+          ...item,
+          price: price(live.price),
+          change: price(live.change),
+          changePct: percent(live.changePct),
+          asOf: live.asOfUtc,
+          source: "public-delayed" as const,
+          delayed: live.delayed,
+          provider: live.provider,
+        };
+      });
+      const updatedHoldings = deriveHoldings(base.holdings, updatedQuotes);
+      const updatedAccount = deriveAccountSummary(base.account, updatedHoldings);
+      return cloneSnapshot({
+        ...base,
+        quotes: updatedQuotes,
+        holdings: updatedHoldings,
+        account: updatedAccount,
+        yearNetChange: updatedAccount.allTimeChange,
+      });
+    }
+    return cloneSnapshot(base);
   }
 
   getScenario(): MockScenario {
@@ -611,7 +904,15 @@ export class MockBroker implements BrokerAdapter {
   }
 
   reset(): void {
+    this.workspaceMode = "mock";
     this.snapshot = BASE_SNAPSHOT;
+    this.localImported = null;
+    this.localSnapshot = null;
+    this.localMeta = null;
+    this.publicQuotesEnabled = false;
+    this.publicQuotes.clear();
+    this.publicQuoteProvider = null;
+    this.publicQuoteLastUpdatedUtc = null;
     this.previews.clear();
     this.previewIssuedAt.clear();
     this.sequence = 0;
@@ -620,7 +921,7 @@ export class MockBroker implements BrokerAdapter {
   }
 
   previewOrder(draft: OrderDraft): MockPreview {
-    const fault = scenarioError(this.scenario);
+    const fault = this.workspaceMode === "mock" ? scenarioError(this.scenario) : undefined;
     if (fault) throw fault;
 
     try {
@@ -650,7 +951,7 @@ export class MockBroker implements BrokerAdapter {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
     if (draft.side === "sell") {
-      if (this.scenario === "insufficient-quantity") {
+      if (this.workspaceMode === "mock" && this.scenario === "insufficient-quantity") {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
       const matchedHolding = snapshot.holdings.find((item) => item.symbol === draft.symbol);
@@ -680,7 +981,7 @@ export class MockBroker implements BrokerAdapter {
   }
 
   consumePreview(previewId: string, draftHash: string): BrokerOrder {
-    const fault = scenarioError(this.scenario);
+    const fault = this.workspaceMode === "mock" ? scenarioError(this.scenario) : undefined;
     if (fault) throw fault;
 
     const preview = this.previews.get(previewId);
@@ -693,9 +994,6 @@ export class MockBroker implements BrokerAdapter {
     }
     if (preview.draftHash !== draftHash) throw new Error("Mock preview does not match the current draft");
 
-    // The account and quote can change while a preview is on screen. Recheck
-    // the same local gates at consumption time so a stale preview cannot
-    // bypass a newly selected safety scenario or double-spend reserved funds.
     const snapshot = this.getSnapshot();
     const matchedQuote = snapshot.quotes.find((item) => item.symbol === preview.draft.symbol);
     if (!matchedQuote || matchedQuote.status !== "available") {
@@ -710,7 +1008,7 @@ export class MockBroker implements BrokerAdapter {
       throw new MockBrokerError("insufficient-buying-power", "Mock buying power is insufficient");
     }
     if (preview.draft.side === "sell") {
-      if (this.scenario === "insufficient-quantity") {
+      if (this.workspaceMode === "mock" && this.scenario === "insufficient-quantity") {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
       const matchedHolding = snapshot.holdings.find((item) => item.symbol === preview.draft.symbol);
@@ -721,12 +1019,13 @@ export class MockBroker implements BrokerAdapter {
     preview.status = "consumed";
     this.previewIssuedAt.delete(previewId);
 
-    const id = `MOCK-ORDER-${++this.sequence}`;
-    const unknown = this.scenario === "unknown" || this.scenario === "reconciliation-failed";
+    const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
+    const id = isLocalMode ? `PAPER-ORDER-${++this.sequence}` : `MOCK-ORDER-${++this.sequence}`;
+    const unknown = !isLocalMode && (this.scenario === "unknown" || this.scenario === "reconciliation-failed");
     const eventAt = nowIso(this.clock);
     const event = unknown
       ? orderEvent("unknown", eventAt, "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
-      : orderEvent("accepted", eventAt, "Accepted by the mock venue; no broker request exists", "模拟场所已接受；不存在券商请求");
+      : orderEvent("accepted", eventAt, "Accepted by the local paper ledger; no broker request exists", "本地纸上账本已接受；不存在券商请求");
     const order: BrokerOrder = {
       id,
       symbol: preview.draft.symbol,
@@ -738,53 +1037,72 @@ export class MockBroker implements BrokerAdapter {
       status: unknown ? "unknown" : "working",
       submittedAt: eventAt,
       events: [
-        orderEvent("draft", eventAt, "Created locally in Mock Broker", "在本地 Mock Broker 中创建"),
+        orderEvent("draft", eventAt, "Created locally in paper ledger", "在本地纸上账本中创建"),
         orderEvent("preview", eventAt, "Preview checked and consumed once", "已检查预览并且只消费一次"),
         event,
       ],
     };
 
+    const activeTarget = isLocalMode ? this.localSnapshot! : this.snapshot;
     const nextAccount: BrokerAccount = preview.draft.side === "buy"
       ? {
-          ...this.snapshot.account,
-          buyingPower: decimalCompare(this.snapshot.account.buyingPower, estimatedAmount) > 0
-            ? decimalSubtract(this.snapshot.account.buyingPower, estimatedAmount) as Money
+          ...activeTarget.account,
+          buyingPower: decimalCompare(activeTarget.account.buyingPower, estimatedAmount) > 0
+            ? decimalSubtract(activeTarget.account.buyingPower, estimatedAmount) as Money
             : ZERO_MONEY,
         }
-      : this.snapshot.account;
+      : activeTarget.account;
 
     const nextHoldings: readonly BrokerHolding[] = preview.draft.side === "sell"
-      ? this.snapshot.holdings.map((item) => {
+      ? activeTarget.holdings.map((item) => {
           if (item.symbol !== preview.draft.symbol) return item;
           const remaining = decimalCompare(item.availableQuantity, preview.draft.quantity) > 0
             ? decimalSubtract(item.availableQuantity, preview.draft.quantity) as Quantity
             : ZERO_QUANTITY;
           return { ...item, availableQuantity: remaining };
         })
-      : this.snapshot.holdings;
+      : activeTarget.holdings;
 
-    this.snapshot = {
-      ...this.snapshot,
+    const updatedTarget: BrokerSnapshot = {
+      ...activeTarget,
       account: nextAccount,
       holdings: nextHoldings,
-      orders: [order, ...this.snapshot.orders],
+      orders: [order, ...activeTarget.orders],
     };
+
+    if (isLocalMode) {
+      this.localSnapshot = updatedTarget;
+    } else {
+      this.snapshot = updatedTarget;
+    }
     this.notify();
     return cloneOrder(order);
   }
 
   reconcileOrder(orderId: string): BrokerOrder {
-    const order = this.snapshot.orders.find((item) => item.id === orderId);
+    const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
+    const target = isLocalMode ? this.localSnapshot! : this.snapshot;
+    const order = target.orders.find((item) => item.id === orderId);
     if (!order) throw new Error(`No mock order ${orderId}`);
     if (order.status !== "unknown") return cloneOrder(order);
-    if (this.scenario === "reconciliation-failed") throw new MockBrokerError("unknown-reconciliation", "Mock reconciliation failed; keep the order locked");
+    if (!isLocalMode && this.scenario === "reconciliation-failed") {
+      throw new MockBrokerError("unknown-reconciliation", "Mock reconciliation failed; keep the order locked");
+    }
 
     const reconciled: BrokerOrder = {
       ...order,
       status: "working",
       events: [...order.events, orderEvent("accepted", nowIso(this.clock), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
     };
-    this.snapshot = { ...this.snapshot, orders: this.snapshot.orders.map((item) => item.id === orderId ? reconciled : item) };
+    const nextTarget: BrokerSnapshot = {
+      ...target,
+      orders: target.orders.map((item) => item.id === orderId ? reconciled : item),
+    };
+    if (isLocalMode) {
+      this.localSnapshot = nextTarget;
+    } else {
+      this.snapshot = nextTarget;
+    }
     this.notify();
     return cloneOrder(reconciled);
   }

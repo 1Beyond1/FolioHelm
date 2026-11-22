@@ -1,9 +1,11 @@
+pub mod csv_import;
 pub mod evidence;
 pub mod storage;
 pub mod vault;
 
-use std::{path::Path, sync::Mutex};
+use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
+use csv_import::{parse_and_preview_csv, CsvCommitResultDto, CsvImportPreviewDto};
 use evidence::{
     AppendEvidenceRequest, EvidenceJournal, EvidenceVerificationDto, SignedEvidenceRecordDto,
 };
@@ -245,6 +247,81 @@ fn vault_load_setting(
 }
 
 #[tauri::command]
+fn csv_preview_import(
+    state: State<'_, VaultRuntimeState>,
+    raw_csv: String,
+    source_label: String,
+) -> Result<CsvImportPreviewDto, String> {
+    let mut preview =
+        parse_and_preview_csv(&raw_csv, &source_label, false).map_err(|error| error.to_string())?;
+    let already_imported = state.with_unlocked(|db, _| {
+        db.has_portfolio_fingerprint(&preview.snapshot.fingerprint)
+            .map_err(|error| error.to_string())
+    })?;
+    preview.already_imported = already_imported;
+    Ok(preview)
+}
+
+#[tauri::command]
+fn csv_commit_import(
+    state: State<'_, VaultRuntimeState>,
+    raw_csv: String,
+    source_label: String,
+) -> Result<CsvCommitResultDto, String> {
+    let preview =
+        parse_and_preview_csv(&raw_csv, &source_label, false).map_err(|error| error.to_string())?;
+    state.with_unlocked(|db, journal| {
+        let outcome = db
+            .save_portfolio_snapshot(&preview.snapshot)
+            .map_err(|error| error.to_string())?;
+        if outcome.deduplicated {
+            return Ok(CsvCommitResultDto {
+                deduplicated: true,
+                evidence_sequence: None,
+                snapshot: outcome.snapshot,
+            });
+        }
+
+        let fp_prefix: String = outcome.snapshot.fingerprint.chars().take(16).collect();
+        let (signed, dto) = journal
+            .prepare_append(AppendEvidenceRequest {
+                kind: "portfolio_import".to_string(),
+                payload: BTreeMap::from([
+                    ("mode".to_string(), "local-csv".to_string()),
+                    (
+                        "sourceFormat".to_string(),
+                        outcome.snapshot.source_format.clone(),
+                    ),
+                    (
+                        "holdingsCount".to_string(),
+                        outcome.snapshot.holdings.len().to_string(),
+                    ),
+                    (
+                        "transactionsCount".to_string(),
+                        outcome.snapshot.transactions.len().to_string(),
+                    ),
+                    ("currency".to_string(), outcome.snapshot.currency.clone()),
+                    ("fingerprintPrefix".to_string(), fp_prefix),
+                ]),
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                occurred_at_utc: None,
+                account_ref: Some("acct_local_csv".to_string()),
+                intent_id: Some(outcome.snapshot.id.clone()),
+            })
+            .map_err(|error| error.to_string())?;
+        db.insert_evidence_entry(&signed)
+            .map_err(|error| error.to_string())?;
+        journal.commit_prepared(signed);
+
+        Ok(CsvCommitResultDto {
+            deduplicated: false,
+            evidence_sequence: Some(dto.sequence),
+            snapshot: outcome.snapshot,
+        })
+    })
+}
+
+#[tauri::command]
 fn vault_clear_all(state: State<'_, VaultRuntimeState>) -> Result<bool, String> {
     state.with_unlocked(|db, journal| {
         db.clear_all_workspace_data()
@@ -293,6 +370,8 @@ pub fn run() {
             vault_load_paper_orders,
             vault_save_setting,
             vault_load_setting,
+            csv_preview_import,
+            csv_commit_import,
             vault_clear_all,
         ])
         .run(tauri::tauri_build_context!())

@@ -1,9 +1,12 @@
 import type { Money, Percent, Price, Quantity } from "./decimal";
 
-export type BrokerMode = "mock" | "offline" | "live-disabled";
+export type WorkspaceMode = "mock" | "local-csv";
+export type BrokerMode = "mock" | "local-csv" | "offline" | "live-disabled";
 export type DataStatus = "available" | "no-data" | "stale" | "error" | "offline" | "reauth-required";
+export type QuoteSourceKind = "mock" | "csv-import" | "public-delayed";
 
-export type BrokerSymbol = "AAPL" | "NVDA" | "MSFT" | "SPY" | "TSLA" | "AMD" | "AMZN";
+export type DefaultMockSymbol = "AAPL" | "NVDA" | "MSFT" | "SPY" | "TSLA" | "AMD" | "AMZN";
+export type BrokerSymbol = string;
 export type BrokerOrderStatus = "working" | "filled" | "canceled" | "rejected" | "unknown";
 export type BrokerOrderSide = "buy" | "sell";
 export type BrokerOrderType = "market" | "limit";
@@ -47,6 +50,9 @@ export interface BrokerQuote {
   changePct: Percent;
   asOf: string;
   status: DataStatus;
+  source?: QuoteSourceKind;
+  delayed?: boolean;
+  provider?: string;
 }
 
 export interface BrokerHolding {

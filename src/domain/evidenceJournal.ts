@@ -23,6 +23,7 @@ const EVIDENCE_KINDS = [
   "reconciliation",
   "automation_run",
   "safety_setting_changed",
+  "portfolio_import",
 ] as const;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const EVIDENCE_RECORD_KEYS = [
@@ -91,7 +92,8 @@ export type LocalEvidenceKind =
   | "state_changed"
   | "reconciliation"
   | "automation_run"
-  | "safety_setting_changed";
+  | "safety_setting_changed"
+  | "portfolio_import";
 
 export interface LocalEvidenceRecord {
   schemaVersion: number;

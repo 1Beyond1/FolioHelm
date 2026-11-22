@@ -21,6 +21,8 @@ import { TradePage } from "./features/trade";
 import { SettingsPage } from "./features/settings";
 import { AutomationPage } from "./features/automation";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "./domain/mockBroker";
+import { loadPersistedLocalPortfolio } from "./domain/csvImport";
+import { invokeVaultStatus, isTauriRuntime } from "./domain/tauriBridge";
 import type { MockScenario } from "./domain/contracts";
 
 function initialLocation(): AppLocation {
@@ -78,9 +80,12 @@ export function App() {
   const [location, setLocation] = useState<AppLocation>(initialLocation);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [storageWarning, setStorageWarning] = useState(() => hasStorageIssue() || !isStorageAvailable());
+  const [vaultLockedWarning, setVaultLockedWarning] = useState<string | null>(null);
   const [, setBrokerRevision] = useState(0);
   const copy = getCopy(language);
   const mockPortfolio = getMockPortfolio(language);
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const publicQuotesEnabled = MOCK_BROKER.isPublicQuotesEnabled();
   const dataStatus = aggregateDataStatus();
   const navigation: NavigationState = location.route === "trade"
     ? location.background ?? { route: "home" }
@@ -115,6 +120,37 @@ export function App() {
   useEffect(() => {
     return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return undefined;
+    let active = true;
+    void (async () => {
+      try {
+        const status = await invokeVaultStatus();
+        if (!active) return;
+        if (!status.unlocked) {
+          setVaultLockedWarning(
+            status.lockedReason
+              ?? (language === "zh"
+                ? "本地加密库已锁定：操作系统凭证密钥缺失或校验失败，已保留原密文并禁止覆盖。"
+                : "Encrypted local vault is locked: OS credential key missing or integrity check failed; existing ciphertext was preserved."),
+          );
+          return;
+        }
+        if (status.hasLocalPortfolio) {
+          const persisted = await loadPersistedLocalPortfolio();
+          if (active && persisted && !MOCK_BROKER.hasLocalPortfolio()) {
+            MOCK_BROKER.applyLocalPortfolioSnapshot(persisted, { switchMode: false });
+          }
+        }
+      } catch {
+        // Keep UI responsive; settings page surfaces explicit vault diagnostics.
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [language]);
 
   useEffect(() => {
     MOCK_BROKER.setScenario(mockScenario);
@@ -345,8 +381,13 @@ export function App() {
         onNavigate={navigate}
         onSearch={() => setSearchOpen(true)}
         dataStatus={dataStatus}
-        persistenceWarning={storageWarning ? copy.localStorageWarning : undefined}
-        onDismissPersistenceWarning={() => setStorageWarning(false)}
+        workspaceMode={workspaceMode}
+        publicQuotesEnabled={publicQuotesEnabled}
+        persistenceWarning={vaultLockedWarning ?? (storageWarning ? copy.localStorageWarning : undefined)}
+        onDismissPersistenceWarning={() => {
+          setVaultLockedWarning(null);
+          setStorageWarning(false);
+        }}
       >
         {dataStatus && <DataStateNotice language={language} status={dataStatus} />}
         {content}

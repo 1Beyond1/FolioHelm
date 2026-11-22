@@ -1,6 +1,7 @@
 import type { Copy } from "../i18n";
 import type { Language } from "../types";
 import type { AppRoute } from "../navigation";
+import type { WorkspaceMode } from "../domain/contracts";
 import type { DisplayDataStatus } from "./DataStateNotice";
 import { primaryRoute } from "../navigation";
 import { Icon } from "./Icons";
@@ -13,6 +14,7 @@ interface TopBarProps {
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
   dataStatus?: DisplayDataStatus | null;
+  workspaceMode?: WorkspaceMode;
 }
 
 function marketStatusLabel(language: Language, status: DisplayDataStatus | null | undefined, openLabel: string): string {
@@ -31,9 +33,21 @@ function marketStatusLabel(language: Language, status: DisplayDataStatus | null 
           : "Market data error";
 }
 
-export function TopBar({ copy, language, activeRoute, onLanguageChange, onNavigate, onSearch, dataStatus = null }: TopBarProps) {
+export function TopBar({
+  copy,
+  language,
+  activeRoute,
+  onLanguageChange,
+  onNavigate,
+  onSearch,
+  dataStatus = null,
+  workspaceMode = "mock",
+}: TopBarProps) {
   const activePrimaryRoute = primaryRoute(activeRoute);
   const degraded = dataStatus !== null;
+  const modeNotice = workspaceMode === "local-csv"
+    ? (language === "zh" ? "本地持仓 (CSV + 纸上模拟) · 无真实下单" : "Local Portfolio (CSV + Paper) · No live orders")
+    : copy.demoNotice;
 
   return (
     <header className="topbar">
@@ -75,7 +89,7 @@ export function TopBar({ copy, language, activeRoute, onLanguageChange, onNaviga
 
       <div className="topbar-status">
         <span className={`status-cluster ${degraded ? "is-degraded" : ""}`}><i />{marketStatusLabel(language, dataStatus, copy.marketOpen)}</span>
-        <span className="status-cluster demo-status" data-testid="demo-status"><i />{copy.demoNotice}</span>
+        <span className={`status-cluster demo-status ${workspaceMode === "local-csv" ? "is-local-portfolio" : ""}`} data-testid="demo-status"><i />{modeNotice}</span>
         <button className="account-menu" type="button" onClick={() => onNavigate("portfolio")}>
           {copy.account}
           <Icon name="chevron-down" />

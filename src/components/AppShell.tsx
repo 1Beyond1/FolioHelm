@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Copy } from "../i18n";
 import type { Language } from "../types";
 import type { AppRoute } from "../navigation";
+import type { WorkspaceMode } from "../domain/contracts";
 import type { DisplayDataStatus } from "./DataStateNotice";
 import { Footer } from "./Footer";
 import { SystemStatusBar } from "./SystemStatusBar";
@@ -15,6 +16,8 @@ interface AppShellProps {
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
   dataStatus?: DisplayDataStatus | null;
+  workspaceMode?: WorkspaceMode;
+  publicQuotesEnabled?: boolean;
   persistenceWarning?: string;
   onDismissPersistenceWarning?: () => void;
   children: ReactNode;
@@ -28,6 +31,8 @@ export function AppShell({
   onNavigate,
   onSearch,
   dataStatus = null,
+  workspaceMode = "mock",
+  publicQuotesEnabled = false,
   persistenceWarning,
   onDismissPersistenceWarning,
   children,
@@ -42,8 +47,14 @@ export function AppShell({
         onNavigate={onNavigate}
         onSearch={onSearch}
         dataStatus={dataStatus}
+        workspaceMode={workspaceMode}
       />
-      <SystemStatusBar copy={copy} dataStatus={dataStatus} />
+      <SystemStatusBar
+        copy={copy}
+        dataStatus={dataStatus}
+        workspaceMode={workspaceMode}
+        publicQuotesEnabled={publicQuotesEnabled}
+      />
       {persistenceWarning && (
         <section className="persistence-warning" role="alert">
           <span>{persistenceWarning}</span>
