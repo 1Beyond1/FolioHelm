@@ -14,7 +14,9 @@ import {
   decimalToMicros,
   mulDivRoundBigInt,
   NAV_STORE,
+  todayUtcIsoDate,
 } from "../../domain/nav";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "../../domain/sessionEpoch";
 import {
   clearPersistedLocalPortfolio,
   commitBrokerCsv,
@@ -35,14 +37,12 @@ import {
   type RebalanceMode,
 } from "../../domain/rebalance";
 import {
-  DEFAULT_WORKSPACE_PREFERENCES,
   loadEncryptedSetting,
-  normalizeWorkspacePreferences,
+  loadWorkspacePreferences,
   REBALANCE_TARGETS_SETTING_KEY,
   saveEncryptedSetting,
   saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
-  WORKSPACE_PREFS_KEY,
 } from "../../domain/vaultStorage";
 import { invokeDialogOpenCsvFile, isTauriRuntime } from "../../domain/tauriBridge";
 import { readStored } from "../../platform/storage";
@@ -118,8 +118,10 @@ function buildHoldings(language: Language): PortfolioHolding[] {
       : 0n;
     const weightPctStr = `${(weightBps / 100n).toString()}.${(weightBps % 100n).toString().padStart(2, "0")}`;
     const matchedQuote = snapshot.quotes.find(
-      (quote) => quote.symbol === holding.symbol && (quote.currency ?? "USD") === currency,
-    ) ?? snapshot.quotes.find((quote) => quote.symbol === holding.symbol);
+      (quote) =>
+        quote.symbol === holding.symbol
+        && (quote.currency ?? "USD").toUpperCase() === currency.toUpperCase(),
+    );
     return {
       symbol: holding.symbol,
       company: language === "zh" ? holding.companyZh : holding.companyEn,
@@ -529,13 +531,21 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const [selectedBenchmark, setSelectedBenchmark] = useState<string | null>(null);
   const [benchmarkLoading, setBenchmarkLoading] = useState(false);
   const [benchmarkNotice, setBenchmarkNotice] = useState<string | null>(null);
-  const localNavSnapshots = useMemo(
-    () => isLocalMode
-      ? aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeBucket.currency, selectedAccountId)
-      : [],
+  const [cfFormOpen, setCfFormOpen] = useState(false);
+  const [cfAccountId, setCfAccountId] = useState<string>(DEFAULT_ACCOUNT_ID);
+  const [cfDate, setCfDate] = useState<string>(() => todayUtcIsoDate());
+  const [cfAmount, setCfAmount] = useState<string>("");
+  const [cfNotice, setCfNotice] = useState<string | null>(null);
+  const navRevision = NAV_STORE.getRevision();
+  const localNavSnapshots = useMemo(() => {
+    if (!isLocalMode) return [];
+    try {
+      return aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeBucket.currency, selectedAccountId);
+    } catch {
+      return [];
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isLocalMode, activeBucket.currency, selectedAccountId, snapshot.account.asOf, NAV_STORE.getAllSnapshots().length],
-  );
+  }, [isLocalMode, activeBucket.currency, selectedAccountId, navRevision]);
 
   // CSV import modal + F2 target account selector state
   const [importOpen, setImportOpen] = useState(false);
@@ -602,11 +612,13 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     };
 
     const hydrateRebalanceAsync = async () => {
+      const epoch = getCurrentLockEpoch();
       const saved = await loadEncryptedSetting<PersistedRebalanceConfig | null>(
         rebalanceSettingKey,
         null,
         rebalanceLegacyKey,
       );
+      if (!isCurrentLockEpoch(epoch)) return;
       applySaved(saved);
     };
 
@@ -771,13 +783,22 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function handleRefreshPortfolioBenchmark(symbol: string) {
+    const epoch = getCurrentLockEpoch();
+    if (!MOCK_BROKER.isPublicQuotesEnabled()) {
+      setBenchmarkNotice(
+        chinese
+          ? `未开启「启用公开延迟行情」联网总开关：请先在设置页开启后再同步 ${symbol} 基准历史（当前不会发起任何联网请求）。`
+          : `Public delayed quotes are disabled in Settings; enable them first to fetch ${symbol} history (no network request was sent).`,
+      );
+      return;
+    }
     setBenchmarkLoading(true);
     setBenchmarkNotice(null);
     try {
-      const prefs = !isTauriRuntime()
-        ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES))
-        : DEFAULT_WORKSPACE_PREFERENCES;
+      const prefs = await loadWorkspacePreferences();
+      if (!isCurrentLockEpoch(epoch)) return;
       const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, prefs.quoteProvider);
+      if (!isCurrentLockEpoch(epoch)) return;
       if (outcome.degradedReason) {
         setBenchmarkNotice(
           outcome.series
@@ -790,9 +811,52 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         );
       }
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setBenchmarkNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      setBenchmarkLoading(false);
+      if (isCurrentLockEpoch(epoch)) {
+        setBenchmarkLoading(false);
+      }
+    }
+  }
+
+  async function handleSaveExternalCashFlow() {
+    const epoch = getCurrentLockEpoch();
+    setCfNotice(null);
+    const targetAcct = selectedAccountId !== ALL_ACCOUNTS_ID ? selectedAccountId : cfAccountId;
+    const trimmedAmt = cfAmount.trim();
+    if (!trimmedAmt || !/^[+-]?(?:\d+(?:\.\d{1,6})?|\.\d{1,6})$/.test(trimmedAmt)) {
+      setCfNotice(chinese ? "请输入有效的出入金金额（正数为入金，负数为出金）。" : "Enter a valid cash flow amount (positive deposit, negative withdrawal).");
+      return;
+    }
+    try {
+      const fallbackSnap = MOCK_BROKER.getAccountSnapshot(targetAcct);
+      const breakdown = fallbackSnap.account.currencyBreakdowns?.find(
+        (b) => b.currency.toUpperCase() === activeBucketCurrency.toUpperCase(),
+      );
+      const fallbackCash = breakdown ? decimalToMicros(breakdown.cash).toString() : "0";
+      const fallbackPos = breakdown ? decimalToMicros(breakdown.holdingsValue).toString() : "0";
+      const fallbackNet = breakdown ? decimalToMicros(breakdown.totalEquity).toString() : "0";
+      await NAV_STORE.recordExternalCashFlow({
+        date: cfDate,
+        accountId: targetAcct,
+        currency: activeBucketCurrency,
+        cashFlowDecimal: trimmedAmt,
+        fallbackNetValueMicros: fallbackNet,
+        fallbackCashMicros: fallbackCash,
+        fallbackPositionsMicros: fallbackPos,
+      });
+      if (!isCurrentLockEpoch(epoch)) return;
+      setCfAmount("");
+      setCfFormOpen(false);
+      setCfNotice(
+        chinese
+          ? `已记录 ${cfDate} 外部现金流 ${trimmedAmt} ${activeBucketCurrency}（后续自动快照将保留此现金流）。`
+          : `Recorded ${cfDate} external cash flow ${trimmedAmt} ${activeBucketCurrency} (preserved across future automatic snapshots).`,
+      );
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setCfNotice(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -823,6 +887,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function handleCreateAccountInline() {
+    const epoch = getCurrentLockEpoch();
     setNewAcctError(null);
     if (!newAcctName.trim()) {
       setNewAcctError(chinese ? "请输入账户名称（如 Schwab Taxable 或 Futu HK）。" : "Enter an account name (e.g. Schwab Taxable or Futu HK).");
@@ -835,6 +900,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         accountType: newAcctType,
         baseCurrency: newAcctCurrency,
       });
+      if (!isCurrentLockEpoch(epoch)) return;
       setTargetAccountId(created.id);
       setCreatingAccount(false);
       setNewAcctName("");
@@ -842,6 +908,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         await processCsvText(pendingRawCsv, pendingFileName || "imported.csv", created.id);
       }
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setNewAcctError(error instanceof Error ? error.message : String(error));
     }
   }
@@ -875,6 +942,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
 
   async function handleConfirmCsvImport() {
     if (!pendingRawCsv || !csvPreview) return;
+    const epoch = getCurrentLockEpoch();
     setCommitting(true);
     setCsvError(null);
     const targetAcct = ACCOUNT_STORE.getAccount(targetAccountId);
@@ -885,8 +953,10 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         targetAccountId,
         targetAcct?.name,
       );
+      if (!isCurrentLockEpoch(epoch)) return;
       MOCK_BROKER.applyLocalPortfolioSnapshot(result.snapshot, { switchMode: true });
       await saveWorkspacePreferences({ workspaceMode: "local-csv" });
+      if (!isCurrentLockEpoch(epoch)) return;
       setImportFeedback(
         result.deduplicated
           ? copy.importDeduplicated
@@ -894,6 +964,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       );
       resetImportModal();
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setCsvError(error instanceof Error ? error.message : String(error));
       setCommitting(false);
     }
@@ -1164,27 +1235,98 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             )}
           </div>
           {isLocalMode ? (
-            <RealNavChart
-              copy={appCopy}
-              language={language}
-              currency={activeBucketCurrency}
-              accountId={selectedAccountId}
-              accountLabel={selectedAccountLabel}
-              snapshots={localNavSnapshots}
-              selectedBenchmark={selectedBenchmark}
-              benchmarkSeries={selectedBenchmark ? NAV_STORE.getBenchmark(selectedBenchmark) : null}
-              benchmarkLoading={benchmarkLoading}
-              benchmarkNotice={benchmarkNotice}
-              onSelectBenchmark={(sym) => {
-                setSelectedBenchmark(sym);
-                setBenchmarkNotice(null);
-              }}
-              onRefreshBenchmark={(sym) => void handleRefreshPortfolioBenchmark(sym)}
-              allTimeChange={decimalToNumber(account.allTimeChange)}
-              isMultiCurrency={isMultiCurrency}
-              baselineTestId="portfolio-local-baseline"
-              compact
-            />
+            <>
+              <RealNavChart
+                copy={appCopy}
+                language={language}
+                currency={activeBucketCurrency}
+                accountId={selectedAccountId}
+                accountLabel={selectedAccountLabel}
+                snapshots={localNavSnapshots}
+                selectedBenchmark={selectedBenchmark}
+                benchmarkSeries={selectedBenchmark ? NAV_STORE.getBenchmark(selectedBenchmark) : null}
+                benchmarkLoading={benchmarkLoading}
+                benchmarkNotice={benchmarkNotice}
+                onSelectBenchmark={(sym) => {
+                  setSelectedBenchmark(sym);
+                  setBenchmarkNotice(null);
+                }}
+                onRefreshBenchmark={(sym) => void handleRefreshPortfolioBenchmark(sym)}
+                allTimeChange={decimalToNumber(account.allTimeChange)}
+                isMultiCurrency={isMultiCurrency}
+                baselineTestId="portfolio-local-baseline"
+                compact
+              />
+              <div className="fh-nav-cf-bar">
+                <button
+                  type="button"
+                  className="fh-rebalance-secondary"
+                  data-testid="nav-cashflow-toggle"
+                  onClick={() => {
+                    setCfFormOpen((open) => !open);
+                    setCfNotice(null);
+                    if (selectedAccountId !== ALL_ACCOUNTS_ID) {
+                      setCfAccountId(selectedAccountId);
+                    }
+                  }}
+                >
+                  {cfFormOpen
+                    ? (chinese ? "收起出入金记录" : "Hide cash flow")
+                    : (chinese ? `记录 ${activeBucketCurrency} 出入金 (CF)` : `Record ${activeBucketCurrency} cash flow`)}
+                </button>
+                {cfNotice && (
+                  <span className="fh-nav-cf-notice" role="status" data-testid="nav-cashflow-notice">
+                    {cfNotice}
+                  </span>
+                )}
+              </div>
+              {cfFormOpen && (
+                <div className="fh-nav-cf-form" data-testid="nav-cashflow-form">
+                  {selectedAccountId === ALL_ACCOUNTS_ID && (
+                    <label>
+                      <span>{chinese ? "账户" : "Account"}</span>
+                      <select
+                        data-testid="nav-cashflow-account"
+                        value={cfAccountId}
+                        onChange={(event) => setCfAccountId(event.target.value)}
+                      >
+                        {accounts.map((acct) => (
+                          <option key={acct.id} value={acct.id}>{acct.name}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  <label>
+                    <span>{chinese ? "日期" : "Date"}</span>
+                    <input
+                      type="date"
+                      data-testid="nav-cashflow-date"
+                      value={cfDate}
+                      onChange={(event) => setCfDate(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>{chinese ? `金额 (${activeBucketCurrency}，正入金/负出金)` : `Amount (${activeBucketCurrency}, +in / -out)`}</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      data-testid="nav-cashflow-amount"
+                      placeholder="e.g. 5000 or -1000"
+                      value={cfAmount}
+                      onChange={(event) => setCfAmount(event.target.value)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="fh-trade-button"
+                    data-testid="nav-cashflow-save"
+                    onClick={() => void handleSaveExternalCashFlow()}
+                  >
+                    {chinese ? "保存现金流" : "Save CF"}
+                  </button>
+                </div>
+              )}
+            </>
           ) : (
             <>
               <svg
@@ -1299,7 +1441,15 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                       aria-label={`${copy.trade} ${holding.symbol}`}
                       onClick={(event) => {
                         event.stopPropagation();
-                        onOpenTrade(holding.symbol);
+                        if (isLocalMode) {
+                          onOpenTrade(holding.symbol, {
+                            symbol: holding.symbol,
+                            currency: holding.currency,
+                            ...(selectedAccountId !== ALL_ACCOUNTS_ID ? { accountId: selectedAccountId } : {}),
+                          });
+                        } else {
+                          onOpenTrade(holding.symbol);
+                        }
                       }}
                     >
                       {copy.trade}
@@ -1542,6 +1692,10 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                                       side: suggestion.action === "sell" ? "sell" : "buy",
                                       quantity: suggestion.estimatedShares,
                                       orderType: "market",
+                                      currency: suggestion.currency,
+                                      ...(isLocalMode && selectedAccountId !== ALL_ACCOUNTS_ID
+                                        ? { accountId: selectedAccountId }
+                                        : {}),
                                     })
                                   }
                                 >

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Language } from "../../types";
 import { decimalToNumber } from "../../domain/decimal";
+import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "../../domain/accounts";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import { MOCK_BROKER, MockBrokerError } from "../../domain/mockBroker";
 import { persistPaperOrder } from "../../domain/vaultStorage";
@@ -26,6 +27,8 @@ export interface OrderTimelineEvent {
 
 export interface OrderRecord {
   id: string;
+  accountId?: string;
+  accountName?: string;
   symbol: string;
   side: OrderSide;
   type: OrderType;
@@ -43,24 +46,38 @@ const STATUS_KEYS: OrderStatus[] = ["working", "filled", "canceled", "rejected",
 function readOrders(language: Language): OrderRecord[] {
   const locale = language === "zh" ? "zh-CN" : "en-US";
   const snapshot = MOCK_BROKER.getSnapshot();
-  const currencyBySymbol = new Map(snapshot.quotes.map((q) => [q.symbol, q.currency ?? "USD"]));
-  return snapshot.orders.map((order) => ({
-    id: order.id,
-    symbol: order.symbol,
-    side: order.side === "buy" ? "Buy" : "Sell",
-    type: order.type === "market" ? "Market" : "Limit",
-    qty: decimalToNumber(order.quantity),
-    filled: decimalToNumber(order.filledQuantity),
-    limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
-    currency: order.currency ?? currencyBySymbol.get(order.symbol) ?? "USD",
-    status: order.status,
-    submitted: new Intl.DateTimeFormat(locale, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
-    timeline: order.events.map((event) => ({
-      kind: event.kind,
-      timestamp: new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
-      detail: language === "zh" ? event.detailZh : event.detailEn,
-    })),
-  }));
+  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
+  const currencyBySymbol = new Map<string, string>();
+  for (const q of snapshot.quotes) {
+    if (!currencyBySymbol.has(q.symbol)) {
+      currencyBySymbol.set(q.symbol, (q.currency ?? "USD").toUpperCase());
+    }
+  }
+  return snapshot.orders.map((order) => {
+    const resolvedAcctId = isLocalMode ? (order.accountId ?? DEFAULT_ACCOUNT_ID) : undefined;
+    const acctName = resolvedAcctId
+      ? (ACCOUNT_STORE.getAccount(resolvedAcctId)?.name ?? resolvedAcctId)
+      : undefined;
+    return {
+      id: order.id,
+      accountId: resolvedAcctId,
+      accountName: acctName,
+      symbol: order.symbol,
+      side: order.side === "buy" ? "Buy" : "Sell",
+      type: order.type === "market" ? "Market" : "Limit",
+      qty: decimalToNumber(order.quantity),
+      filled: decimalToNumber(order.filledQuantity),
+      limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
+      currency: (order.currency ?? currencyBySymbol.get(order.symbol) ?? "USD").toUpperCase(),
+      status: order.status,
+      submitted: new Intl.DateTimeFormat(locale, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
+      timeline: order.events.map((event) => ({
+        kind: event.kind,
+        timestamp: new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(event.at)),
+        detail: language === "zh" ? event.detailZh : event.detailEn,
+      })),
+    };
+  });
 }
 
 const COPY = {
@@ -190,7 +207,13 @@ export function OrdersPage({ language, onOpenTrade }: OrdersPageProps) {
   const [reconcileFeedback, setReconcileFeedback] = useState<ReconcileFeedback | null>(null);
 
   useEffect(() => {
-    return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
+    const bump = () => setBrokerRevision((current) => current + 1);
+    const unsubBroker = MOCK_BROKER.subscribe(bump);
+    const unsubAccounts = ACCOUNT_STORE.subscribe(bump);
+    return () => {
+      unsubBroker();
+      unsubAccounts();
+    };
   }, []);
 
   // Read the canonical local ledger on every render so a newly consumed Mock
@@ -439,7 +462,17 @@ function OrderRows({
             <span aria-hidden="true">{expanded ? "−" : "+"}</span>
           </button>
           <span className="fh-order-symbol">{order.symbol}</span>
-          <span className="fh-order-id">{order.id}</span>
+          <span className="fh-order-id">
+            {order.id}
+            {" · "}
+            <span data-testid={`order-currency-${order.id}`}>{order.currency}</span>
+            {order.accountName && (
+              <>
+                {" · "}
+                <span data-testid={`order-account-${order.id}`}>{order.accountName}</span>
+              </>
+            )}
+          </span>
         </th>
         <td>
           <span className={`fh-side-badge fh-side-${order.side.toLowerCase()}`}>{copy.sideValues[order.side]}</span>

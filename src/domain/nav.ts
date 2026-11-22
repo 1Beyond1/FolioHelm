@@ -16,7 +16,8 @@
 import { readStored, removeStored, writeStored } from "../platform/storage";
 import type { BrokerHeatmapEntry, BrokerOrder, BrokerSnapshot } from "./contracts";
 import { money, percent, type Money } from "./decimal";
-import { registerBrokerResetHook } from "./mockBroker";
+import { MOCK_BROKER, registerBrokerResetHook } from "./mockBroker";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
   invokeBenchmarkFetchHistory,
   invokeBenchmarkLoadCached,
@@ -289,8 +290,12 @@ export function aggregateNavSnapshotsByCurrency(
         const isFirstForAcct = !latestByAccount.has(acctId);
         const todayNet = parseMicrosString(today.netValueMicros);
         const todayCf = parseMicrosString(today.externalCashFlowMicros);
+        // P1-1: On an account's first date after `firstGlobalDate`, its ENTIRE opening NAV
+        // is external capital onboarding into the aggregate portfolio (even if the account
+        // also had a partial same-day cash flow), preventing pre-existing holdings from
+        // masquerading as fake investment gain.
         const effectiveCf = isFirstForAcct && date > firstGlobalDate
-          ? (todayCf === 0n ? todayNet : todayCf)
+          ? todayNet
           : todayCf;
         cfSum = assertI128Range(cfSum + effectiveCf);
         if (today.updatedAt > latestUpdated) latestUpdated = today.updatedAt;
@@ -323,7 +328,9 @@ export function aggregateNavSnapshotsByCurrency(
 }
 
 /**
- * Pure BigInt Time-Weighted Return (TWR) calculation: `(V_end - CF) / V_start`.
+ * Pure BigInt Time-Weighted Return (TWR) calculation (100% isomorphic to Rust `nav/mod.rs`):
+ * - Inflows (`CF > 0`, BOD convention): `sub_factor = V_end / (V_start + CF)`.
+ * - Outflows / zero CF (`CF <= 0`, EOD convention): `sub_factor = (V_end - CF) / V_start`.
  * Strictly refuses cross-currency (`MULTI`) inputs and NEVER fabricates points when `< 2`.
  */
 export function computeTwrSeries(
@@ -396,6 +403,16 @@ export function computeTwrSeries(
     if (vStart <= 0n) {
       subFactor = TWR_FACTOR_SCALE;
       dailyReturnPct = null;
+    } else if (cf > 0n) {
+      // Beginning-of-day inflow convention: capital base is `V_start + CF`.
+      const capitalBase = assertI128Range(vStart + cf);
+      if (vEnd <= 0n) {
+        subFactor = 0n;
+        dailyReturnPct = "-100.00";
+      } else {
+        subFactor = mulDivRoundBigInt(vEnd, TWR_FACTOR_SCALE, capitalBase);
+        dailyReturnPct = formatReturnPctFromFactor(subFactor);
+      }
     } else if (adjustedEnd <= 0n) {
       subFactor = 0n;
       dailyReturnPct = "-100.00";
@@ -468,23 +485,14 @@ export function computeBenchmarkTwrSeries(
     return best;
   };
 
-  const baseClose = findCloseOnOrBefore(dates[0]!);
-  if (baseClose === null || baseClose <= 0n) {
-    return {
-      symbol: benchmark.symbol,
-      currency: benchmark.currency,
-      provider: benchmark.provider,
-      asOfUtc: benchmark.asOfUtc,
-      alignedCount: 0,
-      cumulativeTwrPct: null,
-      points: [],
-    };
-  }
-
+  // P1-3: Anchor at the first common overlapping date where a benchmark close exists,
+  // so benchmarks starting after `dates[0]` still align cleanly from the common start date.
+  let baseClose: bigint | null = null;
   const aligned: BenchmarkTwrPoint[] = [];
   for (const date of dates) {
     const close = findCloseOnOrBefore(date);
-    if (close === null) continue;
+    if (close === null || close <= 0n) continue;
+    if (baseClose === null) baseClose = close;
     const factor = mulDivRoundBigInt(close, TWR_FACTOR_SCALE, baseClose);
     aligned.push({
       date,
@@ -595,6 +603,7 @@ export function buildCalendarHeatmapFromNav(
   orders: readonly BrokerOrder[],
   year?: number,
 ): {
+  year: number;
   entries: BrokerHeatmapEntry[];
   activeDays: number;
   ordersFilled: number;
@@ -602,6 +611,7 @@ export function buildCalendarHeatmapFromNav(
 } {
   const latestSnapDate = twr.points.length > 0 ? twr.points[twr.points.length - 1]!.date : null;
   const resolvedYear = year ?? (latestSnapDate ? Number(latestSnapDate.slice(0, 4)) : new Date().getUTCFullYear());
+  const resolvedYearPrefix = `${resolvedYear}-`;
 
   const twrByDate = new Map<string, TwrPoint>();
   for (const pt of twr.points) {
@@ -614,9 +624,8 @@ export function buildCalendarHeatmapFromNav(
     const orderCurr = (order.currency ?? "USD").toUpperCase();
     if (orderCurr !== twr.currency) continue;
     const dateKey = order.submittedAt.slice(0, 10);
-    if (isValidIsoDate(dateKey)) {
-      orderCountByDate.set(dateKey, (orderCountByDate.get(dateKey) ?? 0) + 1);
-    }
+    if (!isValidIsoDate(dateKey) || !dateKey.startsWith(resolvedYearPrefix)) continue;
+    orderCountByDate.set(dateKey, (orderCountByDate.get(dateKey) ?? 0) + 1);
     if (order.status === "filled") ordersFilled += 1;
   }
 
@@ -625,6 +634,7 @@ export function buildCalendarHeatmapFromNav(
   const start = new Date(Date.UTC(resolvedYear, 0, 1));
   const entries: BrokerHeatmapEntry[] = [];
   let activeDays = 0;
+  let yearPnlMicros = 0n;
 
   for (let idx = 0; idx < totalDays; idx += 1) {
     const dt = new Date(start);
@@ -650,17 +660,22 @@ export function buildCalendarHeatmapFromNav(
     const level = Math.min(4, actions) as 0 | 1 | 2 | 3 | 4;
 
     if (point && point.dailyReturnPct !== null && point.dailyPnlMicros !== null) {
+      const dailyPnl = parseMicrosString(point.dailyPnlMicros);
+      yearPnlMicros = assertI128Range(yearPnlMicros + dailyPnl);
       entries.push({
         date: iso,
         status: "available",
         activityLevel: level,
         actions,
         dailyReturnPct: percent(point.dailyReturnPct),
-        dailyReturnUsd: money(microsToDecimal(parseMicrosString(point.dailyPnlMicros), 2)),
+        dailyReturnUsd: money(microsToDecimal(dailyPnl, 2)),
       });
     } else {
       // Snapshot exists (day 0 baseline) or order activity without prior snapshot:
       // NEVER fabricate a fake daily return!
+      if (point && point.dailyPnlMicros !== null) {
+        yearPnlMicros = assertI128Range(yearPnlMicros + parseMicrosString(point.dailyPnlMicros));
+      }
       entries.push({
         date: iso,
         status: "no-data",
@@ -672,8 +687,8 @@ export function buildCalendarHeatmapFromNav(
     }
   }
 
-  const yearNetChange = money(microsToDecimal(parseMicrosString(twr.periodPnlMicros), 2));
-  return { entries, activeDays, ordersFilled, yearNetChange };
+  const yearNetChange = money(microsToDecimal(yearPnlMicros, 2));
+  return { year: resolvedYear, entries, activeDays, ordersFilled, yearNetChange };
 }
 
 export function todayUtcIsoDate(now = new Date()): string {
@@ -687,6 +702,7 @@ function navRecordKey(snap: Pick<NavSnapshotRecord, "date" | "accountId" | "curr
 class NavHistoryStore {
   private snapshots = new Map<string, NavSnapshotRecord>();
   private benchmarks = new Map<string, BenchmarkSeriesRecord>();
+  private revision = 0;
   private readonly listeners = new Set<() => void>();
 
   subscribe(listener: () => void): () => void {
@@ -694,7 +710,12 @@ class NavHistoryStore {
     return () => this.listeners.delete(listener);
   }
 
+  getRevision(): number {
+    return this.revision;
+  }
+
   private notify(): void {
+    this.revision += 1;
     for (const listener of [...this.listeners]) {
       try {
         listener();
@@ -702,6 +723,43 @@ class NavHistoryStore {
         // Ignore observer errors so state integrity is unaffected.
       }
     }
+  }
+
+  hasSnapshot(date: string, accountId: string, currency: string): boolean {
+    const key = navRecordKey({ date, accountId, currency });
+    return this.snapshots.has(key);
+  }
+
+  hasAnySnapshotForAccountCurrency(accountId: string, currency: string): boolean {
+    const upperCurr = currency.trim().toUpperCase();
+    for (const snap of this.snapshots.values()) {
+      if (snap.accountId === accountId && snap.currency.toUpperCase() === upperCurr) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  getSnapshot(date: string, accountId: string, currency: string): NavSnapshotRecord | null {
+    const found = this.snapshots.get(navRecordKey({ date, accountId, currency }));
+    return found ? { ...found } : null;
+  }
+
+  removeAccountSnapshots(accountId: string): void {
+    const trimmed = accountId.trim();
+    if (!trimmed) return;
+    let changed = false;
+    for (const [key, snap] of this.snapshots.entries()) {
+      if (snap.accountId === trimmed) {
+        this.snapshots.delete(key);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    if (!isTauriRuntime()) {
+      writeStored(BROWSER_NAV_KEY, this.getAllSnapshots());
+    }
+    this.notify();
   }
 
   getAllSnapshots(): NavSnapshotRecord[] {
@@ -763,17 +821,21 @@ class NavHistoryStore {
   }
 
   async hydrateFromVault(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     if (isTauriRuntime()) {
       const [rawSnaps, rawBenchmarks] = await Promise.all([
         invokeNavListSnapshots().catch(() => null),
         invokeBenchmarkLoadCached().catch(() => null),
       ]);
+      // P0-3 Fail-Closed: discard stale pre-lock hydration response if session locked mid-flight.
+      if (!isCurrentLockEpoch(epoch)) return;
       const snaps: NavSnapshotRecord[] = Array.isArray(rawSnaps) ? rawSnaps : [];
       const benches: BenchmarkSeriesRecord[] = Array.isArray(rawBenchmarks) ? rawBenchmarks : [];
       this.replaceAll(snaps, benches);
       return;
     }
 
+    if (!isCurrentLockEpoch(epoch)) return;
     const storedSnaps = readStored<unknown>(BROWSER_NAV_KEY, []);
     const storedBenches = readStored<unknown>(BROWSER_BENCHMARK_KEY, []);
     this.replaceAll(
@@ -786,6 +848,7 @@ class NavHistoryStore {
     incoming: readonly NavSnapshotRecord[],
     preserveExistingCf = true,
   ): Promise<NavSnapshotRecord[]> {
+    const epoch = getCurrentLockEpoch();
     if (incoming.length === 0) return [];
     const normalized: NavSnapshotRecord[] = [];
 
@@ -816,29 +879,88 @@ class NavHistoryStore {
           normalized as TauriStoredNavSnapshot[],
           preserveExistingCf,
         );
+        // P0-3 Fail-Closed: never repopulate JS RAM if locked while IPC was in flight.
+        if (!isCurrentLockEpoch(epoch)) return [];
         if (Array.isArray(persisted)) {
           for (const item of persisted) {
             this.snapshots.set(navRecordKey(item), item);
           }
         }
       } catch {
+        if (!isCurrentLockEpoch(epoch)) return [];
         // Keep in-memory state consistent; caller / vault status surfaces lock errors.
       }
     } else {
+      if (!isCurrentLockEpoch(epoch)) return [];
       writeStored(BROWSER_NAV_KEY, this.getAllSnapshots());
     }
 
+    if (!isCurrentLockEpoch(epoch)) return [];
     this.notify();
     return normalized;
+  }
+
+  /**
+   * Records or adjusts real external cash flow (deposit > 0, withdrawal < 0) on a concrete
+   * account + single-currency snapshot using pure BigInt micros, preserving existing valuation
+   * fields and persisting with `preserveExistingCf = false` so subsequent automatic snapshots
+   * retain the recorded cash flow (P1-1).
+   */
+  async recordExternalCashFlow(input: {
+    date: string;
+    accountId: string;
+    currency: string;
+    cashFlowDecimal: string;
+    fallbackNetValueMicros?: string;
+    fallbackCashMicros?: string;
+    fallbackPositionsMicros?: string;
+  }): Promise<NavSnapshotRecord | null> {
+    if (!isValidIsoDate(input.date)) {
+      throw new Error(`Invalid snapshot date: ${input.date}`);
+    }
+    const acctId = input.accountId.trim();
+    if (!acctId || acctId.toUpperCase() === "ALL") {
+      throw new Error("A concrete account ID is required to record external cash flow");
+    }
+    const curr = normalizeSingleCurrency(input.currency);
+    const cfMicros = decimalToMicros(input.cashFlowDecimal);
+    const existing = this.getSnapshot(input.date, acctId, curr);
+    const record: NavSnapshotRecord = {
+      date: input.date,
+      accountId: acctId,
+      currency: curr,
+      netValueMicros: existing?.netValueMicros ?? input.fallbackNetValueMicros ?? "0",
+      cashMicros: existing?.cashMicros ?? input.fallbackCashMicros ?? "0",
+      positionsMicros: existing?.positionsMicros ?? input.fallbackPositionsMicros ?? "0",
+      externalCashFlowMicros: cfMicros.toString(),
+      source: existing?.source || "manual",
+      updatedAt: new Date().toISOString(),
+    };
+    const saved = await this.recordSnapshots([record], false);
+    return saved[0] ?? null;
   }
 
   async syncBenchmarkHistory(
     rawSymbol: string,
     provider: PublicQuoteProviderChoice = "stooq",
   ): Promise<BenchmarkSyncOutcome> {
+    const epoch = getCurrentLockEpoch();
     const symbol = rawSymbol.trim().toUpperCase();
     if (!isAllowlistedBenchmark(symbol)) {
       throw new Error(`Benchmark ${symbol} is not in the read-only allowlist`);
+    }
+
+    // P1-6: Respect the master opt-in networking toggle ("Enable public delayed quotes").
+    // Never fire outbound HTTPS benchmark requests when public delayed quotes are disabled.
+    if (!MOCK_BROKER.isPublicQuotesEnabled()) {
+      const cached = this.getBenchmark(symbol);
+      return {
+        series: cached,
+        fromCache: true,
+        provider,
+        degradedReason:
+          "Public delayed quotes are disabled; enable them in Settings first to sync online benchmark history",
+      };
     }
 
     if (!isTauriRuntime()) {
@@ -855,6 +977,15 @@ class NavHistoryStore {
 
     try {
       const response: TauriBenchmarkFetchResponse = await invokeBenchmarkFetchHistory(symbol, provider);
+      // P0-3 Fail-Closed: discard stale benchmark fetch if locked while request was in flight.
+      if (!isCurrentLockEpoch(epoch)) {
+        return {
+          series: null,
+          fromCache: true,
+          provider: response.provider,
+          degradedReason: "Session locked",
+        };
+      }
       if (response.series) {
         this.benchmarks.set(symbol, {
           ...response.series,
@@ -870,6 +1001,14 @@ class NavHistoryStore {
         provider: response.provider,
       };
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) {
+        return {
+          series: null,
+          fromCache: true,
+          provider,
+          degradedReason: "Session locked",
+        };
+      }
       const cached = this.getBenchmark(symbol);
       return {
         series: cached,

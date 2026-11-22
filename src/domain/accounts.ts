@@ -17,13 +17,16 @@ import {
   ALL_ACCOUNTS_ID,
   DEFAULT_ACCOUNT_ID,
 } from "./accountAggregation";
-import { registerBrokerResetHook } from "./mockBroker";
+import { MOCK_BROKER, registerBrokerResetHook } from "./mockBroker";
+import { NAV_STORE } from "./nav";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
   invokeVaultDeleteAccount,
   invokeVaultListAccounts,
   invokeVaultSaveAccount,
   isTauriRuntime,
   type TauriStoredAccount,
+  type TauriStoredPaperOrder,
   type TauriStoredPortfolioSnapshot,
 } from "./tauriBridge";
 
@@ -31,6 +34,7 @@ export { aggregatePortfolioSnapshots, ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID };
 
 const BROWSER_ACCOUNTS_KEY = "local-accounts";
 const BROWSER_ACCOUNT_SNAPSHOTS_KEY = "local-account-portfolios";
+const BROWSER_LOCAL_ORDERS_KEY = "local-csv-paper-orders";
 
 export type AccountType = "taxable" | "ira" | "roth_ira" | "margin" | "cash" | "general";
 
@@ -224,6 +228,7 @@ class AccountStore {
     accountType: string;
     baseCurrency: string;
   }): Promise<BrokerAccountProfile> {
+    const epoch = getCurrentLockEpoch();
     const trimmedName = input.name.trim();
     if (!trimmedName) throw new Error("Account name is required");
     const existingIds = new Set(this.accounts.keys());
@@ -240,11 +245,14 @@ class AccountStore {
 
     if (isTauriRuntime()) {
       const saved = await invokeVaultSaveAccount(profile as TauriStoredAccount);
+      // P0-3 Fail-Closed: discard stale post-lock account mutation.
+      if (!isCurrentLockEpoch(epoch)) return saved;
       this.accounts.set(saved.id, saved);
       this.notify();
       return saved;
     }
 
+    if (!isCurrentLockEpoch(epoch)) return profile;
     this.accounts.set(profile.id, profile);
     this.persistBrowserState();
     this.notify();
@@ -252,26 +260,44 @@ class AccountStore {
   }
 
   async deleteAccount(accountId: string): Promise<boolean> {
-    if (accountId === DEFAULT_ACCOUNT_ID) return false;
+    const epoch = getCurrentLockEpoch();
+    const trimmed = accountId.trim();
+    if (!trimmed || trimmed === DEFAULT_ACCOUNT_ID) return false;
     if (isTauriRuntime()) {
-      const ok = await invokeVaultDeleteAccount(accountId);
+      const ok = await invokeVaultDeleteAccount(trimmed);
+      if (!isCurrentLockEpoch(epoch)) return false;
       if (!ok) return false;
     }
-    this.accounts.delete(accountId);
-    this.snapshotsByAccount.delete(accountId);
-    if (this.selectedAccountId === accountId) {
+    if (!isCurrentLockEpoch(epoch)) return false;
+    this.accounts.delete(trimmed);
+    this.snapshotsByAccount.delete(trimmed);
+    if (this.selectedAccountId === trimmed) {
       this.selectedAccountId = ALL_ACCOUNTS_ID;
     }
+    // P1-7: Synchronously purge deleted account's snapshots, paper orders, and NAV history
+    // across MOCK_BROKER, NAV_STORE, and browser localStorage.
+    MOCK_BROKER.removeLocalAccount(trimmed);
+    NAV_STORE.removeAccountSnapshots(trimmed);
     if (!isTauriRuntime()) {
       this.persistBrowserState();
+      const storedOrders = readStored<unknown>(BROWSER_LOCAL_ORDERS_KEY, []);
+      if (Array.isArray(storedOrders)) {
+        const remaining = (storedOrders as TauriStoredPaperOrder[]).filter(
+          (order) => (order?.accountId ?? DEFAULT_ACCOUNT_ID) !== trimmed,
+        );
+        writeStored(BROWSER_LOCAL_ORDERS_KEY, remaining);
+      }
     }
     this.notify();
     return true;
   }
 
   async hydrateAccountsFromVault(): Promise<BrokerAccountProfile[]> {
+    const epoch = getCurrentLockEpoch();
     if (isTauriRuntime()) {
       const raw = await invokeVaultListAccounts().catch(() => null);
+      // P0-3 Fail-Closed: discard stale pre-lock hydration if locked mid-flight.
+      if (!isCurrentLockEpoch(epoch)) return [];
       if (Array.isArray(raw) && raw.length > 0) {
         this.accounts.clear();
         for (const item of raw) {
@@ -283,6 +309,7 @@ class AccountStore {
       return this.getAccounts();
     }
 
+    if (!isCurrentLockEpoch(epoch)) return [];
     const storedAccounts = readStored<unknown>(BROWSER_ACCOUNTS_KEY, []);
     const storedSnapshots = readStored<unknown>(BROWSER_ACCOUNT_SNAPSHOTS_KEY, []);
     if (Array.isArray(storedAccounts) && storedAccounts.length > 0) {

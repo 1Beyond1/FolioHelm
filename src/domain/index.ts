@@ -6,4 +6,5 @@ export * from "./csvImport";
 export * from "./publicQuotes";
 export * from "./mockBroker";
 export * from "./rebalance";
+export * from "./sessionEpoch";
 export * from "./vaultStorage";

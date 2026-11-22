@@ -43,6 +43,7 @@ import {
   type VaultHydrationResult,
 } from "../../domain/vaultStorage";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "../../domain/sessionEpoch";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
 import { Modal } from "../../components/Modal";
 import "./SettingsPage.css";
@@ -614,9 +615,11 @@ export function SettingsPage({
 
   async function handleRefreshPublicQuotes(): Promise<void> {
     if (!publicQuotesEnabled || quoteRefreshing) return;
+    const epoch = getCurrentLockEpoch();
     setQuoteRefreshing(true);
     try {
       const result = await refreshPublicQuotes(quoteProvider);
+      if (!isCurrentLockEpoch(epoch)) return;
       if (result.fromCache) {
         setQuoteStatusMessage(copy.publicQuotesFallback(result.degradedReason ?? result.provider));
       } else {
@@ -628,9 +631,12 @@ export function SettingsPage({
         setQuoteStatusMessage(result.degradedReason ? `${base} · ${result.degradedReason}` : base);
       }
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setQuoteStatusMessage(copy.publicQuotesFallback(error instanceof Error ? error.message : String(error)));
     } finally {
-      setQuoteRefreshing(false);
+      if (isCurrentLockEpoch(epoch)) {
+        setQuoteRefreshing(false);
+      }
     }
   }
 

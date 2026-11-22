@@ -1,5 +1,12 @@
 import { MOCK_BROKER, type PublicQuoteUpdate } from "./mockBroker";
 import {
+  buildNavSnapshotsFromBrokerSnapshot,
+  NAV_STORE,
+  todayUtcIsoDate,
+  type NavSnapshotRecord,
+} from "./nav";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
+import {
   invokeDialogSaveFhvaultFile,
   invokeDialogSaveJsonFile,
   invokeQuotesFetchPublic,
@@ -30,6 +37,7 @@ export type SaveJsonOutcome =
 export async function refreshPublicQuotes(
   provider: PublicQuoteProviderChoice = "stooq",
 ): Promise<PublicQuoteRefreshResult> {
+  const epoch = getCurrentLockEpoch();
   if (!MOCK_BROKER.isPublicQuotesEnabled()) {
     throw new Error("Public delayed quotes are disabled; enable them explicitly first");
   }
@@ -38,6 +46,16 @@ export async function refreshPublicQuotes(
   const symbolSet = new Set<string>();
   for (const holding of snapshot.holdings) symbolSet.add(holding.symbol.toUpperCase());
   for (const quote of snapshot.quotes) symbolSet.add(quote.symbol.toUpperCase());
+  if (MOCK_BROKER.getWorkspaceMode() === "local-csv") {
+    for (const acctId of MOCK_BROKER.getLocalAccountIds()) {
+      try {
+        const acctSnap = MOCK_BROKER.getAccountSnapshot(acctId);
+        for (const holding of acctSnap.holdings) symbolSet.add(holding.symbol.toUpperCase());
+      } catch {
+        // Ignore single-account read errors while collecting symbol list.
+      }
+    }
+  }
   const symbols = [...symbolSet].slice(0, 50);
 
   if (symbols.length === 0) {
@@ -61,6 +79,17 @@ export async function refreshPublicQuotes(
   }
 
   const response = await invokeQuotesFetchPublic(symbols, provider);
+  // P0-3 Fail-Closed: discard stale pre-lock quote response if user/idle lock fired mid-flight.
+  if (!isCurrentLockEpoch(epoch)) {
+    return {
+      updatedCount: 0,
+      fromCache: true,
+      provider: response.provider,
+      asOfUtc: null,
+      degradedReason: "Session locked",
+    };
+  }
+
   const updates: PublicQuoteUpdate[] = response.quotes.map((item) => ({
     symbol: item.symbol,
     price: item.price,
@@ -72,14 +101,40 @@ export async function refreshPublicQuotes(
     delayed: item.delayed,
   }));
 
-  if (updates.length > 0) {
-    MOCK_BROKER.applyPublicQuotes(updates, response.provider);
-  }
-
   const latestAsOf = updates.reduce<string | null>(
     (latest, item) => (!latest || item.asOfUtc > latest ? item.asOfUtc : latest),
     null,
   );
+
+  if (updates.length > 0) {
+    MOCK_BROKER.applyPublicQuotes(updates, response.provider);
+
+    // P1-2: Record real mark-to-market `"quote-refresh"` NAV snapshots per concrete account
+    // whenever fresh delayed public quotes update a local CSV portfolio (protected by lockEpoch).
+    if (
+      !response.fromCache
+      && MOCK_BROKER.getWorkspaceMode() === "local-csv"
+      && MOCK_BROKER.hasLocalPortfolio()
+      && isCurrentLockEpoch(epoch)
+    ) {
+      const today = todayUtcIsoDate();
+      const updatedAt = latestAsOf ?? new Date().toISOString();
+      const navRecords: NavSnapshotRecord[] = [];
+      for (const acctId of MOCK_BROKER.getLocalAccountIds()) {
+        try {
+          const acctSnap = MOCK_BROKER.getAccountSnapshot(acctId);
+          navRecords.push(
+            ...buildNavSnapshotsFromBrokerSnapshot(acctSnap, acctId, today, "quote-refresh", updatedAt),
+          );
+        } catch {
+          // Skip invalid account without aborting quote refresh.
+        }
+      }
+      if (navRecords.length > 0 && isCurrentLockEpoch(epoch)) {
+        await NAV_STORE.recordSnapshots(navRecords, true).catch(() => undefined);
+      }
+    }
+  }
 
   return {
     updatedCount: updates.length,
@@ -91,8 +146,11 @@ export async function refreshPublicQuotes(
 }
 
 export async function hydrateCachedPublicQuotes(): Promise<number> {
+  const epoch = getCurrentLockEpoch();
   if (!isTauriRuntime()) return 0;
   const cached = await invokeQuotesLoadCached();
+  // P0-3 Fail-Closed: discard stale pre-lock cached quotes if locked mid-flight.
+  if (!isCurrentLockEpoch(epoch)) return 0;
   MOCK_BROKER.replacePublicQuotes(
     cached.map((item) => ({
       symbol: item.symbol,

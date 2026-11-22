@@ -10,6 +10,7 @@ interface InvestingHeatmapProps {
   activeDays: number;
   ordersFilled: number;
   netChange: number;
+  year?: number;
   currency?: string;
   isMultiCurrency?: boolean;
   localNavSummary?: {
@@ -44,6 +45,7 @@ export function InvestingHeatmap({
   activeDays,
   ordersFilled,
   netChange,
+  year,
   currency = "USD",
   isMultiCurrency = false,
   localNavSummary,
@@ -58,6 +60,9 @@ export function InvestingHeatmap({
   const displayCurrency = multiCurrency ? "USD" : (currency || "USD");
   const effectiveReturnUnit: ReturnUnit = multiCurrency ? "percent" : returnUnit;
   const currencyUnitLabel = displayCurrency === "USD" ? copy.usd : displayCurrency;
+  const displayYear = year !== undefined
+    ? String(year)
+    : (entries[0]?.date && /^\d{4}-/.test(entries[0].date) ? entries[0].date.slice(0, 4) : copy.year);
   const formattedNetChange = multiCurrency
     ? (language === "zh" ? "多币种隔离" : "Multi-currency")
     : formatSignedCurrency(netChange, language, displayCurrency);
@@ -136,7 +141,7 @@ export function InvestingHeatmap({
               )}
             </div>
           )}
-          <span className="year-label" aria-label={copy.year}>{copy.year}</span>
+          <span className="year-label" aria-label={displayYear}>{displayYear}</span>
         </div>
       </div>
 
@@ -189,16 +194,32 @@ export function InvestingHeatmap({
                 }
 
                 const displayValue = effectiveReturnUnit === "percent" ? entry.dailyReturnPct : entry.dailyReturnUsd;
-                const tone = entry.dataStatus !== "available" || entry.dailyReturnPct === null
+                const hasReturnData = entry.dataStatus === "available" && entry.dailyReturnPct !== null;
+                const hasActivity = entry.actions > 0 && entry.level > 0;
+                const tone = !hasReturnData
                   ? "neutral"
-                  : entry.dailyReturnPct > 0 ? "positive" : entry.dailyReturnPct < 0 ? "negative" : "neutral";
-                const level = entry.dataStatus === "available" ? (isReturnMode ? returnLevel(entry.dailyReturnPct) : entry.level) : 0;
+                  : entry.dailyReturnPct! > 0 ? "positive" : entry.dailyReturnPct! < 0 ? "negative" : "neutral";
+                // P1-5: In Activity mode, Day 0 baseline or order-only days with real activity MUST render
+                // their activity level consistently with `activeDays`, while Return mode stays strictly
+                // `level = 0` / `noData` whenever no prior-day return exists (never fabricating returns).
+                const level = isReturnMode
+                  ? (hasReturnData ? returnLevel(entry.dailyReturnPct) : 0)
+                  : (hasActivity ? entry.level : (entry.dataStatus === "available" ? entry.level : 0));
+                const isCellNoData = isReturnMode
+                  ? !hasReturnData
+                  : (!hasActivity && entry.dataStatus !== "available");
                 const date = formatHeatmapDate(entry.date, language);
-                const summary = entry.dataStatus !== "available" || displayValue === null
-                  ? `${date}: ${copy.noData}`
-                  : isReturnMode
-                    ? `${date}: ${effectiveReturnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language, displayCurrency)}`
-                    : `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`;
+                const summary = isReturnMode
+                  ? (!hasReturnData || displayValue === null
+                      ? `${date}: ${copy.noData}`
+                      : `${date}: ${effectiveReturnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language, displayCurrency)}`)
+                  : hasActivity
+                    ? (hasReturnData
+                        ? `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`
+                        : `${date}: ${actionLabel(entry.actions, copy)}`)
+                    : entry.dataStatus === "available"
+                      ? `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`
+                      : `${date}: ${copy.noData}`;
 
                 function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>): void {
                   let nextIndex = entryIndex;
@@ -227,7 +248,7 @@ export function InvestingHeatmap({
                       type="button"
                       tabIndex={entryIndex === focusIndex ? 0 : -1}
                       ref={(element) => { cellRefs.current[entryIndex] = element; }}
-                      className={`heat-cell ${entryIndex === 133 ? "featured" : ""} ${entry.dataStatus !== "available" ? "is-no-data" : ""}`}
+                      className={`heat-cell ${isCellNoData ? "is-no-data" : ""}`}
                       data-level={level}
                       data-return-sign={tone}
                       data-status={entry.dataStatus}
@@ -262,18 +283,20 @@ export function InvestingHeatmap({
             <>
               <span>{formatHeatmapDate(hoveredEntry.date, language)}</span>
               <strong>
-                {hoveredEntry.dataStatus !== "available"
-                  ? copy.noData
-                  : isReturnMode
-                    ? effectiveReturnUnit === "percent"
-                      ? formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)
-                      : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency)
-                    : actionLabel(hoveredEntry.actions, copy)}
+                {isReturnMode
+                  ? (hoveredEntry.dataStatus !== "available" || hoveredEntry.dailyReturnPct === null
+                      ? copy.noData
+                      : effectiveReturnUnit === "percent"
+                        ? formatSignedPercent(hoveredEntry.dailyReturnPct, language)
+                        : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency))
+                  : (hoveredEntry.actions > 0 || hoveredEntry.dataStatus === "available"
+                      ? actionLabel(hoveredEntry.actions, copy)
+                      : copy.noData)}
               </strong>
               <em>
-                {hoveredEntry.dataStatus !== "available"
+                {hoveredEntry.dataStatus !== "available" || hoveredEntry.dailyReturnPct === null
                   ? copy.noData
-                  : `${copy.portfolioTooltip} ${formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)}${(isReturnMode && effectiveReturnUnit === "percent") || multiCurrency ? "" : ` · ${formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency)}`}`}
+                  : `${copy.portfolioTooltip} ${formatSignedPercent(hoveredEntry.dailyReturnPct, language)}${(isReturnMode && effectiveReturnUnit === "percent") || multiCurrency ? "" : ` · ${formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency)}`}`}
               </em>
             </>
           )}

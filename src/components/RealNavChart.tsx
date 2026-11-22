@@ -60,6 +60,42 @@ function buildSvgLine(values: readonly number[], min: number, max: number): stri
     .join(" ");
 }
 
+function buildSparseSvgLine(
+  values: readonly (number | null)[],
+  min: number,
+  max: number,
+): string {
+  if (values.length === 0) return "";
+  const denom = Math.max(values.length - 1, 1);
+  const segments: string[] = [];
+  let started = false;
+  for (let idx = 0; idx < values.length; idx += 1) {
+    const val = values[idx];
+    if (val === null || !Number.isFinite(val)) continue;
+    const x = PAD_L + (idx / denom) * (PAD_R - PAD_L);
+    const y = toSvgY(val, min, max);
+    segments.push(`${started ? "L" : "M"} ${x.toFixed(2)} ${y.toFixed(2)}`);
+    started = true;
+  }
+  return segments.join(" ");
+}
+
+function safeMicrosToNumber(raw: string): number {
+  try {
+    return Number(microsToDecimal(parseMicrosString(raw), 2));
+  } catch {
+    return 0;
+  }
+}
+
+function safeParseMicros(raw: string): bigint {
+  try {
+    return parseMicrosString(raw);
+  } catch {
+    return 0n;
+  }
+}
+
 function buildSvgArea(linePath: string): string {
   if (!linePath) return "";
   return `${linePath} L ${PAD_R} ${PAD_B + 14} L ${PAD_L} ${PAD_B + 14} Z`;
@@ -95,27 +131,63 @@ export function RealNavChart({
     : null;
   const effectiveMode: "nav" | "twr" = effectiveBenchmark ? "twr" : chartMode;
 
-  const fullTwr = useMemo(
-    () => computeTwrSeries(snapshots, safeCurrency, accountId),
-    [accountId, safeCurrency, snapshots],
-  );
+  const fullTwrOutcome = useMemo(() => {
+    try {
+      return { series: computeTwrSeries(snapshots, safeCurrency, accountId), error: null as string | null };
+    } catch (error) {
+      return { series: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  }, [accountId, safeCurrency, snapshots]);
 
   const windowedSnapshots = useMemo(
     () => filterNavSnapshotsByPeriod(snapshots, period),
     [period, snapshots],
   );
 
-  const activeTwr = useMemo(
-    () => computeTwrSeries(windowedSnapshots, safeCurrency, accountId),
-    [accountId, safeCurrency, windowedSnapshots],
-  );
+  const activeTwrOutcome = useMemo(() => {
+    try {
+      return { series: computeTwrSeries(windowedSnapshots, safeCurrency, accountId), error: null as string | null };
+    } catch (error) {
+      return { series: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  }, [accountId, safeCurrency, windowedSnapshots]);
 
+  const fullTwr = fullTwrOutcome.series;
+  const activeTwr = activeTwrOutcome.series;
+  const displaySeries = activeTwr?.hasEnoughPoints ? activeTwr : fullTwr;
+
+  // P1-3: Align benchmark against the ACTUALLY displayed series (`displaySeries`), so falling
+  // back from a sparse period (e.g. `1W`) to `fullTwr` keeps the benchmark overlay visible!
   const benchmarkTwr: BenchmarkTwrSeriesResult | null = useMemo(() => {
-    if (!effectiveBenchmark || !benchmarkSeries || !activeTwr.hasEnoughPoints) return null;
+    if (!effectiveBenchmark || !benchmarkSeries || !displaySeries?.hasEnoughPoints) return null;
     if (benchmarkSeries.symbol.toUpperCase() !== effectiveBenchmark) return null;
-    const dates = activeTwr.points.map((pt) => pt.date);
-    return computeBenchmarkTwrSeries(dates, benchmarkSeries);
-  }, [activeTwr, benchmarkSeries, effectiveBenchmark]);
+    try {
+      const dates = displaySeries.points.map((pt) => pt.date);
+      return computeBenchmarkTwrSeries(dates, benchmarkSeries);
+    } catch {
+      return null;
+    }
+  }, [benchmarkSeries, displaySeries, effectiveBenchmark]);
+
+  // P1-10: Fault-isolated degraded card if any NAV record has corrupt micros/overflow.
+  if (!fullTwr || !displaySeries) {
+    return (
+      <div className={`hero-local-baseline ${compact ? "is-compact" : ""}`} data-testid="real-nav-degraded-notice" role="status">
+        <div className="nav-baseline-header">
+          <p className="hero-local-kicker">
+            {chinese ? "真实净值计算已降级保护" : "Real NAV analytics degraded safely"}
+            {accountLabel ? ` · ${accountLabel}` : ""}
+          </p>
+        </div>
+        <h2>
+          {chinese
+            ? `${safeCurrency} 币种桶存在异常净值快照，已隔离防崩溃`
+            : `Anomalous NAV snapshot detected in ${safeCurrency} bucket; isolated safely`}
+        </h2>
+        <p>{fullTwrOutcome.error ?? activeTwrOutcome.error ?? (chinese ? "请重新导入 CSV 或检查快照记录。" : "Re-import your CSV or review snapshot records.")}</p>
+      </div>
+    );
+  }
 
   // Honest < 2 snapshot gate: NEVER fabricate simulated curve points!
   if (!fullTwr.hasEnoughPoints) {
@@ -156,12 +228,11 @@ export function RealNavChart({
     );
   }
 
-  const displaySeries = activeTwr.hasEnoughPoints ? activeTwr : fullTwr;
   const points = displaySeries.points;
   const portfolioValues = points.map((pt) =>
     effectiveMode === "twr"
       ? Number(pt.cumulativeTwrPct)
-      : Number(microsToDecimal(parseMicrosString(pt.netValueMicros), 2)),
+      : safeMicrosToNumber(pt.netValueMicros),
   );
 
   const benchMap = new Map<string, number>();
@@ -171,28 +242,38 @@ export function RealNavChart({
     }
   }
   const hasAlignedBenchmark = effectiveMode === "twr" && benchMap.size >= 2;
-  const benchmarkValues = hasAlignedBenchmark
-    ? points.map((pt) => benchMap.get(pt.date) ?? 0)
+  // P1-3: Plot benchmark ONLY on dates covered from the first common overlapping date onward
+  // (never fabricate `0` values for earlier dates before benchmark history started).
+  const benchmarkSparseValues: (number | null)[] = hasAlignedBenchmark
+    ? points.map((pt) => (benchMap.has(pt.date) ? benchMap.get(pt.date)! : null))
     : [];
+  const benchmarkNumericValues = benchmarkSparseValues.filter((v): v is number => v !== null);
+  const benchmarkPartialStart =
+    hasAlignedBenchmark
+    && benchmarkTwr?.points[0]
+    && points[0]
+    && benchmarkTwr.points[0].date > points[0].date
+      ? benchmarkTwr.points[0].date
+      : null;
 
   const allYValues = hasAlignedBenchmark
-    ? [...portfolioValues, ...benchmarkValues]
+    ? [...portfolioValues, ...benchmarkNumericValues]
     : portfolioValues;
   const minVal = Math.min(...allYValues);
   const maxVal = Math.max(...allYValues);
   const linePath = buildSvgLine(portfolioValues, minVal, maxVal);
   const areaPath = buildSvgArea(linePath);
   const benchLinePath = hasAlignedBenchmark
-    ? buildSvgLine(benchmarkValues, minVal, maxVal)
+    ? buildSparseSvgLine(benchmarkSparseValues, minVal, maxVal)
     : "";
 
   const lastIdx = Math.max(points.length - 1, 0);
   const activeIdx = hoverIndex !== null ? Math.min(lastIdx, Math.max(0, hoverIndex)) : lastIdx;
   const activePoint = points[activeIdx]!;
-  const activeNavNum = Number(microsToDecimal(parseMicrosString(activePoint.netValueMicros), 2));
+  const activeNavNum = safeMicrosToNumber(activePoint.netValueMicros);
   const activeTwrNum = Number(activePoint.cumulativeTwrPct);
   const activeDailyPct = activePoint.dailyReturnPct !== null ? Number(activePoint.dailyReturnPct) : null;
-  const activeCfMicros = parseMicrosString(activePoint.externalCashFlowMicros);
+  const activeCfMicros = safeParseMicros(activePoint.externalCashFlowMicros);
   const activeBenchPct = hasAlignedBenchmark ? (benchMap.get(activePoint.date) ?? null) : null;
   const activeX = PAD_L + (activeIdx / Math.max(lastIdx, 1)) * (PAD_R - PAD_L);
   const activeY = toSvgY(portfolioValues[activeIdx] ?? 0, minVal, maxVal);
@@ -327,7 +408,7 @@ export function RealNavChart({
         </div>
       )}
 
-      {!activeTwr.hasEnoughPoints && period !== "ALL" && (
+      {!(activeTwr?.hasEnoughPoints) && period !== "ALL" && (
         <p className="real-nav-notice" role="status" data-testid="nav-window-fallback-notice">
           {chinese
             ? `窗口 ${period} 内真实快照少于 2 个，已自动展示全部 ${fullTwr.snapshotCount} 个真实快照日（不伪造插值点）。`
@@ -335,12 +416,16 @@ export function RealNavChart({
         </p>
       )}
 
-      {effectiveBenchmark && (benchmarkNotice || !hasAlignedBenchmark) && (
+      {effectiveBenchmark && (benchmarkNotice || !hasAlignedBenchmark || benchmarkPartialStart) && (
         <p className="real-nav-notice" role="status" data-testid="benchmark-status-notice">
           {benchmarkNotice
-            ?? (chinese
-              ? `本地尚无 ${effectiveBenchmark} 覆盖当前日期区间的缓存；可点击「同步 ${effectiveBenchmark}」拉取延迟只读历史行情（离线时优雅降级）。`
-              : `No local cached ${effectiveBenchmark} bars overlap this range yet. Click "Sync ${effectiveBenchmark}" for delayed read-only history (gracefully degrades offline).`)}
+            ?? (benchmarkPartialStart
+              ? (chinese
+                  ? `${effectiveBenchmark} 历史晚于组合首日，已自动从双方共同起始日 ${benchmarkPartialStart} 对齐基准收益。`
+                  : `${effectiveBenchmark} history starts later than your portfolio; aligned from common start date ${benchmarkPartialStart}.`)
+              : (chinese
+                  ? `本地尚无 ${effectiveBenchmark} 覆盖当前日期区间的缓存；可点击「同步 ${effectiveBenchmark}」拉取延迟只读历史行情（离线时优雅降级）。`
+                  : `No local cached ${effectiveBenchmark} bars overlap this range yet. Click "Sync ${effectiveBenchmark}" for delayed read-only history (gracefully degrades offline).`))}
         </p>
       )}
 
