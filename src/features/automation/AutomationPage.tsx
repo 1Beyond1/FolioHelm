@@ -10,6 +10,7 @@ import {
 } from "../../domain/automation";
 import { decimalCompare, money, price, quantity, decimalToNumber, type Money } from "../../domain/decimal";
 import { findMockQuote, MOCK_BROKER } from "../../domain/mockBroker";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "../../domain/sessionEpoch";
 import { isTauriRuntime } from "../../domain/tauriBridge";
 import {
   AUTOMATION_SETTING_KEY,
@@ -265,16 +266,17 @@ export function AutomationPage({ language }: AutomationPageProps) {
   useEffect(() => {
     if (!isTauriRuntime()) return undefined;
     let active = true;
+    const epoch = getCurrentLockEpoch();
     void loadEncryptedSetting<unknown>(AUTOMATION_SETTING_KEY, null, "automation")
       .then((loaded) => {
-        if (!active) return;
+        if (!active || !isCurrentLockEpoch(epoch)) return;
         if (loaded !== null) {
           AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(loaded));
         }
         hydratedRef.current = true;
       })
       .catch(() => {
-        if (active) hydratedRef.current = true;
+        if (active && isCurrentLockEpoch(epoch)) hydratedRef.current = true;
       });
     return () => {
       active = false;

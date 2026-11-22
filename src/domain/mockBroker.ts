@@ -672,12 +672,16 @@ function cloneOrder(order: BrokerOrder): BrokerOrder {
   };
 }
 
-function buyingPowerForCurrency(account: BrokerAccount, currency: string): Money {
-  if (account.isMultiCurrency && account.currencyBreakdowns) {
-    const match = account.currencyBreakdowns.find((item) => item.currency === currency);
+export function buyingPowerForCurrency(account: BrokerAccount, currency: string): Money {
+  const normalizedCurrency = currency.trim().toUpperCase() || "USD";
+  if (account.isMultiCurrency) {
+    const match = account.currencyBreakdowns?.find(
+      (item) => item.currency.toUpperCase() === normalizedCurrency,
+    );
     return match ? match.buyingPower : ZERO_MONEY;
   }
-  return account.buyingPower;
+  const accountCurrency = (account.currency ?? "USD").trim().toUpperCase() || "USD";
+  return accountCurrency === normalizedCurrency ? account.buyingPower : ZERO_MONEY;
 }
 
 function deriveLocalCurrencies(imported: ImportedPortfolioSnapshot): string[] {
@@ -719,7 +723,7 @@ function applyOpenOrderReservations(
     if (decimalCompare(openQty, ZERO_QUANTITY) <= 0) continue;
 
     const matchedQuote = matchQuote(quotes, order.symbol, order.currency);
-    const orderCurrency = order.currency ?? matchedQuote?.currency ?? nextAccount.currency ?? "USD";
+    const orderCurrency = (order.currency ?? matchedQuote?.currency ?? nextAccount.currency ?? "USD").toUpperCase();
 
     if (order.side === "buy") {
       const unitPrice = order.limitPrice ?? matchedQuote?.price ?? ZERO_PRICE;
@@ -729,7 +733,7 @@ function applyOpenOrderReservations(
         nextAccount = {
           ...nextAccount,
           currencyBreakdowns: nextAccount.currencyBreakdowns.map((item) => {
-            if (item.currency !== orderCurrency) return item;
+            if (item.currency.toUpperCase() !== orderCurrency) return item;
             return {
               ...item,
               buyingPower: decimalCompare(item.buyingPower, reserved) > 0
@@ -739,7 +743,7 @@ function applyOpenOrderReservations(
           }),
         };
       }
-      if (!nextAccount.isMultiCurrency && orderCurrency === (nextAccount.currency ?? "USD")) {
+      if (!nextAccount.isMultiCurrency && orderCurrency === (nextAccount.currency ?? "USD").toUpperCase()) {
         nextAccount = {
           ...nextAccount,
           buyingPower: decimalCompare(nextAccount.buyingPower, reserved) > 0

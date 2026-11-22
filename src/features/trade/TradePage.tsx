@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
-import { decimalCompare, decimalMultiply, decimalToNumber, money, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
-import { findHoldingInSnapshot, findQuoteInSnapshot, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
+import { decimalCompare, decimalMultiply, decimalToNumber, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
+import { buyingPowerForCurrency, findHoldingInSnapshot, findQuoteInSnapshot, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
 import { ACCOUNT_STORE, ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID } from "../../domain/accounts";
 import { buildNavSnapshotsFromBrokerSnapshot, NAV_STORE, todayUtcIsoDate } from "../../domain/nav";
 import { appendEvidence } from "../../domain/evidenceJournal";
@@ -407,9 +407,7 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
 
   const currentQuote = getTradeQuote(demoSnapshot, symbol, language, effectivePreferredCurrency);
   const quoteCurrency = currentQuote.currency;
-  const demoBuyingPower: Money = demoSnapshot.account.isMultiCurrency && demoSnapshot.account.currencyBreakdowns
-    ? (demoSnapshot.account.currencyBreakdowns.find((b) => b.currency === quoteCurrency)?.buyingPower ?? money("0"))
-    : demoSnapshot.account.buyingPower;
+  const demoBuyingPower: Money = buyingPowerForCurrency(demoSnapshot.account, quoteCurrency);
 
   const badgeText = isLocalMode
     ? (chinese ? "本地持仓 · 纸上模拟" : "Local CSV + Paper")

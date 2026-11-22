@@ -35,6 +35,7 @@ export { aggregatePortfolioSnapshots, ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID };
 const BROWSER_ACCOUNTS_KEY = "local-accounts";
 const BROWSER_ACCOUNT_SNAPSHOTS_KEY = "local-account-portfolios";
 const BROWSER_LOCAL_ORDERS_KEY = "local-csv-paper-orders";
+const BROWSER_LEGACY_PORTFOLIO_KEY = "local-csv-portfolio";
 
 export type AccountType = "taxable" | "ira" | "roth_ira" | "margin" | "cash" | "general";
 
@@ -280,6 +281,15 @@ class AccountStore {
     NAV_STORE.removeAccountSnapshots(trimmed);
     if (!isTauriRuntime()) {
       this.persistBrowserState();
+      const remainingSnapshots = this.getAllAccountSnapshots();
+      if (remainingSnapshots.length === 0) {
+        removeStored(BROWSER_LEGACY_PORTFOLIO_KEY);
+      } else {
+        const legacy = readStored<TauriStoredPortfolioSnapshot | null>(BROWSER_LEGACY_PORTFOLIO_KEY, null);
+        if (legacy && (legacy.accountId?.trim() || DEFAULT_ACCOUNT_ID) === trimmed) {
+          writeStored(BROWSER_LEGACY_PORTFOLIO_KEY, remainingSnapshots[0]);
+        }
+      }
       const storedOrders = readStored<unknown>(BROWSER_LOCAL_ORDERS_KEY, []);
       if (Array.isArray(storedOrders)) {
         const remaining = (storedOrders as TauriStoredPaperOrder[]).filter(
