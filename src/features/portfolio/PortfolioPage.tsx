@@ -1,8 +1,20 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import type { Language } from "../../types";
 import type { TradePrefill } from "../../domain/contracts";
-import { decimalToNumber, price as toPrice } from "../../domain/decimal";
+import { decimalToNumber, money as toMoney } from "../../domain/decimal";
+import {
+  ACCOUNT_PRESETS,
+  ACCOUNT_STORE,
+  ALL_ACCOUNTS_ID,
+  DEFAULT_ACCOUNT_ID,
+} from "../../domain/accounts";
 import { MOCK_BROKER } from "../../domain/mockBroker";
+import {
+  aggregateNavSnapshotsByCurrency,
+  decimalToMicros,
+  mulDivRoundBigInt,
+  NAV_STORE,
+} from "../../domain/nav";
 import {
   clearPersistedLocalPortfolio,
   commitBrokerCsv,
@@ -14,22 +26,30 @@ import {
   buildCurrentTargetWeights,
   buildEqualTargetWeights,
   calculateRebalancePlan,
+  computeCurrencyBucketAllocation,
+  extractCurrencyBuckets,
   REBALANCE_CASH_SYMBOL,
+  type CurrencyBucketView,
   type PersistedRebalanceConfig,
   type RebalanceHoldingInput,
   type RebalanceMode,
 } from "../../domain/rebalance";
 import {
+  DEFAULT_WORKSPACE_PREFERENCES,
   loadEncryptedSetting,
+  normalizeWorkspacePreferences,
   REBALANCE_TARGETS_SETTING_KEY,
   saveEncryptedSetting,
   saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
+  WORKSPACE_PREFS_KEY,
 } from "../../domain/vaultStorage";
 import { invokeDialogOpenCsvFile, isTauriRuntime } from "../../domain/tauriBridge";
 import { readStored } from "../../platform/storage";
 import { DataStateNotice } from "../../components/DataStateNotice";
 import { Modal } from "../../components/Modal";
+import { RealNavChart } from "../../components/RealNavChart";
+import { getCopy } from "../../i18n";
 import { formatCurrency, formatSignedCurrency } from "../../formatters";
 import "./portfolio.css";
 
@@ -79,17 +99,24 @@ const CASH_SLICE_COLOR = "#777873";
 function buildHoldings(language: Language): PortfolioHolding[] {
   const snapshot = MOCK_BROKER.getSnapshot();
   const isMultiCurrency = Boolean(snapshot.account.isMultiCurrency);
-  const totalEquity = decimalToNumber(snapshot.account.totalEquity);
+  const totalEquityMicros = decimalToMicros(snapshot.account.totalEquity);
   const breakdownByCurrency = new Map(
-    (snapshot.account.currencyBreakdowns ?? []).map((item) => [item.currency, decimalToNumber(item.totalEquity)]),
+    (snapshot.account.currencyBreakdowns ?? []).map((item) => [
+      item.currency,
+      decimalToMicros(item.totalEquity),
+    ]),
   );
 
   return snapshot.holdings.map((holding) => {
     const currency = holding.currency ?? snapshot.account.currency ?? "USD";
-    const marketValue = decimalToNumber(holding.marketValue);
-    const denominator = isMultiCurrency
-      ? (breakdownByCurrency.get(currency) ?? 0)
-      : totalEquity;
+    const mvMicros = decimalToMicros(holding.marketValue);
+    const denomMicros = isMultiCurrency
+      ? (breakdownByCurrency.get(currency) ?? 0n)
+      : totalEquityMicros;
+    const weightBps = denomMicros > 0n && mvMicros > 0n
+      ? mulDivRoundBigInt(mvMicros, 10_000n, denomMicros)
+      : 0n;
+    const weightPctStr = `${(weightBps / 100n).toString()}.${(weightBps % 100n).toString().padStart(2, "0")}`;
     const matchedQuote = snapshot.quotes.find(
       (quote) => quote.symbol === holding.symbol && (quote.currency ?? "USD") === currency,
     ) ?? snapshot.quotes.find((quote) => quote.symbol === holding.symbol);
@@ -100,73 +127,42 @@ function buildHoldings(language: Language): PortfolioHolding[] {
       shares: decimalToNumber(holding.quantity),
       avgCost: decimalToNumber(holding.averageCost),
       last: decimalToNumber(matchedQuote?.price ?? holding.averageCost),
-      marketValue,
+      marketValue: decimalToNumber(holding.marketValue),
       dayPnl: decimalToNumber(holding.dayPnl),
       totalPnl: decimalToNumber(holding.totalPnl),
-      weight: denominator > 0 ? (marketValue / denominator) * 100 : 0,
+      weight: Number(weightPctStr),
     };
   });
 }
 
-function buildAllocation(language: Language): AllocationSegment[] {
-  const snapshot = MOCK_BROKER.getSnapshot();
+function buildAllocationForBucket(
+  bucket: CurrencyBucketView | undefined,
+  language: Language,
+): AllocationSegment[] {
   const cashLabel = language === "zh" ? "现金" : "Cash";
   const otherLabel = language === "zh" ? "其他持仓" : "Other";
-  if (snapshot.account.isMultiCurrency) {
-    return [];
-  }
-
-  const totalEquity = decimalToNumber(snapshot.account.totalEquity);
-  if (totalEquity <= 0 || snapshot.holdings.length === 0) {
+  if (!bucket) {
     return [{ label: cashLabel, value: 100, color: CASH_SLICE_COLOR }];
   }
-
-  const sorted = [...snapshot.holdings]
-    .map((holding) => ({
-      symbol: holding.symbol,
-      value: Math.max(0, decimalToNumber(holding.marketValue)),
-    }))
-    .filter((item) => item.value > 0)
-    .sort((left, right) => right.value - left.value);
-
-  const segments: AllocationSegment[] = [];
-  const top = sorted.slice(0, 6);
-  const rest = sorted.slice(6);
-
-  top.forEach((item, index) => {
-    const pct = Math.max(0, Math.min(100, (item.value / totalEquity) * 100));
-    if (pct > 0) {
-      segments.push({
-        label: item.symbol,
-        value: pct,
-        color: SLICE_PALETTE[index % SLICE_PALETTE.length]!,
-      });
-    }
+  const result = computeCurrencyBucketAllocation(
+    bucket.holdings,
+    bucket.cash,
+    bucket.currency,
+    { cashLabel, otherLabel },
+  );
+  let holdingColorIdx = 0;
+  return result.slices.map((slice) => {
+    const color = slice.isCash
+      ? CASH_SLICE_COLOR
+      : slice.isOther
+        ? SLICE_PALETTE[6]
+        : SLICE_PALETTE[holdingColorIdx++ % (SLICE_PALETTE.length - 1)]!;
+    return {
+      label: slice.label,
+      value: decimalToNumber(slice.weightPct),
+      color,
+    };
   });
-
-  if (rest.length > 0) {
-    const restSum = rest.reduce((acc, item) => acc + item.value, 0);
-    const restPct = Math.max(0, Math.min(100, (restSum / totalEquity) * 100));
-    if (restPct > 0) {
-      segments.push({
-        label: `${otherLabel} (${rest.length})`,
-        value: restPct,
-        color: SLICE_PALETTE[6],
-      });
-    }
-  }
-
-  const cashValue = Math.max(0, decimalToNumber(snapshot.account.cash));
-  const cashPct = Math.max(0, Math.min(100, (cashValue / totalEquity) * 100));
-  if (cashPct > 0.05) {
-    segments.push({
-      label: cashLabel,
-      value: cashPct,
-      color: CASH_SLICE_COLOR,
-    });
-  }
-
-  return segments.length > 0 ? segments : [{ label: cashLabel, value: 100, color: CASH_SLICE_COLOR }];
 }
 
 const COPY = {
@@ -473,8 +469,20 @@ function reconcileWeights(
 
 export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: PortfolioPageProps) {
   const copy = COPY[language];
+  const chinese = language === "zh";
+  const appCopy = getCopy(language);
   const [, setBrokerTick] = useState(0);
-  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+  useEffect(() => {
+    const bump = () => setBrokerTick((v) => v + 1);
+    const unsubBroker = MOCK_BROKER.subscribe(bump);
+    const unsubAccounts = ACCOUNT_STORE.subscribe(bump);
+    const unsubNav = NAV_STORE.subscribe(bump);
+    return () => {
+      unsubBroker();
+      unsubAccounts();
+      unsubNav();
+    };
+  }, []);
 
   const workspaceMode = MOCK_BROKER.getWorkspaceMode();
   const isLocalMode = workspaceMode === "local-csv";
@@ -492,6 +500,44 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     direction: SortDirection;
   }>({ key: "marketValue", direction: "desc" });
 
+  // F2: Multi-account state
+  const accounts = ACCOUNT_STORE.getAccounts();
+  const selectedAccountId = MOCK_BROKER.getSelectedAccountId();
+  const selectedAccountLabel = selectedAccountId === ALL_ACCOUNTS_ID
+    ? (chinese ? `全部账户 (${accounts.length})` : `All Accounts (${accounts.length})`)
+    : (accounts.find((a) => a.id === selectedAccountId)?.name ?? selectedAccountId);
+
+  // F2: Per-currency bucket isolation (USD / HKD / CNY ... — zero cross-currency FX blending)
+  const currencyBuckets = useMemo(
+    () => extractCurrencyBuckets(snapshot, language),
+    [language, snapshot],
+  );
+  const [selectedBucketCurrency, setSelectedBucketCurrency] = useState<string>("USD");
+  const activeBucket: CurrencyBucketView = useMemo(() => {
+    const found = currencyBuckets.find((b) => b.currency === selectedBucketCurrency);
+    if (found) return found;
+    return currencyBuckets[0] ?? {
+      currency: accountCurrency === "MULTI" ? "USD" : accountCurrency,
+      cash: account.cash,
+      holdingsValue: toMoney("0"),
+      totalEquity: account.totalEquity,
+      holdings: [],
+    };
+  }, [account.cash, account.totalEquity, accountCurrency, currencyBuckets, selectedBucketCurrency]);
+
+  // F1: Real NAV & benchmark comparison state for Local Portfolio mode
+  const [selectedBenchmark, setSelectedBenchmark] = useState<string | null>(null);
+  const [benchmarkLoading, setBenchmarkLoading] = useState(false);
+  const [benchmarkNotice, setBenchmarkNotice] = useState<string | null>(null);
+  const localNavSnapshots = useMemo(
+    () => isLocalMode
+      ? aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeBucket.currency, selectedAccountId)
+      : [],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isLocalMode, activeBucket.currency, selectedAccountId, snapshot.account.asOf, NAV_STORE.getAllSnapshots().length],
+  );
+
+  // CSV import modal + F2 target account selector state
   const [importOpen, setImportOpen] = useState(false);
   const [pendingRawCsv, setPendingRawCsv] = useState<string>("");
   const [pendingFileName, setPendingFileName] = useState<string>("");
@@ -499,33 +545,32 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const [csvError, setCsvError] = useState<string | null>(null);
   const [importFeedback, setImportFeedback] = useState<string | null>(null);
   const [committing, setCommitting] = useState(false);
+  const [targetAccountId, setTargetAccountId] = useState<string>(DEFAULT_ACCOUNT_ID);
+  const [creatingAccount, setCreatingAccount] = useState(false);
+  const [newAcctName, setNewAcctName] = useState("");
+  const [newAcctBroker, setNewAcctBroker] = useState("Schwab");
+  const [newAcctType, setNewAcctType] = useState("taxable");
+  const [newAcctCurrency, setNewAcctCurrency] = useState("USD");
+  const [newAcctError, setNewAcctError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // C4: Rebalance state (pure exact-Decimal inputs, persisted per workspace mode)
-  const rebalanceHoldings: RebalanceHoldingInput[] = useMemo(() => {
-    return snapshot.holdings.map((holding) => {
-      const holdingCurrency = holding.currency ?? accountCurrency;
-      const quote = snapshot.quotes.find(
-        (item) => item.symbol === holding.symbol && (item.currency ?? "USD") === holdingCurrency,
-      ) ?? snapshot.quotes.find((item) => item.symbol === holding.symbol);
-      return {
-        symbol: holding.symbol,
-        company: language === "zh" ? holding.companyZh : holding.companyEn,
-        shares: holding.quantity,
-        price: quote?.price ?? toPrice(holding.averageCost),
-        marketValue: holding.marketValue,
-        currency: holdingCurrency,
-      };
-    });
-  }, [accountCurrency, language, snapshot.holdings, snapshot.quotes]);
+  // C4 + F2: Rebalance state scoped strictly to the active currency bucket (zero cross-currency FX)
+  const rebalanceHoldings: readonly RebalanceHoldingInput[] = activeBucket.holdings;
+  const activeBucketCurrency = activeBucket.currency;
+  const activeBucketCash = activeBucket.cash;
 
   const holdingSignature = useMemo(
-    () => `${workspaceMode}:${rebalanceHoldings.map((item) => `${item.symbol}:${item.currency}`).join(",")}`,
-    [rebalanceHoldings, workspaceMode],
+    () => `${workspaceMode}:${selectedAccountId}:${activeBucketCurrency}:${rebalanceHoldings.map((item) => `${item.symbol}:${item.currency}`).join(",")}`,
+    [activeBucketCurrency, rebalanceHoldings, selectedAccountId, workspaceMode],
   );
 
-  const rebalanceSettingKey = `${REBALANCE_TARGETS_SETTING_KEY}:${workspaceMode}`;
-  const rebalanceLegacyKey = `rebalance-targets-${workspaceMode}`;
+  const isLegacyDefaultBucket = !isMultiCurrency && selectedAccountId === ALL_ACCOUNTS_ID;
+  const rebalanceSettingKey = isLegacyDefaultBucket
+    ? `${REBALANCE_TARGETS_SETTING_KEY}:${workspaceMode}`
+    : `${REBALANCE_TARGETS_SETTING_KEY}:${workspaceMode}:${selectedAccountId}:${activeBucketCurrency}`;
+  const rebalanceLegacyKey = isLegacyDefaultBucket
+    ? `rebalance-targets-${workspaceMode}`
+    : `rebalance-targets-${workspaceMode}-${selectedAccountId}-${activeBucketCurrency}`;
   const initialStoredRebalance = !isTauriRuntime()
     ? readStored<PersistedRebalanceConfig | null>(rebalanceLegacyKey, null)
     : null;
@@ -537,7 +582,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     typeof initialStoredRebalance?.additionalCash === "string" ? initialStoredRebalance.additionalCash : "0",
   );
   const [targetWeights, setTargetWeights] = useState<Record<string, string>>(() =>
-    reconcileWeights(initialStoredRebalance?.weights ?? null, rebalanceHoldings, account.cash),
+    reconcileWeights(initialStoredRebalance?.weights ?? null, rebalanceHoldings, activeBucketCash),
   );
   const lastSignatureRef = useRef(holdingSignature);
 
@@ -548,11 +593,11 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       if (saved && typeof saved === "object") {
         setRebalanceMode(saved.mode === "cash-only-buy" ? "cash-only-buy" : "full-rebalance");
         setAdditionalCash(typeof saved.additionalCash === "string" ? saved.additionalCash : "0");
-        setTargetWeights(reconcileWeights(saved.weights ?? null, rebalanceHoldings, account.cash));
+        setTargetWeights(reconcileWeights(saved.weights ?? null, rebalanceHoldings, activeBucketCash));
       } else {
         setRebalanceMode("full-rebalance");
         setAdditionalCash("0");
-        setTargetWeights(buildCurrentTargetWeights(rebalanceHoldings, account.cash));
+        setTargetWeights(buildCurrentTargetWeights(rebalanceHoldings, activeBucketCash));
       }
     };
 
@@ -657,7 +702,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   function handleSyncCurrentWeights() {
-    const nextWeights = buildCurrentTargetWeights(rebalanceHoldings, account.cash);
+    const nextWeights = buildCurrentTargetWeights(rebalanceHoldings, activeBucketCash);
     setTargetWeights(nextWeights);
     persistRebalanceConfigNow({ mode: rebalanceMode, additionalCash, weights: nextWeights });
   }
@@ -666,14 +711,14 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     () =>
       calculateRebalancePlan({
         holdings: rebalanceHoldings,
-        cash: account.cash,
-        currency: accountCurrency,
-        isMultiCurrency,
+        cash: activeBucketCash,
+        currency: activeBucketCurrency,
+        isMultiCurrency: false,
         targetWeights,
         mode: rebalanceMode,
         additionalCash,
       }),
-    [account.cash, accountCurrency, additionalCash, isMultiCurrency, rebalanceHoldings, rebalanceMode, targetWeights],
+    [activeBucketCash, activeBucketCurrency, additionalCash, rebalanceHoldings, rebalanceMode, targetWeights],
   );
 
   const sortedHoldings = useMemo(() => {
@@ -689,7 +734,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     });
   }, [activeSort, holdings]);
 
-  const allocationSegments = buildAllocation(language);
+  const allocationSegments = buildAllocationForBucket(activeBucket, language);
   let allocationOffset = 0;
   const allocationVisuals = allocationSegments.map((segment) => {
     const visual = { ...segment, offset: allocationOffset };
@@ -712,6 +757,45 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     }
   }
 
+  function handleSelectAccount(nextAccountId: string) {
+    ACCOUNT_STORE.setSelectedAccountId(nextAccountId);
+    MOCK_BROKER.setSelectedAccountId(nextAccountId);
+    setSelectedBenchmark(null);
+    setBenchmarkNotice(null);
+  }
+
+  function handleSelectBucketCurrency(nextCurrency: string) {
+    setSelectedBucketCurrency(nextCurrency);
+    setSelectedBenchmark(null);
+    setBenchmarkNotice(null);
+  }
+
+  async function handleRefreshPortfolioBenchmark(symbol: string) {
+    setBenchmarkLoading(true);
+    setBenchmarkNotice(null);
+    try {
+      const prefs = !isTauriRuntime()
+        ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES))
+        : DEFAULT_WORKSPACE_PREFERENCES;
+      const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, prefs.quoteProvider);
+      if (outcome.degradedReason) {
+        setBenchmarkNotice(
+          outcome.series
+            ? (chinese
+                ? `离线降级：使用本地缓存的 ${symbol}（${outcome.degradedReason}）`
+                : `Degraded to cached ${symbol} (${outcome.degradedReason})`)
+            : (chinese
+                ? `${symbol} 基准行情暂不可用（${outcome.degradedReason}）`
+                : `${symbol} benchmark unavailable (${outcome.degradedReason})`),
+        );
+      }
+    } catch (error) {
+      setBenchmarkNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBenchmarkLoading(false);
+    }
+  }
+
   function resetImportModal() {
     setImportOpen(false);
     setPendingRawCsv("");
@@ -719,18 +803,46 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     setCsvPreview(null);
     setCsvError(null);
     setCommitting(false);
+    setCreatingAccount(false);
+    setNewAcctError(null);
   }
 
-  async function processCsvText(rawText: string, fileName: string) {
+  async function processCsvText(rawText: string, fileName: string, acctIdOverride?: string) {
     setCsvError(null);
     setCsvPreview(null);
     setPendingRawCsv(rawText);
     setPendingFileName(fileName);
+    const resolvedAcctId = acctIdOverride ?? targetAccountId;
+    const targetAcct = ACCOUNT_STORE.getAccount(resolvedAcctId);
     try {
-      const preview = await previewBrokerCsv(rawText, fileName);
+      const preview = await previewBrokerCsv(rawText, fileName, resolvedAcctId, targetAcct?.name);
       setCsvPreview(preview);
     } catch (error) {
       setCsvError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleCreateAccountInline() {
+    setNewAcctError(null);
+    if (!newAcctName.trim()) {
+      setNewAcctError(chinese ? "请输入账户名称（如 Schwab Taxable 或 Futu HK）。" : "Enter an account name (e.g. Schwab Taxable or Futu HK).");
+      return;
+    }
+    try {
+      const created = await ACCOUNT_STORE.createOrUpdateAccount({
+        name: newAcctName,
+        broker: newAcctBroker,
+        accountType: newAcctType,
+        baseCurrency: newAcctCurrency,
+      });
+      setTargetAccountId(created.id);
+      setCreatingAccount(false);
+      setNewAcctName("");
+      if (pendingRawCsv) {
+        await processCsvText(pendingRawCsv, pendingFileName || "imported.csv", created.id);
+      }
+    } catch (error) {
+      setNewAcctError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -765,14 +877,20 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     if (!pendingRawCsv || !csvPreview) return;
     setCommitting(true);
     setCsvError(null);
+    const targetAcct = ACCOUNT_STORE.getAccount(targetAccountId);
     try {
-      const result = await commitBrokerCsv(pendingRawCsv, pendingFileName || "imported.csv");
+      const result = await commitBrokerCsv(
+        pendingRawCsv,
+        pendingFileName || "imported.csv",
+        targetAccountId,
+        targetAcct?.name,
+      );
       MOCK_BROKER.applyLocalPortfolioSnapshot(result.snapshot, { switchMode: true });
       await saveWorkspacePreferences({ workspaceMode: "local-csv" });
       setImportFeedback(
         result.deduplicated
           ? copy.importDeduplicated
-          : copy.importSuccess(result.snapshot.holdings.length),
+          : `${copy.importSuccess(result.snapshot.holdings.length)}${targetAcct ? ` [${targetAcct.name}]` : ""}`,
       );
       resetImportModal();
     } catch (error) {
@@ -806,7 +924,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
           <p className="fh-page-subtitle">{copy.subtitle}</p>
         </div>
         <div className="fh-portfolio-controls">
-          <div className="fh-mode-switcher" role="group" aria-label={language === "zh" ? "工作区模式" : "Workspace mode"}>
+          <div className="fh-mode-switcher" role="group" aria-label={chinese ? "工作区模式" : "Workspace mode"}>
             <button
               type="button"
               className={`fh-mode-pill ${!isLocalMode ? "is-active" : ""}`}
@@ -826,17 +944,44 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
               {copy.modeLocal}
             </button>
           </div>
+          {isLocalMode && (
+            <label className="fh-account-switcher-wrap">
+              <span>{chinese ? "账户视图" : "Account scope"}</span>
+              <select
+                className="fh-account-switcher"
+                data-testid="portfolio-account-switcher"
+                value={selectedAccountId}
+                onChange={(event) => handleSelectAccount(event.target.value)}
+              >
+                <option value={ALL_ACCOUNTS_ID}>
+                  {chinese ? `全部账户 (${accounts.length})` : `All Accounts (${accounts.length})`}
+                </option>
+                {accounts.map((acct) => (
+                  <option key={acct.id} value={acct.id}>
+                    {acct.name} ({acct.baseCurrency})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="fh-portfolio-actions">
             <button
               type="button"
               className="fh-import-csv-button"
               data-testid="open-csv-import"
-              onClick={() => setImportOpen(true)}
+              onClick={() => {
+                setTargetAccountId(
+                  selectedAccountId !== ALL_ACCOUNTS_ID && ACCOUNT_STORE.getAccount(selectedAccountId)
+                    ? selectedAccountId
+                    : DEFAULT_ACCOUNT_ID,
+                );
+                setImportOpen(true);
+              }}
             >
               {copy.importCsv}
             </button>
             <div className="fh-account-meta">
-              <span>{isLocalMode ? copy.localAccount : copy.account}</span>
+              <span>{isLocalMode ? `${copy.localAccount} · ${selectedAccountLabel}` : copy.account}</span>
               <span>{isLocalMode && localMeta ? `${localMeta.sourceLabel} · ${localMeta.fingerprint.slice(0, 8)}` : copy.updated}</span>
             </div>
           </div>
@@ -913,64 +1058,101 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
           <div className="fh-panel-heading">
             <div>
               <h2>{copy.allocation}</h2>
-              <p>{copy.allocationHint}</p>
+              <p>
+                {isMultiCurrency
+                  ? (chinese
+                      ? `按币种桶独立展示 (${activeBucketCurrency} 桶 · 严禁跨币种 FX 混算)`
+                      : `Currency-isolated bucket (${activeBucketCurrency} only · No cross-currency FX blending)`)
+                  : copy.allocationHint}
+              </p>
             </div>
-            <span className="fh-panel-kicker">{isMultiCurrency ? "MULTI" : "100%"}</span>
-          </div>
-          {isMultiCurrency ? (
-            <div className="fh-local-baseline-box" data-testid="allocation-multi-currency-notice">
-              <p>{copy.allocationMultiCurrency}</p>
-            </div>
-          ) : (
-            <div className="fh-allocation-content">
-              <div className="fh-donut-wrap">
-                <svg
-                  className="fh-donut"
-                  data-testid="portfolio-allocation-donut"
-                  role="img"
-                  aria-label={copy.allocationLabel}
-                  viewBox="0 0 120 120"
+            <div className="fh-bucket-header-right">
+              {currencyBuckets.length > 1 && (
+                <div
+                  className="fh-bucket-tabs"
+                  role="group"
+                  aria-label={chinese ? "配置币种桶" : "Allocation currency bucket"}
+                  data-testid="allocation-currency-tabs"
                 >
-                  <circle className="fh-donut-track" cx="60" cy="60" r="42" />
-                  {allocationVisuals.map((segment) => {
-                    const segmentLength = (segment.value / 100) * circumference;
-                    return (
-                      <circle
-                        key={segment.label}
-                        className="fh-donut-segment"
-                        cx="60"
-                        cy="60"
-                        r="42"
-                        stroke={segment.color}
-                        strokeDasharray={`${segmentLength} ${circumference - segmentLength}`}
-                        strokeDashoffset={-((segment.offset / 100) * circumference)}
-                      />
-                    );
-                  })}
-                </svg>
-                <div className="fh-donut-center" aria-hidden="true">
-                  <strong>{allocationSegments.length}</strong>
-                  <span>{language === "zh" ? "项配置" : "slices"}</span>
+                  {currencyBuckets.map((bucket) => (
+                    <button
+                      key={bucket.currency}
+                      type="button"
+                      className={`fh-bucket-tab ${bucket.currency === activeBucketCurrency ? "is-active" : ""}`}
+                      aria-pressed={bucket.currency === activeBucketCurrency}
+                      data-testid={`allocation-bucket-tab-${bucket.currency}`}
+                      onClick={() => handleSelectBucketCurrency(bucket.currency)}
+                    >
+                      {bucket.currency}
+                    </button>
+                  ))}
                 </div>
-              </div>
-              <ul className="fh-allocation-list">
-                {allocationVisuals.map((segment) => (
-                  <li key={segment.label}>
-                    <span className="fh-legend-dot" style={{ backgroundColor: segment.color }} />
-                    <span>{segment.label}</span>
-                    <strong>{formatPercent(segment.value, language)}</strong>
-                  </li>
-                ))}
-              </ul>
+              )}
+              <span className="fh-panel-kicker">{activeBucketCurrency} · 100%</span>
             </div>
+          </div>
+          {isMultiCurrency && (
+            <p className="fh-bucket-isolation-note" data-testid="allocation-bucket-isolation-badge">
+              {chinese
+                ? `仅统计 ${activeBucketCurrency} 桶内持仓与现金（纯整型微单位权重，绝不跨币种混加）。`
+                : `Strictly scoped to ${activeBucketCurrency} holdings & cash (exact integer micro weights; no FX blending).`}
+            </p>
           )}
+          <div className="fh-allocation-content">
+            <div className="fh-donut-wrap">
+              <svg
+                className="fh-donut"
+                data-testid="portfolio-allocation-donut"
+                data-currency={activeBucketCurrency}
+                role="img"
+                aria-label={`${copy.allocationLabel} (${activeBucketCurrency})`}
+                viewBox="0 0 120 120"
+              >
+                <circle className="fh-donut-track" cx="60" cy="60" r="42" />
+                {allocationVisuals.map((segment) => {
+                  const segmentLength = (segment.value / 100) * circumference;
+                  return (
+                    <circle
+                      key={segment.label}
+                      className="fh-donut-segment"
+                      cx="60"
+                      cy="60"
+                      r="42"
+                      stroke={segment.color}
+                      strokeDasharray={`${segmentLength} ${circumference - segmentLength}`}
+                      strokeDashoffset={-((segment.offset / 100) * circumference)}
+                    />
+                  );
+                })}
+              </svg>
+              <div className="fh-donut-center" aria-hidden="true">
+                <strong>{allocationSegments.length}</strong>
+                <span>{isMultiCurrency ? activeBucketCurrency : (chinese ? "项配置" : "slices")}</span>
+              </div>
+            </div>
+            <ul className="fh-allocation-list" data-testid="portfolio-allocation-list">
+              {allocationVisuals.map((segment) => (
+                <li key={segment.label}>
+                  <span className="fh-legend-dot" style={{ backgroundColor: segment.color }} />
+                  <span>{segment.label}</span>
+                  <strong>{formatPercent(segment.value, language)}</strong>
+                </li>
+              ))}
+            </ul>
+          </div>
         </article>
 
         <article className="fh-panel fh-return-panel">
           <div className="fh-panel-heading">
             <div>
               <h2>{copy.returnCurve}</h2>
-              <p>{isLocalMode ? copy.returnHintLocal : copy.returnHint}</p>
+              <p>
+                {isLocalMode
+                  ? (chinese
+                      ? `${activeBucketCurrency} 币种桶真实快照净值与时间加权收益率 TWR（< 2 个点不伪造曲线）`
+                      : `${activeBucketCurrency} bucket real NAV & TWR (< 2 snapshots never fabricated)`)
+                  : copy.returnHint}
+              </p>
             </div>
             {!isLocalMode && (
               <span
@@ -982,17 +1164,27 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             )}
           </div>
           {isLocalMode ? (
-            <div className="fh-local-baseline-box" data-testid="portfolio-local-baseline">
-              <strong>{copy.localBaselineTitle}</strong>
-              <p>{copy.localBaselineBody}</p>
-              {localMeta && (
-                <div className="fh-local-baseline-meta">
-                  <span>{localMeta.sourceLabel}</span>
-                  <span>{isMultiCurrency ? currencyBreakdowns.map((c) => c.currency).join(" / ") : accountCurrency}</span>
-                  <span>{holdings.length} {copy.holdings}</span>
-                </div>
-              )}
-            </div>
+            <RealNavChart
+              copy={appCopy}
+              language={language}
+              currency={activeBucketCurrency}
+              accountId={selectedAccountId}
+              accountLabel={selectedAccountLabel}
+              snapshots={localNavSnapshots}
+              selectedBenchmark={selectedBenchmark}
+              benchmarkSeries={selectedBenchmark ? NAV_STORE.getBenchmark(selectedBenchmark) : null}
+              benchmarkLoading={benchmarkLoading}
+              benchmarkNotice={benchmarkNotice}
+              onSelectBenchmark={(sym) => {
+                setSelectedBenchmark(sym);
+                setBenchmarkNotice(null);
+              }}
+              onRefreshBenchmark={(sym) => void handleRefreshPortfolioBenchmark(sym)}
+              allTimeChange={decimalToNumber(account.allTimeChange)}
+              isMultiCurrency={isMultiCurrency}
+              baselineTestId="portfolio-local-baseline"
+              compact
+            />
           ) : (
             <>
               <svg
@@ -1136,63 +1328,90 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <h2 id="fh-rebalance-title">{copy.rebalanceTitle}</h2>
             <p>{copy.rebalanceSubtitle}</p>
           </div>
-          {rebalanceHoldings.length > 0 && !isMultiCurrency && (
-            <div className="fh-rebalance-controls">
-              <div className="fh-mode-switcher" role="group" aria-label={copy.rebalanceTitle}>
-                <button
-                  type="button"
-                  className={`fh-mode-pill ${rebalanceMode === "full-rebalance" ? "is-active" : ""}`}
-                  data-testid="rebalance-mode-full"
-                  aria-pressed={rebalanceMode === "full-rebalance"}
-                  onClick={() => handleRebalanceModeChange("full-rebalance")}
-                >
-                  {copy.rebalanceModeFull}
-                </button>
-                <button
-                  type="button"
-                  className={`fh-mode-pill ${rebalanceMode === "cash-only-buy" ? "is-active" : ""}`}
-                  data-testid="rebalance-mode-cash-only"
-                  aria-pressed={rebalanceMode === "cash-only-buy"}
-                  onClick={() => handleRebalanceModeChange("cash-only-buy")}
-                >
-                  {copy.rebalanceModeCashOnly}
-                </button>
+          <div className="fh-rebalance-controls">
+            {currencyBuckets.length > 1 && (
+              <div
+                className="fh-bucket-tabs"
+                role="group"
+                aria-label={chinese ? "再平衡币种桶" : "Rebalance currency bucket"}
+                data-testid="rebalance-currency-tabs"
+              >
+                {currencyBuckets.map((bucket) => (
+                  <button
+                    key={bucket.currency}
+                    type="button"
+                    className={`fh-bucket-tab ${bucket.currency === activeBucketCurrency ? "is-active" : ""}`}
+                    aria-pressed={bucket.currency === activeBucketCurrency}
+                    data-testid={`rebalance-bucket-tab-${bucket.currency}`}
+                    onClick={() => handleSelectBucketCurrency(bucket.currency)}
+                  >
+                    {bucket.currency}
+                  </button>
+                ))}
               </div>
-              <div className="fh-rebalance-quick-actions">
-                <button
-                  type="button"
-                  className="fh-rebalance-util-btn"
-                  data-testid="rebalance-equal-btn"
-                  onClick={handleApplyEqualWeights}
-                >
-                  {copy.rebalanceEqual}
-                </button>
-                <button
-                  type="button"
-                  className="fh-rebalance-util-btn"
-                  data-testid="rebalance-sync-btn"
-                  onClick={handleSyncCurrentWeights}
-                >
-                  {copy.rebalanceSyncCurrent}
-                </button>
-              </div>
-            </div>
-          )}
+            )}
+            {rebalanceHoldings.length > 0 && (
+              <>
+                <div className="fh-mode-switcher" role="group" aria-label={copy.rebalanceTitle}>
+                  <button
+                    type="button"
+                    className={`fh-mode-pill ${rebalanceMode === "full-rebalance" ? "is-active" : ""}`}
+                    data-testid="rebalance-mode-full"
+                    aria-pressed={rebalanceMode === "full-rebalance"}
+                    onClick={() => handleRebalanceModeChange("full-rebalance")}
+                  >
+                    {copy.rebalanceModeFull}
+                  </button>
+                  <button
+                    type="button"
+                    className={`fh-mode-pill ${rebalanceMode === "cash-only-buy" ? "is-active" : ""}`}
+                    data-testid="rebalance-mode-cash-only"
+                    aria-pressed={rebalanceMode === "cash-only-buy"}
+                    onClick={() => handleRebalanceModeChange("cash-only-buy")}
+                  >
+                    {copy.rebalanceModeCashOnly}
+                  </button>
+                </div>
+                <div className="fh-rebalance-quick-actions">
+                  <button
+                    type="button"
+                    className="fh-rebalance-util-btn"
+                    data-testid="rebalance-equal-btn"
+                    onClick={handleApplyEqualWeights}
+                  >
+                    {copy.rebalanceEqual}
+                  </button>
+                  <button
+                    type="button"
+                    className="fh-rebalance-util-btn"
+                    data-testid="rebalance-sync-btn"
+                    onClick={handleSyncCurrentWeights}
+                  >
+                    {copy.rebalanceSyncCurrent}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
+
+        {isMultiCurrency && (
+          <p className="fh-bucket-isolation-note" data-testid="rebalance-bucket-isolation-badge">
+            {chinese
+              ? `当前仅对 ${activeBucketCurrency} 币种桶内部独立计算再平衡（严禁跨币种 FX 混算）。切换上方币种标签查看其他币种桶。`
+              : `Rebalancing strictly inside the isolated ${activeBucketCurrency} bucket (cross-currency FX blending disabled). Switch tabs above for other currencies.`}
+          </p>
+        )}
 
         {rebalanceHoldings.length === 0 ? (
           <div className="fh-rebalance-empty" data-testid="rebalance-empty-notice">
             <p>{copy.rebalanceEmpty}</p>
           </div>
-        ) : isMultiCurrency ? (
-          <div className="fh-csv-warning fh-rebalance-alert" role="status" data-testid="rebalance-multi-currency-blocked">
-            {copy.rebalanceMultiCurrencyBlocked}
-          </div>
         ) : (
-          <div className="fh-rebalance-body">
+          <div className="fh-rebalance-body" data-currency={activeBucketCurrency}>
             <div className="fh-rebalance-toolbar">
               <label className="fh-rebalance-cash-field">
-                <span>{copy.rebalanceAdditionalCash} ({accountCurrency})</span>
+                <span>{copy.rebalanceAdditionalCash} ({activeBucketCurrency})</span>
                 <input
                   type="text"
                   inputMode="decimal"
@@ -1257,20 +1476,20 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                 <div className="fh-rebalance-metrics">
                   <div>
                     <span>{copy.rebalanceProjectedTotal}</span>
-                    <strong>{formatMoney(decimalToNumber(rebalancePlan.projectedPortfolioValue), language, false, accountCurrency)}</strong>
+                    <strong>{formatMoney(decimalToNumber(rebalancePlan.projectedPortfolioValue), language, false, activeBucketCurrency)}</strong>
                   </div>
                   <div>
                     <span>{copy.rebalanceAvailableCash}</span>
-                    <strong>{formatMoney(decimalToNumber(rebalancePlan.availableCash), language, false, accountCurrency)}</strong>
+                    <strong>{formatMoney(decimalToNumber(rebalancePlan.availableCash), language, false, activeBucketCurrency)}</strong>
                   </div>
                   <div>
                     <span>{copy.rebalanceEstBuys}</span>
-                    <strong className="fh-positive">{formatMoney(decimalToNumber(rebalancePlan.totalBuyAmount), language, false, accountCurrency)}</strong>
+                    <strong className="fh-positive">{formatMoney(decimalToNumber(rebalancePlan.totalBuyAmount), language, false, activeBucketCurrency)}</strong>
                   </div>
                   <div>
                     <span>{copy.rebalanceEstSells}</span>
                     <strong className={decimalToNumber(rebalancePlan.totalSellAmount) > 0 ? "fh-negative" : ""}>
-                      {formatMoney(decimalToNumber(rebalancePlan.totalSellAmount), language, false, accountCurrency)}
+                      {formatMoney(decimalToNumber(rebalancePlan.totalSellAmount), language, false, activeBucketCurrency)}
                     </strong>
                   </div>
                 </div>
@@ -1384,6 +1603,126 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
               <p className="fh-page-subtitle">{copy.importModalSubtitle}</p>
             </div>
             <button type="button" className="fh-csv-close" aria-label={copy.cancel} onClick={resetImportModal}>×</button>
+          </div>
+
+          <div className="fh-csv-account-section" data-testid="csv-account-section">
+            <div className="fh-csv-account-row">
+              <label className="fh-csv-account-select-wrap">
+                <span>{chinese ? "导入目标账户" : "Target account"}</span>
+                <select
+                  data-testid="csv-target-account-select"
+                  value={creatingAccount ? "__NEW__" : targetAccountId}
+                  onChange={(event) => {
+                    const nextVal = event.target.value;
+                    if (nextVal === "__NEW__") {
+                      setCreatingAccount(true);
+                      setNewAcctError(null);
+                      return;
+                    }
+                    setCreatingAccount(false);
+                    setTargetAccountId(nextVal);
+                    if (pendingRawCsv) {
+                      void processCsvText(pendingRawCsv, pendingFileName || "imported.csv", nextVal);
+                    }
+                  }}
+                >
+                  {accounts.map((acct) => (
+                    <option key={acct.id} value={acct.id}>
+                      {acct.name} ({acct.broker} · {acct.baseCurrency})
+                    </option>
+                  ))}
+                  <option value="__NEW__">
+                    {chinese ? "+ 新建账户..." : "+ Create new account..."}
+                  </option>
+                </select>
+              </label>
+              <button
+                type="button"
+                className="fh-rebalance-util-btn"
+                data-testid="csv-toggle-new-account"
+                onClick={() => {
+                  setCreatingAccount((cur) => !cur);
+                  setNewAcctError(null);
+                }}
+              >
+                {creatingAccount
+                  ? (chinese ? "取消新建" : "Cancel new")
+                  : (chinese ? "+ 新建账户" : "+ New account")}
+              </button>
+            </div>
+
+            {creatingAccount && (
+              <div className="fh-csv-new-account-form" data-testid="csv-new-account-form">
+                <div className="fh-csv-preset-chips">
+                  {ACCOUNT_PRESETS.map((preset) => (
+                    <button
+                      key={preset.name}
+                      type="button"
+                      className="fh-csv-preset-chip"
+                      data-testid={`csv-preset-${preset.name.toLowerCase().replace(/\s+/g, "-")}`}
+                      onClick={() => {
+                        setNewAcctName(preset.name);
+                        setNewAcctBroker(preset.broker);
+                        setNewAcctType(preset.accountType);
+                        setNewAcctCurrency(preset.baseCurrency);
+                      }}
+                    >
+                      {preset.name} ({preset.baseCurrency})
+                    </button>
+                  ))}
+                </div>
+                <div className="fh-csv-new-account-grid">
+                  <input
+                    type="text"
+                    placeholder={chinese ? "账户名 (如 Schwab IRA / Futu HK)" : "Account name (e.g. Schwab IRA)"}
+                    data-testid="csv-new-account-name"
+                    value={newAcctName}
+                    onChange={(event) => setNewAcctName(event.target.value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder={chinese ? "券商 (Schwab / Futu / IBKR)" : "Broker (Schwab / Futu / IBKR)"}
+                    data-testid="csv-new-account-broker"
+                    value={newAcctBroker}
+                    onChange={(event) => setNewAcctBroker(event.target.value)}
+                  />
+                  <select
+                    data-testid="csv-new-account-type"
+                    value={newAcctType}
+                    onChange={(event) => setNewAcctType(event.target.value)}
+                  >
+                    <option value="taxable">Taxable</option>
+                    <option value="ira">IRA</option>
+                    <option value="roth_ira">Roth IRA</option>
+                    <option value="margin">Margin</option>
+                    <option value="cash">Cash</option>
+                  </select>
+                  <select
+                    data-testid="csv-new-account-currency"
+                    value={newAcctCurrency}
+                    onChange={(event) => setNewAcctCurrency(event.target.value)}
+                  >
+                    <option value="USD">USD</option>
+                    <option value="HKD">HKD</option>
+                    <option value="CNY">CNY</option>
+                    <option value="EUR">EUR</option>
+                    <option value="SGD">SGD</option>
+                    <option value="GBP">GBP</option>
+                  </select>
+                  <button
+                    type="button"
+                    className="fh-import-csv-button"
+                    data-testid="csv-create-account-btn"
+                    onClick={() => void handleCreateAccountInline()}
+                  >
+                    {chinese ? "保存账户" : "Save account"}
+                  </button>
+                </div>
+                {newAcctError && (
+                  <div className="fh-csv-error" role="alert">{newAcctError}</div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="fh-csv-picker-row">

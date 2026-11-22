@@ -1,5 +1,6 @@
 pub mod csv_import;
 pub mod evidence;
+pub mod nav;
 pub mod quotes;
 pub mod storage;
 pub mod vault;
@@ -18,19 +19,28 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
-use csv_import::{parse_and_preview_csv, CsvCommitResultDto, CsvImportPreviewDto, MAX_CSV_BYTES};
+use csv_import::{
+    parse_and_preview_csv, scope_snapshot_to_account, CsvCommitResultDto, CsvImportPreviewDto,
+    MAX_CSV_BYTES,
+};
 use evidence::{
     AppendEvidenceRequest, EvidenceJournal, EvidenceVerificationDto, SignedEvidenceRecordDto,
 };
+use nav::{
+    aggregate_nav_snapshots_for_currency, build_nav_snapshots_from_portfolio,
+    compute_benchmark_twr_series, compute_twr_series, NavAnalyticsResponseDto,
+};
 use quotes::{
-    fetch_public_quotes_partial, PublicQuoteBatchOutcome, PublicQuoteBatchResponseDto,
+    fetch_benchmark_history, fetch_public_quotes_partial, validate_benchmark_symbol,
+    BenchmarkFetchResponseDto, PublicQuoteBatchOutcome, PublicQuoteBatchResponseDto,
     PublicQuoteProvider, QuoteError,
 };
 use serde::Serialize;
 use storage::{
     atomic_write_bytes, AppLockBackoffState, CachedPublicQuote, EncryptedVaultDb,
-    PortfolioSaveOutcome, StoredPaperOrder, StoredPortfolioSnapshot, VaultBackupPayload,
-    VaultRestoreSummaryDto, VaultStatusDto, STORAGE_SCHEMA_VERSION,
+    PortfolioSaveOutcome, StoredAccount, StoredBenchmarkSeries, StoredNavSnapshot,
+    StoredPaperOrder, StoredPortfolioSnapshot, VaultBackupPayload, VaultRestoreSummaryDto,
+    VaultStatusDto, STORAGE_SCHEMA_VERSION,
 };
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -50,11 +60,42 @@ struct OpenedTextFileDto {
     content: String,
 }
 
+#[derive(Default)]
+struct VaultRuntimeCache {
+    accounts: Vec<StoredAccount>,
+    nav_snapshots: Vec<StoredNavSnapshot>,
+    benchmarks: BTreeMap<String, StoredBenchmarkSeries>,
+}
+
+impl VaultRuntimeCache {
+    fn clear(&mut self) {
+        self.accounts.clear();
+        self.nav_snapshots.clear();
+        self.benchmarks.clear();
+    }
+
+    fn reload_from_db(&mut self, db: &EncryptedVaultDb) {
+        self.clear();
+        if let Ok(accounts) = db.list_accounts() {
+            self.accounts = accounts;
+        }
+        if let Ok(snaps) = db.load_all_nav_snapshots() {
+            self.nav_snapshots = snaps;
+        }
+        if let Ok(series_list) = db.load_all_benchmark_series() {
+            for series in series_list {
+                self.benchmarks.insert(series.symbol.clone(), series);
+            }
+        }
+    }
+}
+
 enum VaultSession {
     Unlocked {
         db: Box<EncryptedVaultDb>,
         journal: Box<EvidenceJournal>,
         lock_verifier: Option<AppLockVerifier>,
+        cache: VaultRuntimeCache,
     },
     UserLocked {
         reason: String,
@@ -236,10 +277,13 @@ impl VaultRuntimeState {
                                 let _ = db.save_app_lock_backoff(&AppLockBackoffState::default());
                             }
 
+                            let mut cache = VaultRuntimeCache::default();
+                            cache.reload_from_db(&db);
                             VaultSession::Unlocked {
                                 db: Box::new(db),
                                 journal: Box::new(journal),
                                 lock_verifier,
+                                cache,
                             }
                         }
                         Err(error) => VaultSession::ErrorLocked {
@@ -304,6 +348,41 @@ impl VaultRuntimeState {
             VaultSession::UserLocked { reason, .. } | VaultSession::ErrorLocked { reason } => {
                 Err(format!("Vault is locked: {reason}"))
             }
+        }
+    }
+
+    fn with_unlocked_and_cache<T>(
+        &self,
+        op: impl FnOnce(
+            &mut EncryptedVaultDb,
+            &mut EvidenceJournal,
+            &mut VaultRuntimeCache,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "vault state lock is poisoned".to_string())?;
+        match &mut *guard {
+            VaultSession::Unlocked {
+                db, journal, cache, ..
+            } => op(db, journal, cache),
+            VaultSession::UserLocked { reason, .. } | VaultSession::ErrorLocked { reason } => {
+                Err(format!("Vault is locked: {reason}"))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_cache_counts(&self) -> (usize, usize, usize) {
+        let guard = self.session.lock().expect("lock");
+        match &*guard {
+            VaultSession::Unlocked { cache, .. } => (
+                cache.accounts.len(),
+                cache.nav_snapshots.len(),
+                cache.benchmarks.len(),
+            ),
+            VaultSession::UserLocked { .. } | VaultSession::ErrorLocked { .. } => (0, 0, 0),
         }
     }
 
@@ -377,7 +456,10 @@ impl VaultRuntimeState {
                 db,
                 journal,
                 lock_verifier,
+                cache,
             } => {
+                // Immediately scrub in-memory nav_snapshots / accounts / benchmark caches on lock.
+                cache.clear();
                 let verifier_clone = lock_verifier.clone();
                 let evidence_warning = match journal.prepare_append(AppendEvidenceRequest {
                     kind: "session_locked".to_string(),
@@ -630,6 +712,7 @@ impl VaultRuntimeState {
             db,
             journal,
             lock_verifier,
+            ..
         } = &mut *guard
         else {
             return Err("Vault must be unlocked to update the lock passphrase".to_string());
@@ -826,7 +909,10 @@ impl VaultRuntimeState {
             .session
             .lock()
             .map_err(|_| "vault state lock is poisoned".to_string())?;
-        let VaultSession::Unlocked { db, journal, .. } = &mut *guard else {
+        let VaultSession::Unlocked {
+            db, journal, cache, ..
+        } = &mut *guard
+        else {
             return Err("Vault must be unlocked before restoring a .fhvault backup".to_string());
         };
 
@@ -834,6 +920,7 @@ impl VaultRuntimeState {
             .restore_from_backup_payload(payload, self.key_store.as_ref())
             .map_err(|error| error.to_string())?;
         **journal = restored_journal;
+        cache.reload_from_db(db);
         Ok(summary)
     }
 }
@@ -1034,34 +1121,40 @@ fn vault_load_setting(
     state.with_unlocked(|db, _| db.load_setting(&key).map_err(|error| error.to_string()))
 }
 
-#[tauri::command]
-fn csv_preview_import(
-    state: State<'_, VaultRuntimeState>,
-    raw_csv: String,
-    source_label: String,
-) -> Result<CsvImportPreviewDto, String> {
-    let mut preview =
-        parse_and_preview_csv(&raw_csv, &source_label, false).map_err(|error| error.to_string())?;
-    let already_imported = state.with_unlocked(|db, _| {
-        db.has_portfolio_fingerprint(&preview.snapshot.fingerprint)
-            .map_err(|error| error.to_string())
-    })?;
-    preview.already_imported = already_imported;
-    Ok(preview)
-}
-
-#[tauri::command]
-fn csv_commit_import(
-    state: State<'_, VaultRuntimeState>,
-    raw_csv: String,
-    source_label: String,
+fn commit_csv_import_internal(
+    state: &VaultRuntimeState,
+    raw_csv: &str,
+    source_label: &str,
+    account_id: Option<&str>,
+    account_label: Option<&str>,
+    snapshot_date_override: Option<&str>,
 ) -> Result<CsvCommitResultDto, String> {
-    let preview =
-        parse_and_preview_csv(&raw_csv, &source_label, false).map_err(|error| error.to_string())?;
-    state.with_unlocked(|db, journal| {
+    let mut preview =
+        parse_and_preview_csv(raw_csv, source_label, false).map_err(|error| error.to_string())?;
+    scope_snapshot_to_account(&mut preview.snapshot, account_id, account_label);
+
+    state.with_unlocked_and_cache(|db, journal, cache| {
         let outcome = db
             .save_portfolio_snapshot(&preview.snapshot)
             .map_err(|error| error.to_string())?;
+
+        // Automatically record idempotent daily NAV snapshot(s) per currency bucket (pure i128).
+        let now_utc = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let date_str = snapshot_date_override
+            .map(str::to_string)
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+        if let Ok(nav_snaps) =
+            build_nav_snapshots_from_portfolio(&outcome.snapshot, &date_str, "csv-import", &now_utc)
+        {
+            for snap in &nav_snaps {
+                db.upsert_nav_snapshot(snap, true)
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Ok(all_nav) = db.load_all_nav_snapshots() {
+                cache.nav_snapshots = all_nav;
+            }
+        }
+
         if outcome.deduplicated {
             return Ok(CsvCommitResultDto {
                 deduplicated: true,
@@ -1076,6 +1169,7 @@ fn csv_commit_import(
                 kind: "portfolio_import".to_string(),
                 payload: BTreeMap::from([
                     ("mode".to_string(), "local-csv".to_string()),
+                    ("accountId".to_string(), outcome.snapshot.account_id.clone()),
                     (
                         "sourceFormat".to_string(),
                         outcome.snapshot.source_format.clone(),
@@ -1106,6 +1200,305 @@ fn csv_commit_import(
             evidence_sequence: Some(dto.sequence),
             snapshot: outcome.snapshot,
         })
+    })
+}
+
+#[tauri::command]
+fn csv_preview_import(
+    state: State<'_, VaultRuntimeState>,
+    raw_csv: String,
+    source_label: String,
+    account_id: Option<String>,
+    account_label: Option<String>,
+) -> Result<CsvImportPreviewDto, String> {
+    let mut preview =
+        parse_and_preview_csv(&raw_csv, &source_label, false).map_err(|error| error.to_string())?;
+    scope_snapshot_to_account(
+        &mut preview.snapshot,
+        account_id.as_deref(),
+        account_label.as_deref(),
+    );
+    let already_imported = state.with_unlocked(|db, _| {
+        db.has_portfolio_fingerprint(&preview.snapshot.fingerprint)
+            .map_err(|error| error.to_string())
+    })?;
+    preview.already_imported = already_imported;
+    Ok(preview)
+}
+
+#[tauri::command]
+fn csv_commit_import(
+    state: State<'_, VaultRuntimeState>,
+    raw_csv: String,
+    source_label: String,
+    account_id: Option<String>,
+    account_label: Option<String>,
+) -> Result<CsvCommitResultDto, String> {
+    commit_csv_import_internal(
+        &state,
+        &raw_csv,
+        &source_label,
+        account_id.as_deref(),
+        account_label.as_deref(),
+        None,
+    )
+}
+
+#[tauri::command]
+fn vault_list_accounts(state: State<'_, VaultRuntimeState>) -> Result<Vec<StoredAccount>, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let accounts = db.list_accounts().map_err(|error| error.to_string())?;
+        cache.accounts = accounts.clone();
+        Ok(accounts)
+    })
+}
+
+#[tauri::command]
+fn vault_save_account(
+    state: State<'_, VaultRuntimeState>,
+    account: StoredAccount,
+) -> Result<StoredAccount, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let saved = db
+            .upsert_account(&account)
+            .map_err(|error| error.to_string())?;
+        cache.accounts = db.list_accounts().map_err(|error| error.to_string())?;
+        Ok(saved)
+    })
+}
+
+#[tauri::command]
+fn vault_delete_account(
+    state: State<'_, VaultRuntimeState>,
+    account_id: String,
+) -> Result<bool, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let deleted = db
+            .delete_account(&account_id)
+            .map_err(|error| error.to_string())?;
+        cache.reload_from_db(db);
+        Ok(deleted)
+    })
+}
+
+#[tauri::command]
+fn vault_load_account_portfolios(
+    state: State<'_, VaultRuntimeState>,
+) -> Result<Vec<StoredPortfolioSnapshot>, String> {
+    state.with_unlocked(|db, _| {
+        db.load_latest_portfolio_snapshots_per_account()
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+fn nav_upsert_snapshots(
+    state: State<'_, VaultRuntimeState>,
+    snapshots: Vec<StoredNavSnapshot>,
+    preserve_existing_cf: Option<bool>,
+) -> Result<Vec<StoredNavSnapshot>, String> {
+    let preserve = preserve_existing_cf.unwrap_or(true);
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let mut saved = Vec::with_capacity(snapshots.len());
+        for snap in &snapshots {
+            let record = db
+                .upsert_nav_snapshot(snap, preserve)
+                .map_err(|error| error.to_string())?;
+            saved.push(record);
+        }
+        cache.nav_snapshots = db
+            .load_all_nav_snapshots()
+            .map_err(|error| error.to_string())?;
+        Ok(saved)
+    })
+}
+
+#[tauri::command]
+fn nav_list_snapshots(
+    state: State<'_, VaultRuntimeState>,
+    account_id: Option<String>,
+    currency: Option<String>,
+) -> Result<Vec<StoredNavSnapshot>, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let all = db
+            .load_all_nav_snapshots()
+            .map_err(|error| error.to_string())?;
+        cache.nav_snapshots = all;
+        db.load_nav_snapshots(account_id.as_deref(), currency.as_deref())
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+fn nav_compute_twr(
+    state: State<'_, VaultRuntimeState>,
+    account_id: Option<String>,
+    currency: String,
+    benchmark_symbol: Option<String>,
+) -> Result<NavAnalyticsResponseDto, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        let raw_snaps = db
+            .load_nav_snapshots(None, Some(&currency))
+            .map_err(|error| error.to_string())?;
+        let scoped_id = account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ALL");
+        let aggregated =
+            aggregate_nav_snapshots_for_currency(&raw_snaps, &currency, Some(scoped_id))
+                .map_err(|error| error.to_string())?;
+        let portfolio = compute_twr_series(&aggregated, &currency, scoped_id)
+            .map_err(|error| error.to_string())?;
+
+        let benchmark = if let Some(raw_sym) = benchmark_symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (allowed_sym, bench_curr) =
+                validate_benchmark_symbol(raw_sym).map_err(|error| error.to_string())?;
+            if !bench_curr.eq_ignore_ascii_case(&portfolio.currency) {
+                return Err(format!(
+                    "Benchmark {allowed_sym} ({bench_curr}) cannot be compared against {} bucket",
+                    portfolio.currency
+                ));
+            }
+            if let Some(series) = db
+                .load_benchmark_series(allowed_sym)
+                .map_err(|error| error.to_string())?
+            {
+                cache
+                    .benchmarks
+                    .insert(series.symbol.clone(), series.clone());
+                let dates: Vec<String> = portfolio.points.iter().map(|p| p.date.clone()).collect();
+                Some(
+                    compute_benchmark_twr_series(&dates, &series)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(NavAnalyticsResponseDto {
+            portfolio,
+            benchmark,
+        })
+    })
+}
+
+async fn fetch_benchmark_history_with_vault_cache<F, Fut>(
+    state: &VaultRuntimeState,
+    raw_symbol: String,
+    provider: Option<String>,
+    fetcher: F,
+) -> Result<BenchmarkFetchResponseDto, String>
+where
+    F: FnOnce(String, PublicQuoteProvider) -> Fut,
+    Fut: Future<Output = Result<StoredBenchmarkSeries, QuoteError>>,
+{
+    // Fail-Closed: NEVER perform outbound benchmark requests while the vault is locked.
+    state.ensure_unlocked()?;
+
+    let provider_choice = PublicQuoteProvider::parse(provider.as_deref().unwrap_or("stooq"))
+        .map_err(|error| error.to_string())?;
+    let (allowed_symbol, _) =
+        validate_benchmark_symbol(&raw_symbol).map_err(|error| error.to_string())?;
+
+    let fetch_result = fetcher(allowed_symbol.to_string(), provider_choice).await;
+
+    // Re-check lock state after awaiting network I/O so mid-flight lock discards results.
+    state.ensure_unlocked()?;
+
+    match fetch_result {
+        Ok(series) => {
+            state.with_unlocked_and_cache(|db, _, cache| {
+                db.upsert_benchmark_series(&series)
+                    .map_err(|error| error.to_string())?;
+                cache
+                    .benchmarks
+                    .insert(series.symbol.clone(), series.clone());
+                Ok(())
+            })?;
+            Ok(BenchmarkFetchResponseDto {
+                series: Some(series),
+                from_cache: false,
+                degraded_reason: None,
+                provider: provider_choice.code().to_string(),
+            })
+        }
+        Err(fetch_error) => {
+            let cached = state.with_unlocked_and_cache(|db, _, cache| {
+                let loaded = db
+                    .load_benchmark_series(allowed_symbol)
+                    .map_err(|error| error.to_string())?;
+                if let Some(ref series) = loaded {
+                    cache
+                        .benchmarks
+                        .insert(series.symbol.clone(), series.clone());
+                }
+                Ok(loaded)
+            })?;
+            Ok(BenchmarkFetchResponseDto {
+                series: cached,
+                from_cache: true,
+                degraded_reason: Some(fetch_error.to_string()),
+                provider: provider_choice.code().to_string(),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+async fn benchmark_fetch_history(
+    state: State<'_, VaultRuntimeState>,
+    symbol: String,
+    provider: Option<String>,
+) -> Result<BenchmarkFetchResponseDto, String> {
+    fetch_benchmark_history_with_vault_cache(
+        &state,
+        symbol,
+        provider,
+        |allowed_symbol, provider_choice| async move {
+            fetch_benchmark_history(&allowed_symbol, provider_choice).await
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+fn benchmark_load_cached(
+    state: State<'_, VaultRuntimeState>,
+    symbol: Option<String>,
+) -> Result<Vec<StoredBenchmarkSeries>, String> {
+    state.with_unlocked_and_cache(|db, _, cache| {
+        if let Some(raw_sym) = symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let (allowed_sym, _) =
+                validate_benchmark_symbol(raw_sym).map_err(|error| error.to_string())?;
+            let maybe = db
+                .load_benchmark_series(allowed_sym)
+                .map_err(|error| error.to_string())?;
+            if let Some(series) = maybe {
+                cache
+                    .benchmarks
+                    .insert(series.symbol.clone(), series.clone());
+                return Ok(vec![series]);
+            }
+            return Ok(Vec::new());
+        }
+        let all = db
+            .load_all_benchmark_series()
+            .map_err(|error| error.to_string())?;
+        cache.benchmarks.clear();
+        for series in &all {
+            cache
+                .benchmarks
+                .insert(series.symbol.clone(), series.clone());
+        }
+        Ok(all)
     })
 }
 
@@ -1480,10 +1873,11 @@ async fn dialog_open_fhvault_file(app: AppHandle) -> Result<Option<OpenedTextFil
 
 #[tauri::command]
 fn vault_clear_all(state: State<'_, VaultRuntimeState>) -> Result<bool, String> {
-    state.with_unlocked(|db, journal| {
+    state.with_unlocked_and_cache(|db, journal, cache| {
         db.clear_all_workspace_data()
             .map_err(|error| error.to_string())?;
         journal.clear();
+        cache.reload_from_db(db);
         Ok(true)
     })
 }
@@ -1532,15 +1926,24 @@ pub fn run() {
             vault_restore_backup,
             vault_save_portfolio,
             vault_load_portfolio,
+            vault_load_account_portfolios,
             vault_clear_portfolio,
+            vault_list_accounts,
+            vault_save_account,
+            vault_delete_account,
             vault_save_paper_order,
             vault_load_paper_orders,
             vault_save_setting,
             vault_load_setting,
             csv_preview_import,
             csv_commit_import,
+            nav_upsert_snapshots,
+            nav_list_snapshots,
+            nav_compute_twr,
             quotes_fetch_public,
             quotes_load_cached,
+            benchmark_fetch_history,
+            benchmark_load_cached,
             dialog_open_csv_file,
             dialog_save_json_file,
             dialog_save_fhvault_file,
@@ -2086,5 +2489,181 @@ mod tests {
         assert_eq!(decoded_gbk, gbk_source);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn benchmark_fetch_blocks_locked_rejects_disallowed_symbol_and_falls_back_to_cache() {
+        let db_path = temp_vault_path("benchmark-lock-fallback");
+        let key_store: Arc<dyn KeyStore> = Arc::new(InMemoryKeyStore::new());
+        let state = VaultRuntimeState::open_with_store(&db_path, key_store, "in-memory-test");
+
+        // 1. Disallowed symbol is rejected before any network call
+        let called = Arc::new(AtomicBool::new(false));
+        let called_flag = Arc::clone(&called);
+        let bad_sym = fetch_benchmark_history_with_vault_cache(
+            &state,
+            "AAPL".into(),
+            Some("stooq".into()),
+            move |_sym, _prov| async move {
+                called_flag.store(true, Ordering::SeqCst);
+                Err(QuoteError::Network("unreachable".into()))
+            },
+        )
+        .await
+        .expect_err("non-allowlisted benchmark must be rejected");
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(bad_sym.contains("allowlist"));
+
+        // 2. Successful fetch caches SPY in encrypted SQLite + runtime cache
+        let fresh = fetch_benchmark_history_with_vault_cache(
+            &state,
+            "SPY".into(),
+            Some("stooq".into()),
+            |_sym, _prov| async {
+                Ok(StoredBenchmarkSeries {
+                    symbol: "SPY".into(),
+                    currency: "USD".into(),
+                    provider: "stooq.com".into(),
+                    as_of_utc: "2026-11-22T00:00:00.000Z".into(),
+                    points: vec![storage::BenchmarkPricePoint {
+                        date: "2026-11-21".into(),
+                        close_micros: 590_000_000,
+                    }],
+                })
+            },
+        )
+        .await
+        .expect("fresh benchmark fetch");
+        assert!(!fresh.from_cache);
+        assert_eq!(fresh.series.as_ref().expect("series").points.len(), 1);
+
+        // 3. Offline failure gracefully falls back to encrypted local cache
+        let fallback = fetch_benchmark_history_with_vault_cache(
+            &state,
+            "SPY".into(),
+            Some("stooq".into()),
+            |_sym, _prov| async { Err(QuoteError::Network("offline".into())) },
+        )
+        .await
+        .expect("fallback succeeds");
+        assert!(fallback.from_cache);
+        assert!(fallback
+            .degraded_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("offline"));
+        assert_eq!(
+            fallback.series.as_ref().expect("cached").points[0].close_micros,
+            590_000_000
+        );
+
+        // 4. Locking session wipes runtime caches AND blocks outbound benchmark fetches Fail-Closed
+        state
+            .lock_session("manual", Some("local-csv"))
+            .expect("lock");
+        assert_eq!(state.runtime_cache_counts(), (0, 0, 0));
+
+        let locked_called = Arc::new(AtomicBool::new(false));
+        let locked_flag = Arc::clone(&locked_called);
+        let locked_err = fetch_benchmark_history_with_vault_cache(
+            &state,
+            "SPY".into(),
+            Some("stooq".into()),
+            move |_sym, _prov| async move {
+                locked_flag.store(true, Ordering::SeqCst);
+                Err(QuoteError::Network("should not be reached".into()))
+            },
+        )
+        .await
+        .expect_err("locked vault must reject benchmark fetch");
+        assert!(!locked_called.load(Ordering::SeqCst));
+        assert!(locked_err.to_ascii_lowercase().contains("lock"));
+
+        // 5. Unlocking reloads encrypted accounts & benchmarks from SQLite cleanly
+        state.unlock_session(None).expect("unlock");
+        let (accts, _navs, benches) = state.runtime_cache_counts();
+        assert_eq!(accts, 1);
+        assert_eq!(benches, 1);
+
+        if let Some(parent) = db_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn csv_commit_auto_records_idempotent_nav_snapshots_per_account_and_currency() {
+        let db_path = temp_vault_path("csv-auto-nav");
+        let key_store: Arc<dyn KeyStore> = Arc::new(InMemoryKeyStore::new());
+        let state = VaultRuntimeState::open_with_store(&db_path, key_store, "in-memory-test");
+
+        let csv_a = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nVOO,Vanguard S&P 500,10,450.00,500.00,USD,2500.00\n";
+        let csv_b = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\n00700.HK,Tencent,100,320.00,400.00,HKD,10000.00\n";
+
+        let res_a = commit_csv_import_internal(
+            &state,
+            csv_a,
+            "schwab-taxable.csv",
+            Some("acct_schwab_taxable"),
+            Some("Schwab Taxable"),
+            Some("2026-11-21"),
+        )
+        .expect("commit a");
+        assert!(!res_a.deduplicated);
+        assert_eq!(res_a.snapshot.account_id, "acct_schwab_taxable");
+
+        // Re-committing same CSV to same account deduplicates idempotently without duplicating NAV row
+        let res_a_dup = commit_csv_import_internal(
+            &state,
+            csv_a,
+            "schwab-taxable.csv",
+            Some("acct_schwab_taxable"),
+            Some("Schwab Taxable"),
+            Some("2026-11-21"),
+        )
+        .expect("commit a dup");
+        assert!(res_a_dup.deduplicated);
+
+        let res_b = commit_csv_import_internal(
+            &state,
+            csv_b,
+            "futu-hk.csv",
+            Some("acct_futu_hk"),
+            Some("Futu HK"),
+            Some("2026-11-21"),
+        )
+        .expect("commit b");
+        assert!(!res_b.deduplicated);
+        assert_eq!(res_b.snapshot.account_id, "acct_futu_hk");
+
+        let (usd_snaps, hkd_snaps, acct_snaps) = state
+            .with_unlocked(|db, _| {
+                let usd = db
+                    .load_nav_snapshots(None, Some("USD"))
+                    .map_err(|e| e.to_string())?;
+                let hkd = db
+                    .load_nav_snapshots(None, Some("HKD"))
+                    .map_err(|e| e.to_string())?;
+                let per_acct = db
+                    .load_latest_portfolio_snapshots_per_account()
+                    .map_err(|e| e.to_string())?;
+                Ok((usd, hkd, per_acct))
+            })
+            .expect("load nav & per-account snaps");
+
+        assert_eq!(usd_snaps.len(), 1);
+        assert_eq!(usd_snaps[0].net_value_micros, 7_500_000_000);
+        assert_eq!(hkd_snaps.len(), 1);
+        assert_eq!(hkd_snaps[0].net_value_micros, 50_000_000_000);
+        assert_eq!(acct_snaps.len(), 2);
+
+        // Lock clears all runtime caches cleanly
+        state
+            .lock_session("manual", Some("local-csv"))
+            .expect("lock");
+        assert_eq!(state.runtime_cache_counts(), (0, 0, 0));
+
+        if let Some(parent) = db_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 }

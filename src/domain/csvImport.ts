@@ -9,12 +9,22 @@ import {
   decimalToFixed,
   type DecimalString,
 } from "./decimal";
+import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "./accounts";
 import { appendEvidence } from "./evidenceJournal";
+import {
+  decimalToMicros,
+  MICROS_PER_UNIT,
+  mulDivRoundBigInt,
+  NAV_STORE,
+  todayUtcIsoDate,
+  type NavSnapshotRecord,
+} from "./nav";
 import { readStored, removeStored, writeStored } from "../platform/storage";
 import {
   invokeCsvCommitImport,
   invokeCsvPreviewImport,
   invokeVaultClearPortfolio,
+  invokeVaultLoadAccountPortfolios,
   invokeVaultLoadPortfolio,
   isTauriRuntime,
   type TauriCsvCommitResult,
@@ -958,6 +968,8 @@ function addCashByCurrency(map: Map<string, DecimalString>, currency: string, am
 export async function parseCsvLocally(
   rawCsv: string,
   sourceLabel = "imported.csv",
+  accountId?: string,
+  accountLabel?: string,
 ): Promise<CsvImportPreview> {
   if (!rawCsv || !rawCsv.trim()) throw new Error("CSV payload is empty");
   const byteSize = new TextEncoder().encode(rawCsv).byteLength;
@@ -1380,7 +1392,7 @@ export async function parseCsvLocally(
     : (cashByCurrency[primaryCurrency] ?? "0.00");
 
   const currencySubtotals = computeCurrencySubtotals(currencies, holdings, cashByCurrencyMap);
-  const fingerprint = await computeFingerprint(
+  const baseFingerprint = await computeFingerprint(
     format,
     primaryCurrency,
     cashStr,
@@ -1388,16 +1400,36 @@ export async function parseCsvLocally(
     holdings,
     sortedTransactions,
   );
+  const resolvedAccountId = accountId?.trim() || DEFAULT_ACCOUNT_ID;
+  const resolvedAccountLabel = accountLabel?.trim() || "Local Portfolio (CSV + Paper)";
+  let fingerprint = baseFingerprint;
+  if (resolvedAccountId !== DEFAULT_ACCOUNT_ID) {
+    const scopedBytes = new TextEncoder().encode(
+      `foliohelm/account-snapshot/v1|${resolvedAccountId}|${baseFingerprint}`,
+    );
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      const digest = await crypto.subtle.digest("SHA-256", scopedBytes);
+      fingerprint = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+    } else {
+      let hash = 0x811c9dc5;
+      for (const b of scopedBytes) {
+        hash ^= b;
+        hash = Math.imul(hash, 0x01000193);
+      }
+      fingerprint = `${(hash >>> 0).toString(16).padStart(8, "0")}${baseFingerprint.slice(8)}`;
+    }
+  }
   const alreadyImported = storedFingerprints().includes(fingerprint);
   const labels = FORMAT_LABELS[format];
 
   const snapshot: ImportedPortfolioSnapshot = {
     id: `csv-${fingerprint.slice(0, 16)}`,
+    accountId: resolvedAccountId,
     fingerprint,
     sourceFormat: format,
     sourceLabel: safeLabel,
     importedAtUtc: new Date().toISOString(),
-    accountLabel: "Local Portfolio (CSV + Paper)",
+    accountLabel: resolvedAccountLabel,
     currency: primaryCurrency,
     cash: cashStr,
     cashByCurrency,
@@ -1422,33 +1454,122 @@ export async function parseCsvLocally(
   };
 }
 
-export async function previewBrokerCsv(rawCsv: string, sourceLabel: string): Promise<CsvImportPreview> {
-  if (isTauriRuntime()) {
-    return invokeCsvPreviewImport(rawCsv, sourceLabel);
+function buildNavRecordsFromImportedSnapshot(
+  snapshot: ImportedPortfolioSnapshot,
+  dateIso: string,
+  source: "csv-import" | "portfolio-load",
+): NavSnapshotRecord[] {
+  const acctId = snapshot.accountId?.trim() || DEFAULT_ACCOUNT_ID;
+  const updatedAt = snapshot.importedAtUtc || new Date().toISOString();
+  const positionsByCurr = new Map<string, bigint>();
+  const cashByCurr = new Map<string, bigint>();
+  const currSet = new Set<string>();
+
+  for (const h of snapshot.holdings) {
+    const curr = (h.currency || "USD").trim().toUpperCase();
+    if (!curr || curr === "MULTI") continue;
+    const qtyMicros = decimalToMicros(h.quantity);
+    const priceMicros = decimalToMicros(h.lastPrice || h.averageCost);
+    const mvMicros = mulDivRoundBigInt(qtyMicros, priceMicros, MICROS_PER_UNIT);
+    positionsByCurr.set(curr, (positionsByCurr.get(curr) ?? 0n) + mvMicros);
+    currSet.add(curr);
   }
-  return parseCsvLocally(rawCsv, sourceLabel);
+
+  if (snapshot.cashByCurrency && Object.keys(snapshot.cashByCurrency).length > 0) {
+    for (const [rawCurr, rawCash] of Object.entries(snapshot.cashByCurrency)) {
+      const curr = rawCurr.trim().toUpperCase();
+      if (!curr || curr === "MULTI") continue;
+      const cashMicros = decimalToMicros(rawCash);
+      cashByCurr.set(curr, (cashByCurr.get(curr) ?? 0n) + cashMicros);
+      if (cashMicros !== 0n || currSet.has(curr)) currSet.add(curr);
+    }
+  } else if (!snapshot.isMultiCurrency) {
+    const curr = (snapshot.currency && snapshot.currency !== "MULTI" ? snapshot.currency : "USD").toUpperCase();
+    cashByCurr.set(curr, decimalToMicros(snapshot.cash || "0"));
+    currSet.add(curr);
+  }
+
+  if (currSet.size === 0) {
+    const fallback = snapshot.currency && snapshot.currency !== "MULTI" ? snapshot.currency.toUpperCase() : "USD";
+    currSet.add(fallback);
+  }
+
+  return [...currSet].sort().map((curr) => {
+    const cashMicros = cashByCurr.get(curr) ?? 0n;
+    const positionsMicros = positionsByCurr.get(curr) ?? 0n;
+    const netMicros = cashMicros + positionsMicros;
+    return {
+      date: dateIso,
+      accountId: acctId,
+      currency: curr,
+      netValueMicros: netMicros.toString(),
+      cashMicros: cashMicros.toString(),
+      positionsMicros: positionsMicros.toString(),
+      externalCashFlowMicros: "0",
+      source,
+      updatedAt,
+    };
+  });
 }
 
-export async function commitBrokerCsv(rawCsv: string, sourceLabel: string): Promise<CsvCommitResult> {
+export async function recordNavSnapshotsForPortfolio(
+  snapshot: ImportedPortfolioSnapshot,
+  source: "csv-import" | "portfolio-load",
+  dateIso = todayUtcIsoDate(),
+): Promise<void> {
+  const records = buildNavRecordsFromImportedSnapshot(snapshot, dateIso, source);
+  if (records.length > 0) {
+    await NAV_STORE.recordSnapshots(records, true);
+  }
+}
+
+export async function previewBrokerCsv(
+  rawCsv: string,
+  sourceLabel: string,
+  accountId?: string,
+  accountLabel?: string,
+): Promise<CsvImportPreview> {
   if (isTauriRuntime()) {
-    return invokeCsvCommitImport(rawCsv, sourceLabel);
+    return invokeCsvPreviewImport(rawCsv, sourceLabel, accountId, accountLabel);
+  }
+  return parseCsvLocally(rawCsv, sourceLabel, accountId, accountLabel);
+}
+
+export async function commitBrokerCsv(
+  rawCsv: string,
+  sourceLabel: string,
+  accountId?: string,
+  accountLabel?: string,
+): Promise<CsvCommitResult> {
+  if (isTauriRuntime()) {
+    const result = await invokeCsvCommitImport(rawCsv, sourceLabel, accountId, accountLabel);
+    ACCOUNT_STORE.registerAccountSnapshot(result.snapshot);
+    await NAV_STORE.hydrateFromVault().catch(() => {});
+    return result;
   }
 
-  const preview = await parseCsvLocally(rawCsv, sourceLabel);
+  const preview = await parseCsvLocally(rawCsv, sourceLabel, accountId, accountLabel);
   const fingerprints = storedFingerprints();
   if (fingerprints.includes(preview.snapshot.fingerprint)) {
-    const existing = readStored<ImportedPortfolioSnapshot | null>(LOCAL_PORTFOLIO_KEY, null);
+    const existing = ACCOUNT_STORE.getSnapshotForAccount(preview.snapshot.accountId ?? DEFAULT_ACCOUNT_ID)
+      ?? readStored<ImportedPortfolioSnapshot | null>(LOCAL_PORTFOLIO_KEY, null);
+    const snap = existing ?? preview.snapshot;
+    ACCOUNT_STORE.registerAccountSnapshot(snap);
+    await recordNavSnapshotsForPortfolio(snap, "csv-import");
     return {
       deduplicated: true,
       evidenceSequence: null,
-      snapshot: existing ?? preview.snapshot,
+      snapshot: snap,
     };
   }
 
   writeStored(LOCAL_PORTFOLIO_KEY, preview.snapshot);
   writeStored(LOCAL_FINGERPRINTS_KEY, [...fingerprints, preview.snapshot.fingerprint]);
+  ACCOUNT_STORE.registerAccountSnapshot(preview.snapshot);
+  await recordNavSnapshotsForPortfolio(preview.snapshot, "csv-import");
   const evidence = await appendEvidence("portfolio_import", {
     mode: "local-csv",
+    accountId: preview.snapshot.accountId ?? DEFAULT_ACCOUNT_ID,
     sourceFormat: preview.snapshot.sourceFormat,
     holdingsCount: String(preview.snapshot.holdings.length),
     transactionsCount: String(preview.snapshot.transactions.length),
@@ -1470,8 +1591,28 @@ export async function loadPersistedLocalPortfolio(): Promise<ImportedPortfolioSn
   return readStored<ImportedPortfolioSnapshot | null>(LOCAL_PORTFOLIO_KEY, null);
 }
 
+export async function loadPersistedAccountPortfolios(): Promise<ImportedPortfolioSnapshot[]> {
+  if (isTauriRuntime()) {
+    const multi = await invokeVaultLoadAccountPortfolios().catch(() => null);
+    if (Array.isArray(multi)) {
+      return multi;
+    }
+    // Backward-compatible fallback for older test mocks that only stub `vault_load_portfolio`.
+    const single = await invokeVaultLoadPortfolio().catch(() => null);
+    return single ? [single] : [];
+  }
+
+  await ACCOUNT_STORE.hydrateAccountsFromVault();
+  const fromAccounts = ACCOUNT_STORE.getAllAccountSnapshots();
+  if (fromAccounts.length > 0) return fromAccounts;
+  const legacySingle = readStored<ImportedPortfolioSnapshot | null>(LOCAL_PORTFOLIO_KEY, null);
+  return legacySingle ? [{ ...legacySingle, accountId: legacySingle.accountId ?? DEFAULT_ACCOUNT_ID }] : [];
+}
+
 export async function clearPersistedLocalPortfolio(): Promise<boolean> {
   const tauriOk = isTauriRuntime() ? await invokeVaultClearPortfolio() : true;
+  ACCOUNT_STORE.clearAll();
+  NAV_STORE.clearAll();
   const localOk = removeStored(LOCAL_PORTFOLIO_KEY)
     && removeStored(LOCAL_FINGERPRINTS_KEY)
     && removeStored(LOCAL_PAPER_ORDERS_KEY);

@@ -33,6 +33,23 @@ import type {
   WorkspaceMode,
 } from "./contracts";
 import type { ImportedPortfolioSnapshot } from "./csvImport";
+import {
+  aggregatePortfolioSnapshots,
+  ALL_ACCOUNTS_ID,
+  DEFAULT_ACCOUNT_ID,
+} from "./accountAggregation";
+
+const brokerResetHooks = new Set<() => void>();
+
+/**
+ * Registers an optional teardown callback invoked by `MOCK_BROKER.reset()`
+ * (test harness only) so dependent runtime stores can clear state without
+ * forcing `mockBroker.ts` or `src/test/setup.ts` to import Tauri IPC modules.
+ */
+export function registerBrokerResetHook(hook: () => void): () => void {
+  brokerResetHooks.add(hook);
+  return () => brokerResetHooks.delete(hook);
+}
 
 export interface LocalPortfolioMeta {
   id: string;
@@ -930,6 +947,9 @@ export class MockBroker implements BrokerAdapter {
   private workspaceMode: WorkspaceMode = "mock";
   private snapshot: BrokerSnapshot = BASE_SNAPSHOT;
   private localImported: ImportedPortfolioSnapshot | null = null;
+  private localAccountSnapshots = new Map<string, ImportedPortfolioSnapshot>();
+  private selectedAccountId: string = ALL_ACCOUNTS_ID;
+  private allLocalOrders: BrokerOrder[] = [];
   private localSnapshot: BrokerSnapshot | null = null;
   private localMeta: LocalPortfolioMeta | null = null;
   private publicQuotesEnabled = false;
@@ -1054,32 +1074,136 @@ export class MockBroker implements BrokerAdapter {
     this.notify();
   }
 
-  applyLocalPortfolioSnapshot(
-    imported: ImportedPortfolioSnapshot,
-    options: { switchMode?: boolean; resetOrders?: boolean } = {},
-  ): void {
-    const currencies = deriveLocalCurrencies(imported);
-    const isMultiCurrency = Boolean(imported.isMultiCurrency) || currencies.length > 1;
-    this.localImported = imported;
+  getSelectedAccountId(): string {
+    return this.selectedAccountId;
+  }
+
+  getLocalAccountIds(): string[] {
+    return [...this.localAccountSnapshots.keys()].sort();
+  }
+
+  setSelectedAccountId(accountId: string): void {
+    const normalized = accountId.trim() || ALL_ACCOUNTS_ID;
+    if (this.selectedAccountId === normalized) return;
+    this.selectedAccountId = normalized;
+    if (this.localAccountSnapshots.size > 0) {
+      this.rebuildActiveLocalSnapshot();
+    }
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.notify();
+  }
+
+  private filterOrdersForActiveAccount(orders: readonly BrokerOrder[]): BrokerOrder[] {
+    if (this.selectedAccountId === ALL_ACCOUNTS_ID) {
+      return [...orders];
+    }
+    return orders.filter((order) => (order.accountId ?? DEFAULT_ACCOUNT_ID) === this.selectedAccountId);
+  }
+
+  private resolveEffectiveLocalImported(): ImportedPortfolioSnapshot | null {
+    if (this.localAccountSnapshots.size === 0) return null;
+    if (this.selectedAccountId === ALL_ACCOUNTS_ID) {
+      return aggregatePortfolioSnapshots([...this.localAccountSnapshots.values()]);
+    }
+    const exact = this.localAccountSnapshots.get(this.selectedAccountId);
+    if (exact) return exact;
+    return {
+      id: `empty-${this.selectedAccountId}`,
+      accountId: this.selectedAccountId,
+      fingerprint: `empty-${this.selectedAccountId}`,
+      sourceFormat: "empty_account",
+      sourceLabel: "No CSV imported yet",
+      importedAtUtc: new Date().toISOString(),
+      accountLabel: this.selectedAccountId,
+      currency: "USD",
+      cash: "0.00",
+      cashByCurrency: { USD: "0.00" },
+      currencies: ["USD"],
+      isMultiCurrency: false,
+      holdings: [],
+      transactions: [],
+      warnings: [],
+    };
+  }
+
+  private rebuildActiveLocalSnapshot(): void {
+    const effective = this.resolveEffectiveLocalImported();
+    if (!effective) {
+      this.localImported = null;
+      this.localMeta = null;
+      this.localSnapshot = null;
+      return;
+    }
+    const currencies = deriveLocalCurrencies(effective);
+    const isMultiCurrency = Boolean(effective.isMultiCurrency) || currencies.length > 1;
+    this.localImported = effective;
     this.localMeta = {
-      id: imported.id,
-      fingerprint: imported.fingerprint,
-      sourceFormat: imported.sourceFormat,
-      sourceLabel: imported.sourceLabel,
-      importedAtUtc: imported.importedAtUtc,
-      currency: isMultiCurrency ? "MULTI" : (currencies[0] ?? imported.currency ?? "USD"),
+      id: effective.id,
+      fingerprint: effective.fingerprint,
+      sourceFormat: effective.sourceFormat,
+      sourceLabel: effective.sourceLabel,
+      importedAtUtc: effective.importedAtUtc,
+      currency: isMultiCurrency ? "MULTI" : (currencies[0] ?? effective.currency ?? "USD"),
       currencies,
       isMultiCurrency,
-      holdingsCount: imported.holdings.length,
-      transactionsCount: imported.transactions.length,
-      warnings: [...imported.warnings],
+      holdingsCount: effective.holdings.length,
+      transactionsCount: effective.transactions.length,
+      warnings: [...effective.warnings],
     };
-    const carryOrders = options.resetOrders ? [] : (this.localSnapshot?.orders ?? []);
+    const scopedOrders = this.filterOrdersForActiveAccount(this.allLocalOrders);
     this.localSnapshot = buildLocalSnapshotFromCsv(
-      imported,
-      carryOrders,
-      this.publicQuotesEnabled ? this.publicQuotes : undefined,
+      effective,
+      scopedOrders,
+      this.publicQuotesEnabled && this.publicQuotes.size > 0 ? this.publicQuotes : undefined,
     );
+  }
+
+  applyAccountPortfolioSnapshots(
+    snapshots: readonly ImportedPortfolioSnapshot[],
+    options: { switchMode?: boolean; resetOrders?: boolean; selectedAccountId?: string } = {},
+  ): void {
+    this.localAccountSnapshots.clear();
+    for (const snap of snapshots) {
+      const acctId = snap.accountId?.trim() || DEFAULT_ACCOUNT_ID;
+      this.localAccountSnapshots.set(acctId, { ...snap, accountId: acctId });
+    }
+    if (options.resetOrders) {
+      this.allLocalOrders = [];
+    }
+    if (options.selectedAccountId) {
+      this.selectedAccountId = options.selectedAccountId;
+    } else if (
+      this.selectedAccountId !== ALL_ACCOUNTS_ID
+      && !this.localAccountSnapshots.has(this.selectedAccountId)
+    ) {
+      this.selectedAccountId = ALL_ACCOUNTS_ID;
+    }
+
+    this.rebuildActiveLocalSnapshot();
+    if (this.localSnapshot && options.switchMode !== false) {
+      this.workspaceMode = "local-csv";
+    } else if (!this.localSnapshot) {
+      this.workspaceMode = "mock";
+    }
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.notify();
+  }
+
+  applyLocalPortfolioSnapshot(
+    imported: ImportedPortfolioSnapshot,
+    options: { switchMode?: boolean; resetOrders?: boolean; selectAccount?: boolean } = {},
+  ): void {
+    const acctId = imported.accountId?.trim() || DEFAULT_ACCOUNT_ID;
+    this.localAccountSnapshots.set(acctId, { ...imported, accountId: acctId });
+    if (options.resetOrders) {
+      this.allLocalOrders = [];
+    }
+    if (options.selectAccount) {
+      this.selectedAccountId = acctId;
+    }
+    this.rebuildActiveLocalSnapshot();
     if (options.switchMode !== false) {
       this.workspaceMode = "local-csv";
     }
@@ -1122,20 +1246,9 @@ export class MockBroker implements BrokerAdapter {
       if (!this.localSnapshot) return;
       const nextOrders = replace
         ? [...persistedOrders].map(cloneOrder).sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))
-        : mergeOrders(this.localSnapshot.orders);
-      if (this.localImported) {
-        this.localSnapshot = buildLocalSnapshotFromCsv(
-          this.localImported,
-          nextOrders,
-          this.publicQuotesEnabled && this.publicQuotes.size > 0 ? this.publicQuotes : undefined,
-        );
-      } else {
-        this.localSnapshot = {
-          ...this.localSnapshot,
-          orders: nextOrders,
-          ordersFilled: nextOrders.filter((o) => o.status === "filled").length,
-        };
-      }
+        : mergeOrders(this.allLocalOrders);
+      this.allLocalOrders = nextOrders;
+      this.rebuildActiveLocalSnapshot();
     } else {
       // When replacing (e.g. after .fhvault restore), drop all pre-restore mock orders
       // and keep only the immutable demo baseline plus orders present in the restored vault.
@@ -1171,6 +1284,9 @@ export class MockBroker implements BrokerAdapter {
     this.workspaceMode = "mock";
     this.snapshot = BASE_SNAPSHOT;
     this.localImported = null;
+    this.localAccountSnapshots.clear();
+    this.selectedAccountId = ALL_ACCOUNTS_ID;
+    this.allLocalOrders = [];
     this.localSnapshot = null;
     this.localMeta = null;
     this.publicQuotesEnabled = false;
@@ -1185,6 +1301,9 @@ export class MockBroker implements BrokerAdapter {
 
   clearLocalPortfolio(): void {
     this.localImported = null;
+    this.localAccountSnapshots.clear();
+    this.selectedAccountId = ALL_ACCOUNTS_ID;
+    this.allLocalOrders = [];
     this.localSnapshot = null;
     this.localMeta = null;
     this.workspaceMode = "mock";
@@ -1256,6 +1375,9 @@ export class MockBroker implements BrokerAdapter {
     this.workspaceMode = "mock";
     this.snapshot = BASE_SNAPSHOT;
     this.localImported = null;
+    this.localAccountSnapshots.clear();
+    this.selectedAccountId = ALL_ACCOUNTS_ID;
+    this.allLocalOrders = [];
     this.localSnapshot = null;
     this.localMeta = null;
     this.publicQuotesEnabled = false;
@@ -1266,6 +1388,9 @@ export class MockBroker implements BrokerAdapter {
     this.previewIssuedAt.clear();
     this.sequence = 0;
     this.scenario = "healthy";
+    for (const hook of brokerResetHooks) {
+      hook();
+    }
     this.notify();
   }
 
@@ -1383,8 +1508,12 @@ export class MockBroker implements BrokerAdapter {
     const event = unknown
       ? orderEvent("unknown", eventAt, "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
       : orderEvent("accepted", eventAt, "Accepted by the local paper ledger; no broker request exists", "本地纸上账本已接受；不存在券商请求");
+    const orderAccountId = isLocalMode
+      ? (this.selectedAccountId === ALL_ACCOUNTS_ID ? DEFAULT_ACCOUNT_ID : this.selectedAccountId)
+      : undefined;
     const order: BrokerOrder = {
       id,
+      ...(orderAccountId ? { accountId: orderAccountId } : {}),
       symbol: preview.draft.symbol,
       side: preview.draft.side,
       type: preview.draft.type,
@@ -1451,6 +1580,7 @@ export class MockBroker implements BrokerAdapter {
     };
 
     if (isLocalMode) {
+      this.allLocalOrders = [order, ...this.allLocalOrders];
       this.localSnapshot = updatedTarget;
     } else {
       this.snapshot = updatedTarget;
@@ -1479,6 +1609,7 @@ export class MockBroker implements BrokerAdapter {
       orders: target.orders.map((item) => item.id === orderId ? reconciled : item),
     };
     if (isLocalMode) {
+      this.allLocalOrders = this.allLocalOrders.map((item) => item.id === orderId ? reconciled : item);
       this.localSnapshot = nextTarget;
     } else {
       this.snapshot = nextTarget;

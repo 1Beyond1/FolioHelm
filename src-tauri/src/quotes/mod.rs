@@ -27,9 +27,17 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 
-use crate::storage::CachedPublicQuote;
+use crate::storage::{BenchmarkPricePoint, CachedPublicQuote, StoredBenchmarkSeries};
 
 pub const ALLOWED_QUOTE_HOSTS: &[&str] = &["stooq.com", "query1.finance.yahoo.com"];
+/// Strictly allowlisted read-only benchmark symbols and their isolated currency buckets.
+pub const ALLOWED_BENCHMARK_SYMBOLS: &[(&str, &str)] = &[
+    ("SPY", "USD"),
+    ("QQQ", "USD"),
+    ("2800.HK", "HKD"),
+    ("510300.SS", "CNY"),
+];
+pub const MAX_BENCHMARK_POINTS: usize = 420;
 pub const MAX_QUOTE_SYMBOLS: usize = 50;
 pub const QUOTE_TIMEOUT_SECS: u64 = 7;
 pub const BATCH_QUOTE_TIMEOUT_SECS: u64 = 20;
@@ -894,6 +902,273 @@ fn compute_change_pct_fixed(change_fixed: i128, base_fixed: i128) -> Result<i128
     fixed_div(scaled_change, base_fixed)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkFetchResponseDto {
+    pub series: Option<StoredBenchmarkSeries>,
+    pub from_cache: bool,
+    pub degraded_reason: Option<String>,
+    pub provider: String,
+}
+
+/// Strictly validates that `raw_symbol` is in the read-only benchmark allowlist.
+/// Never accepts arbitrary URLs, path segments, or non-benchmark tickers.
+pub fn validate_benchmark_symbol(
+    raw_symbol: &str,
+) -> Result<(&'static str, &'static str), QuoteError> {
+    let normalized = raw_symbol.trim().to_ascii_uppercase();
+    for &(allowed, currency) in ALLOWED_BENCHMARK_SYMBOLS {
+        if normalized == allowed {
+            return Ok((allowed, currency));
+        }
+    }
+    Err(QuoteError::InvalidSymbol(format!(
+        "benchmark symbol '{}' is not in the read-only allowlist (SPY, QQQ, 2800.HK, 510300.SS)",
+        raw_symbol.trim().chars().take(24).collect::<String>()
+    )))
+}
+
+fn fixed_1e8_to_micros(value_1e8: i128) -> Result<i128, QuoteError> {
+    let rounded = if value_1e8 >= 0 {
+        value_1e8
+            .checked_add(50)
+            .ok_or_else(|| QuoteError::Parse("benchmark micro scaling overflow".to_string()))?
+            / 100
+    } else {
+        value_1e8
+            .checked_sub(50)
+            .ok_or_else(|| QuoteError::Parse("benchmark micro scaling overflow".to_string()))?
+            / 100
+    };
+    if rounded <= 0 {
+        return Err(QuoteError::Parse(
+            "non-positive benchmark close rejected".to_string(),
+        ));
+    }
+    Ok(rounded)
+}
+
+/// Fetches daily historical closing prices for an allowlisted read-only benchmark symbol.
+pub async fn fetch_benchmark_history(
+    raw_symbol: &str,
+    provider: PublicQuoteProvider,
+) -> Result<StoredBenchmarkSeries, QuoteError> {
+    let (symbol, currency) = validate_benchmark_symbol(raw_symbol)?;
+    let client = build_read_only_client()?;
+    let now = Utc::now();
+    let as_of_utc = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    match provider {
+        PublicQuoteProvider::Stooq => {
+            let (stooq_ticker, _) = map_stooq_symbol(symbol);
+            let d2 = now.format("%Y%m%d");
+            let d1 = (now - TimeDelta::days(400)).format("%Y%m%d");
+            let url_str = format!("https://stooq.com/q/d/l/?s={stooq_ticker}&i=d&d1={d1}&d2={d2}");
+            let url = validate_allowlisted_https_url(&url_str)?;
+            let response = client
+                .get(url)
+                .header("Accept", "text/csv,text/plain")
+                .send()
+                .await
+                .map_err(|error| QuoteError::Network(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(QuoteError::Network(format!(
+                    "stooq history returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let body = read_bounded_response_utf8(response, MAX_QUOTE_RESPONSE_BYTES).await?;
+            parse_stooq_history_csv(symbol, currency, &body, &as_of_utc)
+        }
+        PublicQuoteProvider::Yahoo => {
+            let yahoo_ticker = map_yahoo_symbol(symbol);
+            let url_str = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval=1d&range=1y"
+            );
+            let url = validate_allowlisted_https_url(&url_str)?;
+            let response = client
+                .get(url)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .map_err(|error| QuoteError::Network(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(QuoteError::Network(format!(
+                    "yahoo history returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            let body = read_bounded_response_utf8(response, MAX_QUOTE_RESPONSE_BYTES).await?;
+            parse_yahoo_history_json(symbol, currency, &body, &as_of_utc)
+        }
+    }
+}
+
+pub fn parse_stooq_history_csv(
+    symbol: &str,
+    currency: &str,
+    body: &str,
+    as_of_utc: &str,
+) -> Result<StoredBenchmarkSeries, QuoteError> {
+    if body.len() > MAX_QUOTE_RESPONSE_BYTES {
+        return Err(QuoteError::ResponseTooLarge {
+            limit: MAX_QUOTE_RESPONSE_BYTES,
+        });
+    }
+    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
+    let header = lines
+        .next()
+        .ok_or_else(|| QuoteError::Parse("empty stooq history CSV".to_string()))?;
+    let headers: Vec<String> = header
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+    let date_idx = headers
+        .iter()
+        .position(|h| h == "date")
+        .ok_or_else(|| QuoteError::Parse("missing Date column in stooq history CSV".to_string()))?;
+    let close_idx = headers.iter().position(|h| h == "close").ok_or_else(|| {
+        QuoteError::Parse("missing Close column in stooq history CSV".to_string())
+    })?;
+
+    let mut by_date: BTreeMap<String, i128> = BTreeMap::new();
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        if cols.len() <= date_idx || cols.len() <= close_idx {
+            continue;
+        }
+        let date_str = cols[date_idx];
+        let close_str = cols[close_idx];
+        if date_str.len() != 10
+            || NaiveDate::parse_from_str(date_str, "%Y-%m-%d").is_err()
+            || close_str.is_empty()
+            || close_str.eq_ignore_ascii_case("N/D")
+        {
+            continue;
+        }
+        if let Ok(fixed) = parse_positive_fixed_decimal(close_str) {
+            if let Ok(micros) = fixed_1e8_to_micros(fixed) {
+                by_date.insert(date_str.to_string(), micros);
+            }
+        }
+    }
+
+    if by_date.is_empty() {
+        return Err(QuoteError::Parse(format!(
+            "no valid daily history bars on stooq for {symbol}"
+        )));
+    }
+
+    let mut points: Vec<BenchmarkPricePoint> = by_date
+        .into_iter()
+        .map(|(date, close_micros)| BenchmarkPricePoint { date, close_micros })
+        .collect();
+    if points.len() > MAX_BENCHMARK_POINTS {
+        let start = points.len() - MAX_BENCHMARK_POINTS;
+        points = points.split_off(start);
+    }
+
+    Ok(StoredBenchmarkSeries {
+        symbol: symbol.to_string(),
+        currency: currency.to_string(),
+        provider: PublicQuoteProvider::Stooq.code().to_string(),
+        as_of_utc: as_of_utc.to_string(),
+        points,
+    })
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryRoot {
+    chart: YahooHistoryBody,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryBody {
+    result: Option<Vec<YahooHistoryResult>>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryResult {
+    timestamp: Option<Vec<i64>>,
+    indicators: Option<YahooHistoryIndicators>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryIndicators {
+    quote: Option<Vec<YahooHistoryQuote>>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryQuote {
+    close: Option<Vec<Option<Box<RawValue>>>>,
+}
+
+pub fn parse_yahoo_history_json(
+    symbol: &str,
+    currency: &str,
+    body: &str,
+    as_of_utc: &str,
+) -> Result<StoredBenchmarkSeries, QuoteError> {
+    if body.len() > MAX_QUOTE_RESPONSE_BYTES {
+        return Err(QuoteError::ResponseTooLarge {
+            limit: MAX_QUOTE_RESPONSE_BYTES,
+        });
+    }
+    let parsed: YahooHistoryRoot =
+        serde_json::from_str(body).map_err(|error| QuoteError::Parse(error.to_string()))?;
+    let item = parsed
+        .chart
+        .result
+        .and_then(|mut list| list.drain(..).next())
+        .ok_or_else(|| QuoteError::Parse(format!("missing yahoo history result for {symbol}")))?;
+
+    let timestamps = item.timestamp.unwrap_or_default();
+    let closes = item
+        .indicators
+        .and_then(|ind| ind.quote)
+        .and_then(|mut q| q.drain(..).next())
+        .and_then(|q| q.close)
+        .unwrap_or_default();
+
+    let mut by_date: BTreeMap<String, i128> = BTreeMap::new();
+    for (ts, close_opt) in timestamps.iter().zip(closes.iter()) {
+        let Some(dt) = chrono::DateTime::from_timestamp(*ts, 0) else {
+            continue;
+        };
+        let Ok(fixed) = parse_raw_json_positive_fixed(close_opt.as_deref()) else {
+            continue;
+        };
+        let Ok(micros) = fixed_1e8_to_micros(fixed) else {
+            continue;
+        };
+        let date = dt.format("%Y-%m-%d").to_string();
+        by_date.insert(date, micros);
+    }
+
+    if by_date.is_empty() {
+        return Err(QuoteError::Parse(format!(
+            "no valid daily history bars on yahoo for {symbol}"
+        )));
+    }
+
+    let mut points: Vec<BenchmarkPricePoint> = by_date
+        .into_iter()
+        .map(|(date, close_micros)| BenchmarkPricePoint { date, close_micros })
+        .collect();
+    if points.len() > MAX_BENCHMARK_POINTS {
+        let start = points.len() - MAX_BENCHMARK_POINTS;
+        points = points.split_off(start);
+    }
+
+    Ok(StoredBenchmarkSeries {
+        symbol: symbol.to_string(),
+        currency: currency.to_string(),
+        provider: PublicQuoteProvider::Yahoo.code().to_string(),
+        as_of_utc: as_of_utc.to_string(),
+        points,
+    })
+}
+
 fn format_fixed(value: i128, decimals: u32) -> String {
     let negative = value < 0;
     let abs = value.unsigned_abs();
@@ -1154,5 +1429,40 @@ mod tests {
         )
         .await;
         assert_eq!(timed_out, Err(QuoteError::BatchTimeout));
+    }
+
+    #[test]
+    fn enforces_read_only_benchmark_allowlist_and_parses_history_with_exact_i128_micros() {
+        assert_eq!(validate_benchmark_symbol("spy"), Ok(("SPY", "USD")));
+        assert_eq!(validate_benchmark_symbol("QQQ"), Ok(("QQQ", "USD")));
+        assert_eq!(validate_benchmark_symbol("2800.HK"), Ok(("2800.HK", "HKD")));
+        assert_eq!(
+            validate_benchmark_symbol("510300.SS"),
+            Ok(("510300.SS", "CNY"))
+        );
+
+        // Non-allowlisted symbols, arbitrary URLs, and injection attempts are rejected Fail-Closed.
+        assert!(validate_benchmark_symbol("AAPL").is_err());
+        assert!(validate_benchmark_symbol("https://evil.example/spy").is_err());
+        assert!(validate_benchmark_symbol("SPY&token=leak").is_err());
+
+        let stooq_hist = "Date,Open,High,Low,Close,Volume\n2026-11-19,20.00,20.40,19.90,20.25,1000\n2026-11-20,20.30,20.80,20.20,20.60,1200\n";
+        let hk_series =
+            parse_stooq_history_csv("2800.HK", "HKD", stooq_hist, "2026-11-22T00:00:00.000Z")
+                .expect("parse stooq history");
+        assert_eq!(hk_series.symbol, "2800.HK");
+        assert_eq!(hk_series.currency, "HKD");
+        assert_eq!(hk_series.points.len(), 2);
+        assert_eq!(hk_series.points[0].date, "2026-11-19");
+        assert_eq!(hk_series.points[0].close_micros, 20_250_000);
+        assert_eq!(hk_series.points[1].close_micros, 20_600_000);
+
+        let yahoo_hist = r#"{"chart":{"result":[{"timestamp":[1763510400,1763596800],"indicators":{"quote":[{"close":[580.125,null]}]}}]}}"#;
+        let spy_series =
+            parse_yahoo_history_json("SPY", "USD", yahoo_hist, "2026-11-22T00:00:00.000Z")
+                .expect("parse yahoo history");
+        assert_eq!(spy_series.symbol, "SPY");
+        assert_eq!(spy_series.points.len(), 1);
+        assert_eq!(spy_series.points[0].close_micros, 580_125_000);
     }
 }

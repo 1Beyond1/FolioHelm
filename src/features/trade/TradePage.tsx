@@ -3,6 +3,8 @@ import type { FormEvent } from "react";
 import type { Language } from "../../types";
 import { decimalCompare, decimalMultiply, decimalToNumber, money, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
 import { findMockHolding, findMockQuote, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
+import { ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID } from "../../domain/accounts";
+import { buildNavSnapshotsFromBrokerSnapshot, NAV_STORE, todayUtcIsoDate } from "../../domain/nav";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import { persistPaperOrder } from "../../domain/vaultStorage";
 import { formatCurrency } from "../../formatters";
@@ -490,6 +492,19 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
       const simulatedOrder: BrokerOrder = MOCK_BROKER.consumePreview(preview.previewId, currentDraftHash);
 
       void persistPaperOrder(workspaceMode, simulatedOrder);
+      if (isLocalMode) {
+        const activeAcctId = simulatedOrder.accountId
+          ?? (MOCK_BROKER.getSelectedAccountId() === ALL_ACCOUNTS_ID
+            ? DEFAULT_ACCOUNT_ID
+            : MOCK_BROKER.getSelectedAccountId());
+        const navRecords = buildNavSnapshotsFromBrokerSnapshot(
+          MOCK_BROKER.getSnapshot(),
+          activeAcctId,
+          todayUtcIsoDate(),
+          "paper-trade",
+        );
+        void NAV_STORE.recordSnapshots(navRecords, true).catch(() => undefined);
+      }
       setReceipt({
         receiptId: `${isLocalMode ? "PAPER-RECEIPT" : "DEMO-RECEIPT"}-${simulatedOrder.id}`,
         orderId: simulatedOrder.id,

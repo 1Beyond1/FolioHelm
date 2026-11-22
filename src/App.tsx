@@ -22,17 +22,26 @@ import { TradePage } from "./features/trade";
 import { SettingsPage } from "./features/settings";
 import { AutomationPage } from "./features/automation";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "./domain/mockBroker";
-import { AUTOMATION_CONTROLLER } from "./domain/automation";
+import { ACCOUNT_STORE } from "./domain/accounts";
+import { decimalToNumber } from "./domain/decimal";
+import {
+  aggregateNavSnapshotsByCurrency,
+  buildCalendarHeatmapFromNav,
+  computeTwrSeries,
+  NAV_STORE,
+} from "./domain/nav";
 import { appendEvidence } from "./domain/evidenceJournal";
 import {
   DEFAULT_WORKSPACE_PREFERENCES,
   hydrateWorkspaceFromVault,
   normalizeWorkspacePreferences,
+  purgeAllFrontendSensitiveMemory,
   saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
   WORKSPACE_PREFS_KEY,
   type VaultHydrationResult,
 } from "./domain/vaultStorage";
+import type { PublicQuoteProviderChoice } from "./domain/publicQuotes";
 import {
   invokeVaultLock,
   invokeVaultStatus,
@@ -112,6 +121,15 @@ export function App() {
       ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
       : DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes,
   );
+  const [quoteProvider, setQuoteProvider] = useState<PublicQuoteProviderChoice>(() =>
+    !isTauriRuntime()
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).quoteProvider
+      : DEFAULT_WORKSPACE_PREFERENCES.quoteProvider,
+  );
+  const [selectedDashboardCurrency, setSelectedDashboardCurrency] = useState<string>("USD");
+  const [selectedBenchmark, setSelectedBenchmark] = useState<string | null>(null);
+  const [benchmarkLoading, setBenchmarkLoading] = useState(false);
+  const [benchmarkNotice, setBenchmarkNotice] = useState<string | null>(null);
   const [, setBrokerRevision] = useState(0);
   const copy = getCopy(language);
   const navigation: NavigationState = location.route === "trade"
@@ -151,7 +169,15 @@ export function App() {
   }, [language]);
 
   useEffect(() => {
-    return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
+    const bump = () => setBrokerRevision((current) => current + 1);
+    const unsubBroker = MOCK_BROKER.subscribe(bump);
+    const unsubAccounts = ACCOUNT_STORE.subscribe(bump);
+    const unsubNav = NAV_STORE.subscribe(bump);
+    return () => {
+      unsubBroker();
+      unsubAccounts();
+      unsubNav();
+    };
   }, []);
 
   useEffect(() => {
@@ -162,13 +188,15 @@ export function App() {
           const { status, preferences } = await hydrateWorkspaceFromVault();
           if (!active) return;
           setIdleLockMinutes(preferences.idleLockMinutes);
+          setQuoteProvider(preferences.quoteProvider);
           if (status) {
             setHasLockPassphrase(Boolean(status.hasLockPassphrase));
             setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
             if (!status.unlocked) {
               if (status.lockState === "user-locked") {
-                MOCK_BROKER.purgeSensitiveMemory();
-                AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+                purgeAllFrontendSensitiveMemory();
+                setSelectedBenchmark(null);
+                setBenchmarkNotice(null);
                 setTradePrefill(null);
                 setSearchOpen(false);
                 setUserLocked(true);
@@ -177,8 +205,9 @@ export function App() {
                 setVaultErrorLocked(false);
                 setVaultLockedReason(null);
               } else {
-                MOCK_BROKER.purgeSensitiveMemory();
-                AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+                purgeAllFrontendSensitiveMemory();
+                setSelectedBenchmark(null);
+                setBenchmarkNotice(null);
                 setVaultErrorLocked(true);
                 setVaultLockedReason(status.lockedReason ?? null);
               }
@@ -198,6 +227,7 @@ export function App() {
       if (!detail) return;
       if (detail.preferences) {
         setIdleLockMinutes(detail.preferences.idleLockMinutes);
+        setQuoteProvider(detail.preferences.quoteProvider);
       }
       if (detail.status) {
         setHasLockPassphrase(Boolean(detail.status.hasLockPassphrase));
@@ -214,10 +244,11 @@ export function App() {
   const lockSession = useCallback(async (trigger: "manual" | "idle") => {
     const mode = MOCK_BROKER.getWorkspaceMode();
     // P0-2 Fail-Closed: immediately wipe all sensitive user portfolio, quote, order,
-    // automation, and draft state from JS memory, sanitize window title, and engage LockScreen
-    // synchronously BEFORE awaiting any IPC or evidence writes.
-    MOCK_BROKER.purgeSensitiveMemory();
-    AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+    // automation, accounts, NAV snapshots, benchmark caches, and draft state from JS memory,
+    // sanitize window title, and engage LockScreen synchronously BEFORE awaiting any IPC.
+    purgeAllFrontendSensitiveMemory();
+    setSelectedBenchmark(null);
+    setBenchmarkNotice(null);
     setTradePrefill(null);
     setSearchOpen(false);
     setSettingsModalOpen(false);
@@ -524,8 +555,72 @@ export function App() {
 
   const mockPortfolio = getMockPortfolio(language);
   const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const isLocalMode = workspaceMode === "local-csv";
   const publicQuotesEnabled = MOCK_BROKER.isPublicQuotesEnabled();
   const dataStatus = aggregateDataStatus();
+
+  const rawSnapshot = MOCK_BROKER.getSnapshot();
+  const localAccounts = ACCOUNT_STORE.getAccounts();
+  const selectedAccountId = MOCK_BROKER.getSelectedAccountId();
+  const availableCurrencies = (() => {
+    const fromBreakdowns = (rawSnapshot.account.currencyBreakdowns ?? [])
+      .map((b) => b.currency.toUpperCase())
+      .filter((c) => c && c !== "MULTI");
+    if (fromBreakdowns.length > 0) return [...new Set(fromBreakdowns)].sort();
+    const fallback = rawSnapshot.account.currency && rawSnapshot.account.currency !== "MULTI"
+      ? rawSnapshot.account.currency.toUpperCase()
+      : "USD";
+    return [fallback];
+  })();
+  const activeNavCurrency = availableCurrencies.includes(selectedDashboardCurrency)
+    ? selectedDashboardCurrency
+    : availableCurrencies[0]!;
+
+  const localNavSnapshots = isLocalMode
+    ? aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeNavCurrency, selectedAccountId)
+    : [];
+  const localTwrSeries = isLocalMode
+    ? computeTwrSeries(localNavSnapshots, activeNavCurrency, selectedAccountId)
+    : null;
+  const localHeatmapBundle = isLocalMode && localTwrSeries
+    ? buildCalendarHeatmapFromNav(localTwrSeries, rawSnapshot.orders)
+    : null;
+
+  const heatmapEntries = localHeatmapBundle
+    ? localHeatmapBundle.entries.map((entry) => ({
+        date: entry.date,
+        dataStatus: entry.status,
+        level: entry.activityLevel,
+        actions: entry.actions,
+        dailyReturnPct: entry.dailyReturnPct === null ? null : decimalToNumber(entry.dailyReturnPct),
+        dailyReturnUsd: entry.dailyReturnUsd === null ? null : decimalToNumber(entry.dailyReturnUsd),
+      }))
+    : mockPortfolio.heatmap;
+
+  const handleRefreshBenchmark = async (symbol: string) => {
+    setBenchmarkLoading(true);
+    setBenchmarkNotice(null);
+    try {
+      const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, quoteProvider);
+      if (outcome.degradedReason) {
+        setBenchmarkNotice(
+          outcome.series
+            ? (language === "zh"
+                ? `离线降级：使用本地加密缓存的 ${symbol} 历史（${outcome.degradedReason}）`
+                : `Degraded to cached ${symbol} history (${outcome.degradedReason})`)
+            : (language === "zh"
+                ? `${symbol} 基准行情当前不可用（${outcome.degradedReason}）`
+                : `${symbol} benchmark unavailable (${outcome.degradedReason})`),
+        );
+      } else {
+        setBenchmarkNotice(null);
+      }
+    } catch (error) {
+      setBenchmarkNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBenchmarkLoading(false);
+    }
+  };
 
   const home = (
     <main className="home-page" data-testid="home-page">
@@ -535,18 +630,49 @@ export function App() {
         data={mockPortfolio}
         onNavigate={navigate}
         onSearch={() => setSearchOpen(true)}
+        localNav={isLocalMode ? {
+          accounts: localAccounts,
+          selectedAccountId,
+          onSelectAccount: (acctId) => {
+            ACCOUNT_STORE.setSelectedAccountId(acctId);
+            MOCK_BROKER.setSelectedAccountId(acctId);
+            setBenchmarkNotice(null);
+          },
+          availableCurrencies,
+          activeCurrency: activeNavCurrency,
+          onSelectCurrency: (curr) => {
+            setSelectedDashboardCurrency(curr);
+            setSelectedBenchmark(null);
+            setBenchmarkNotice(null);
+          },
+          snapshots: localNavSnapshots,
+          selectedBenchmark,
+          benchmarkSeries: selectedBenchmark ? NAV_STORE.getBenchmark(selectedBenchmark) : null,
+          benchmarkLoading,
+          benchmarkNotice,
+          onSelectBenchmark: (sym) => {
+            setSelectedBenchmark(sym);
+            setBenchmarkNotice(null);
+          },
+          onRefreshBenchmark: (sym) => void handleRefreshBenchmark(sym),
+        } : undefined}
       />
 
       <section className="content-grid" aria-label={copy.portfolio}>
         <InvestingHeatmap
           copy={copy}
           language={language}
-          entries={mockPortfolio.heatmap}
-          activeDays={mockPortfolio.activeDays}
-          ordersFilled={mockPortfolio.ordersFilled}
-          netChange={mockPortfolio.netChange}
-          currency={mockPortfolio.currency}
-          isMultiCurrency={mockPortfolio.isMultiCurrency}
+          entries={heatmapEntries}
+          activeDays={localHeatmapBundle ? localHeatmapBundle.activeDays : mockPortfolio.activeDays}
+          ordersFilled={localHeatmapBundle ? localHeatmapBundle.ordersFilled : mockPortfolio.ordersFilled}
+          netChange={localHeatmapBundle ? decimalToNumber(localHeatmapBundle.yearNetChange) : mockPortfolio.netChange}
+          currency={isLocalMode ? activeNavCurrency : mockPortfolio.currency}
+          isMultiCurrency={isLocalMode ? false : mockPortfolio.isMultiCurrency}
+          localNavSummary={isLocalMode && localTwrSeries ? {
+            snapshotCount: localTwrSeries.snapshotCount,
+            hasEnoughPoints: localTwrSeries.hasEnoughPoints,
+            currency: activeNavCurrency,
+          } : undefined}
         />
         <aside className="side-stack">
           <PositionsCard
