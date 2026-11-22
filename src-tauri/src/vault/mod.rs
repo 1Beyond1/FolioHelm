@@ -1,11 +1,16 @@
-//! OS-backed key management and authenticated record encryption (AES-256-GCM).
+//! OS-backed key management, authenticated record encryption (AES-256-GCM),
+//! Argon2id passphrase-protected `.fhvault` offline backups, and App Lock verification.
 //!
 //! Security invariants:
-//! - Secrets are always held in `Zeroizing` buffers so memory is scrubbed on drop.
+//! - Secrets and derived keys are always held in `Zeroizing` buffers so memory is scrubbed on drop.
 //! - If an encrypted database already exists on disk but OS keyring material is
 //!   missing, initialization fails closed and never overwrites or resets data.
 //! - Every encrypted record binds `(schema_version, table, record_id)` via AEAD
 //!   associated data (AAD) so ciphertext cannot be transplanted across rows.
+//! - `.fhvault` offline backups derive 256-bit keys via Argon2id with random 128-bit salts
+//!   and authenticate all header/KDF parameters as AES-256-GCM AAD.
+//! - App Lock stores only an Argon2id verifier (salt + hash) and compares in constant time;
+//!   plaintext passphrases are never persisted or logged.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -13,7 +18,11 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -22,6 +31,23 @@ pub const DB_MASTER_KEY_ACCOUNT: &str = "db_master_key_v1";
 pub const DEVICE_SIGNING_SEED_ACCOUNT: &str = "device_ed25519_seed_v1";
 pub const VAULT_CRYPTO_VERSION: u8 = 1;
 
+pub const FHVAULT_FORMAT: &str = "foliohelm-vault-backup";
+pub const FHVAULT_VERSION: u16 = 1;
+pub const MAX_FHVAULT_BYTES: usize = 20 * 1024 * 1024;
+pub const MIN_PASSPHRASE_LEN: usize = 10;
+
+/// Production Argon2id parameters: 64 MiB memory, 3 iterations, 1 lane.
+pub const ARGON2_MEMORY_KIB: u32 = 65_536;
+pub const ARGON2_ITERATIONS: u32 = 3;
+pub const ARGON2_PARALLELISM: u32 = 1;
+
+const MIN_IMPORT_ARGON2_MEMORY_KIB: u32 = 1_024;
+const MAX_IMPORT_ARGON2_MEMORY_KIB: u32 = 262_144;
+const MIN_IMPORT_ARGON2_ITERATIONS: u32 = 1;
+const MAX_IMPORT_ARGON2_ITERATIONS: u32 = 20;
+const MAX_IMPORT_ARGON2_PARALLELISM: u32 = 8;
+
+const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MIN_BLOB_LEN: usize = 1 + NONCE_LEN + TAG_LEN;
@@ -40,6 +66,14 @@ pub enum VaultError {
     EncryptionFailed,
     #[error("record decryption or integrity check failed: {0}")]
     DecryptionFailed(String),
+    #[error("passphrase must be at least {MIN_PASSPHRASE_LEN} characters long")]
+    WeakPassphrase,
+    #[error("Argon2id key derivation failed: {0}")]
+    KdfFailed(String),
+    #[error("encrypted backup exceeds the 20 MB safety limit")]
+    BackupTooLarge,
+    #[error("invalid .fhvault backup format: {0}")]
+    InvalidBackupFormat(String),
 }
 
 /// Abstract OS secret storage so unit tests can inject an isolated in-memory
@@ -206,6 +240,47 @@ impl VaultKeyMaterial {
     pub fn signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.device_signing_seed)
     }
+
+    /// Encode the Ed25519 device signing seed strictly for embedding inside an
+    /// Argon2id + AES-256-GCM encrypted `.fhvault` backup payload.
+    pub fn device_signing_seed_hex(&self) -> Zeroizing<String> {
+        encode_key32(&self.device_signing_seed)
+    }
+
+    /// Replace the device signing seed in the OS keyring and memory, returning the
+    /// previous seed so callers can roll back cleanly if a database transaction fails.
+    pub fn replace_signing_seed(
+        &mut self,
+        store: &dyn KeyStore,
+        new_seed_hex: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+        let decoded = decode_key32(new_seed_hex)?;
+        let normalized_hex = encode_key32(&decoded);
+        store.set_secret(
+            VAULT_KEYRING_SERVICE,
+            DEVICE_SIGNING_SEED_ACCOUNT,
+            &normalized_hex,
+        )?;
+        let previous = std::mem::replace(&mut self.device_signing_seed, decoded);
+        Ok(previous)
+    }
+
+    /// Restore a previously replaced signing seed on rollback.
+    pub fn restore_signing_seed(
+        &mut self,
+        store: &dyn KeyStore,
+        previous_seed: Zeroizing<[u8; 32]>,
+    ) -> Result<(), VaultError> {
+        let hex = encode_key32(&previous_seed);
+        store.set_secret(VAULT_KEYRING_SERVICE, DEVICE_SIGNING_SEED_ACCOUNT, &hex)?;
+        self.device_signing_seed = previous_seed;
+        Ok(())
+    }
+}
+
+pub fn decode_signing_key_hex(seed_hex: &str) -> Result<SigningKey, VaultError> {
+    let seed = decode_key32(seed_hex)?;
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 pub fn build_aad(schema_version: u16, table: &str, record_id: &str) -> Vec<u8> {
@@ -269,6 +344,331 @@ pub fn decrypt_record(
             )
         })?;
     Ok(Zeroizing::new(plaintext))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FhVaultKdfParams {
+    pub algorithm: String,
+    pub version: u32,
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+    pub salt_b64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FhVaultEnvelope {
+    pub format: String,
+    pub version: u16,
+    pub kdf: FhVaultKdfParams,
+    pub cipher: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLockVerifier {
+    pub algorithm: String,
+    pub version: u32,
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+    pub salt_b64: String,
+    pub hash_b64: String,
+}
+
+fn validate_passphrase_strength(passphrase: &str) -> Result<(), VaultError> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(VaultError::WeakPassphrase);
+    }
+    Ok(())
+}
+
+fn validate_kdf_bounds(
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<(), VaultError> {
+    if !(MIN_IMPORT_ARGON2_MEMORY_KIB..=MAX_IMPORT_ARGON2_MEMORY_KIB).contains(&memory_kib) {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "Argon2id memoryKiB out of safe bounds: {memory_kib}"
+        )));
+    }
+    if !(MIN_IMPORT_ARGON2_ITERATIONS..=MAX_IMPORT_ARGON2_ITERATIONS).contains(&iterations) {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "Argon2id iterations out of safe bounds: {iterations}"
+        )));
+    }
+    if parallelism == 0 || parallelism > MAX_IMPORT_ARGON2_PARALLELISM {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "Argon2id parallelism out of safe bounds: {parallelism}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn derive_argon2id_key(
+    passphrase: &str,
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<Zeroizing<[u8; 32]>, VaultError> {
+    if salt.len() != SALT_LEN {
+        return Err(VaultError::KdfFailed("expected 128-bit salt".to_string()));
+    }
+    validate_kdf_bounds(memory_kib, iterations, parallelism)?;
+    let params = Params::new(memory_kib, iterations, parallelism, Some(32))
+        .map_err(|error| VaultError::KdfFailed(error.to_string()))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0_u8; 32]);
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
+        .map_err(|error| VaultError::KdfFailed(error.to_string()))?;
+    Ok(key)
+}
+
+fn build_fhvault_aad(version: u16, kdf: &FhVaultKdfParams, cipher: &str) -> Vec<u8> {
+    format!(
+        "foliohelm-fhvault|v{version}|{}|v{}|m={}|t={}|p={}|salt={}|{cipher}",
+        kdf.algorithm, kdf.version, kdf.memory_kib, kdf.iterations, kdf.parallelism, kdf.salt_b64
+    )
+    .into_bytes()
+}
+
+/// Encrypt a serialized vault payload into a passphrase-protected `.fhvault` JSON envelope
+/// using Argon2id (64 MiB, 3 iterations, 128-bit random salt) + AES-256-GCM + full header AAD.
+pub fn encrypt_fhvault_backup(passphrase: &str, plaintext: &[u8]) -> Result<String, VaultError> {
+    encrypt_fhvault_backup_with_params(
+        passphrase,
+        plaintext,
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+    )
+}
+
+pub fn encrypt_fhvault_backup_with_params(
+    passphrase: &str,
+    plaintext: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<String, VaultError> {
+    validate_passphrase_strength(passphrase)?;
+    if plaintext.len() > MAX_FHVAULT_BYTES {
+        return Err(VaultError::BackupTooLarge);
+    }
+
+    let mut salt = [0_u8; SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|_| VaultError::RandomnessUnavailable)?;
+    let mut nonce_bytes = [0_u8; NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes).map_err(|_| VaultError::RandomnessUnavailable)?;
+
+    let key = derive_argon2id_key(passphrase, &salt, memory_kib, iterations, parallelism)?;
+    let kdf = FhVaultKdfParams {
+        algorithm: "argon2id".to_string(),
+        version: u32::from(Version::V0x13 as u8),
+        memory_kib,
+        iterations,
+        parallelism,
+        salt_b64: BASE64.encode(salt),
+    };
+    let cipher_name = "aes-256-gcm".to_string();
+    let aad = build_fhvault_aad(FHVAULT_VERSION, &kdf, &cipher_name);
+
+    let cipher = Aes256Gcm::new((&*key).into());
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| VaultError::EncryptionFailed)?;
+
+    let envelope = FhVaultEnvelope {
+        format: FHVAULT_FORMAT.to_string(),
+        version: FHVAULT_VERSION,
+        kdf,
+        cipher: cipher_name,
+        nonce_b64: BASE64.encode(nonce_bytes),
+        ciphertext_b64: BASE64.encode(ciphertext),
+    };
+
+    let serialized = serde_json::to_string_pretty(&envelope)
+        .map_err(|error| VaultError::InvalidBackupFormat(error.to_string()))?;
+    if serialized.len() > MAX_FHVAULT_BYTES {
+        return Err(VaultError::BackupTooLarge);
+    }
+    Ok(serialized)
+}
+
+/// Fail-closed decryption and header/AAD authentication of a `.fhvault` backup envelope.
+pub fn decrypt_fhvault_backup(
+    passphrase: &str,
+    raw_backup: &str,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    if raw_backup.len() > MAX_FHVAULT_BYTES {
+        return Err(VaultError::BackupTooLarge);
+    }
+    if passphrase.is_empty() {
+        return Err(VaultError::DecryptionFailed(
+            "passphrase is required to decrypt .fhvault backup".to_string(),
+        ));
+    }
+
+    let envelope: FhVaultEnvelope = serde_json::from_str(raw_backup)
+        .map_err(|error| VaultError::InvalidBackupFormat(error.to_string()))?;
+    if envelope.format != FHVAULT_FORMAT {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "unsupported backup format '{}'",
+            envelope.format
+        )));
+    }
+    if envelope.version != FHVAULT_VERSION {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "unsupported backup version {}",
+            envelope.version
+        )));
+    }
+    if envelope.cipher != "aes-256-gcm" {
+        return Err(VaultError::InvalidBackupFormat(format!(
+            "unsupported backup cipher '{}'",
+            envelope.cipher
+        )));
+    }
+    if envelope.kdf.algorithm != "argon2id"
+        || envelope.kdf.version != u32::from(Version::V0x13 as u8)
+    {
+        return Err(VaultError::InvalidBackupFormat(
+            "unsupported KDF algorithm or version".to_string(),
+        ));
+    }
+    validate_kdf_bounds(
+        envelope.kdf.memory_kib,
+        envelope.kdf.iterations,
+        envelope.kdf.parallelism,
+    )?;
+
+    let salt = BASE64
+        .decode(envelope.kdf.salt_b64.as_bytes())
+        .map_err(|_| VaultError::InvalidBackupFormat("invalid base64 salt".to_string()))?;
+    if salt.len() != SALT_LEN {
+        return Err(VaultError::InvalidBackupFormat(
+            "backup salt must be 128 bits".to_string(),
+        ));
+    }
+    let nonce_bytes = BASE64
+        .decode(envelope.nonce_b64.as_bytes())
+        .map_err(|_| VaultError::InvalidBackupFormat("invalid base64 nonce".to_string()))?;
+    if nonce_bytes.len() != NONCE_LEN {
+        return Err(VaultError::InvalidBackupFormat(
+            "backup nonce must be 96 bits".to_string(),
+        ));
+    }
+    let ciphertext = BASE64
+        .decode(envelope.ciphertext_b64.as_bytes())
+        .map_err(|_| VaultError::InvalidBackupFormat("invalid base64 ciphertext".to_string()))?;
+    if ciphertext.len() < TAG_LEN {
+        return Err(VaultError::InvalidBackupFormat(
+            "backup ciphertext is truncated".to_string(),
+        ));
+    }
+
+    let key = derive_argon2id_key(
+        passphrase,
+        &salt,
+        envelope.kdf.memory_kib,
+        envelope.kdf.iterations,
+        envelope.kdf.parallelism,
+    )?;
+    let aad = build_fhvault_aad(envelope.version, &envelope.kdf, &envelope.cipher);
+    let cipher = Aes256Gcm::new((&*key).into());
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| {
+            VaultError::DecryptionFailed(
+                "wrong passphrase or tampered .fhvault backup (AEAD authentication failed)"
+                    .to_string(),
+            )
+        })?;
+    Ok(Zeroizing::new(plaintext))
+}
+
+/// Create a non-reversible Argon2id verifier for App Lock (never persists the plaintext passphrase).
+pub fn create_app_lock_verifier(passphrase: &str) -> Result<AppLockVerifier, VaultError> {
+    create_app_lock_verifier_with_params(
+        passphrase,
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+    )
+}
+
+pub fn create_app_lock_verifier_with_params(
+    passphrase: &str,
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<AppLockVerifier, VaultError> {
+    validate_passphrase_strength(passphrase)?;
+    let mut salt = [0_u8; SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|_| VaultError::RandomnessUnavailable)?;
+    let derived = derive_argon2id_key(passphrase, &salt, memory_kib, iterations, parallelism)?;
+    Ok(AppLockVerifier {
+        algorithm: "argon2id".to_string(),
+        version: u32::from(Version::V0x13 as u8),
+        memory_kib,
+        iterations,
+        parallelism,
+        salt_b64: BASE64.encode(salt),
+        hash_b64: BASE64.encode(*derived),
+    })
+}
+
+/// Constant-time verification of a candidate App Lock passphrase against a stored Argon2id verifier.
+pub fn verify_app_lock_passphrase(
+    verifier: &AppLockVerifier,
+    candidate_passphrase: &str,
+) -> Result<bool, VaultError> {
+    if verifier.algorithm != "argon2id" || verifier.version != u32::from(Version::V0x13 as u8) {
+        return Err(VaultError::CorruptedKeyMaterial(
+            "unsupported app lock verifier algorithm",
+        ));
+    }
+    if candidate_passphrase.is_empty() {
+        return Ok(false);
+    }
+    let salt = BASE64
+        .decode(verifier.salt_b64.as_bytes())
+        .map_err(|_| VaultError::CorruptedKeyMaterial("invalid app lock verifier salt"))?;
+    let expected_hash = BASE64
+        .decode(verifier.hash_b64.as_bytes())
+        .map_err(|_| VaultError::CorruptedKeyMaterial("invalid app lock verifier hash"))?;
+    if salt.len() != SALT_LEN || expected_hash.len() != 32 {
+        return Err(VaultError::CorruptedKeyMaterial(
+            "unexpected app lock verifier field lengths",
+        ));
+    }
+    let candidate = derive_argon2id_key(
+        candidate_passphrase,
+        &salt,
+        verifier.memory_kib,
+        verifier.iterations,
+        verifier.parallelism,
+    )?;
+    Ok(bool::from(candidate.as_slice().ct_eq(&expected_hash)))
 }
 
 fn generate_random_key32() -> Result<Zeroizing<[u8; 32]>, VaultError> {
@@ -375,5 +775,53 @@ mod tests {
             decrypt_record(keys.db_master_key(), &aad, &tampered),
             Err(VaultError::DecryptionFailed(_))
         ));
+    }
+
+    #[test]
+    fn encrypts_and_decrypts_fhvault_backup_with_argon2id_and_rejects_wrong_passphrase_or_tampered_header(
+    ) {
+        let plaintext = br#"{"portfolio":"VOO","cash":"12500.00"}"#;
+        let passphrase = "Correct-Horse-Battery-Staple-2026!";
+
+        // Rejects weak passphrase
+        assert_eq!(
+            encrypt_fhvault_backup("short", plaintext),
+            Err(VaultError::WeakPassphrase)
+        );
+
+        // Production Argon2id parameters roundtrip
+        let backup = encrypt_fhvault_backup(passphrase, plaintext).expect("encrypt backup");
+        assert!(!backup.contains("12500.00"));
+        assert!(!backup.contains(passphrase));
+        assert!(backup.contains("argon2id"));
+
+        let decrypted = decrypt_fhvault_backup(passphrase, &backup).expect("decrypt backup");
+        assert_eq!(decrypted.as_slice(), plaintext);
+
+        // Wrong passphrase must fail closed
+        assert!(matches!(
+            decrypt_fhvault_backup("Wrong-Passphrase-9999!", &backup),
+            Err(VaultError::DecryptionFailed(_))
+        ));
+
+        // Tampering with authenticated header/KDF metadata fails AAD verification
+        let tampered_header = backup.replace("\"iterations\": 3", "\"iterations\": 2");
+        assert!(matches!(
+            decrypt_fhvault_backup(passphrase, &tampered_header),
+            Err(VaultError::DecryptionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn creates_and_verifies_app_lock_verifier_without_storing_plaintext() {
+        let passphrase = "Vault-Lock-Passphrase-2026";
+        let verifier =
+            create_app_lock_verifier_with_params(passphrase, 4096, 1, 1).expect("verifier");
+        let serialized = serde_json::to_string(&verifier).expect("serialize");
+        assert!(!serialized.contains(passphrase));
+
+        assert!(verify_app_lock_passphrase(&verifier, passphrase).expect("verify ok"));
+        assert!(!verify_app_lock_passphrase(&verifier, "Wrong-Passphrase-2026").expect("verify"));
+        assert!(!verify_app_lock_passphrase(&verifier, "").expect("empty"));
     }
 }

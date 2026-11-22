@@ -86,11 +86,11 @@ impl EvidenceKind {
             Self::SafetySettingChanged => "safety_setting_changed",
             Self::AutomationRun => "automation_run",
             Self::PortfolioImport => "portfolio_import",
+            Self::SessionLocked => "session_locked",
             Self::CancelStarted
             | Self::CancelObserved
             | Self::ReplaceStarted
             | Self::ReplaceObserved
-            | Self::SessionLocked
             | Self::StateChanged => "state_changed",
         }
     }

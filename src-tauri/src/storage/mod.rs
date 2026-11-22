@@ -20,16 +20,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    evidence::{encode_hex, SignedEvidenceEntry},
+    evidence::{encode_hex, EvidenceJournal, SignedEvidenceEntry},
     vault::{
-        build_aad, decrypt_record, encrypt_record, KeyStore, VaultError, VaultKeyMaterial,
-        VAULT_CRYPTO_VERSION,
+        build_aad, decode_signing_key_hex, decrypt_record, encrypt_record, AppLockVerifier,
+        KeyStore, VaultError, VaultKeyMaterial, VAULT_CRYPTO_VERSION,
     },
 };
 
 pub const STORAGE_SCHEMA_VERSION: u16 = 1;
 const CANARY_PLAINTEXT: &[u8] = b"foliohelm-vault-canary-v1";
 const CANARY_RECORD_ID: &str = "canary";
+const APP_LOCK_VERIFIER_META_KEY: &str = "app_lock_verifier";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -153,6 +154,9 @@ pub struct CachedPublicQuote {
 #[serde(rename_all = "camelCase")]
 pub struct VaultStatusDto {
     pub unlocked: bool,
+    pub lock_state: String,
+    pub has_lock_passphrase: bool,
+    pub retry_after_seconds: u64,
     pub cipher: String,
     pub schema_version: u16,
     pub key_provider: String,
@@ -160,6 +164,30 @@ pub struct VaultStatusDto {
     pub evidence_count: u64,
     pub has_local_portfolio: bool,
     pub locked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultBackupPayload {
+    pub schema_version: u16,
+    pub exported_at_utc: String,
+    pub device_signing_seed_hex: String,
+    pub evidence_entries: Vec<SignedEvidenceEntry>,
+    pub portfolio_snapshots: Vec<StoredPortfolioSnapshot>,
+    pub paper_orders: Vec<StoredPaperOrder>,
+    pub quote_cache: Vec<CachedPublicQuote>,
+    pub settings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultRestoreSummaryDto {
+    pub evidence_count: usize,
+    pub portfolio_count: usize,
+    pub paper_order_count: usize,
+    pub quote_count: usize,
+    pub setting_count: usize,
+    pub signer_public_key: String,
 }
 
 pub struct EncryptedVaultDb {
@@ -228,8 +256,13 @@ impl EncryptedVaultDb {
                     row.get(0)
                 })?;
 
+        let has_lock_passphrase = self.load_app_lock_verifier()?.is_some();
+
         Ok(VaultStatusDto {
             unlocked: true,
+            lock_state: "unlocked".to_string(),
+            has_lock_passphrase,
+            retry_after_seconds: 0,
             cipher: "AES-256-GCM + Ed25519".to_string(),
             schema_version: STORAGE_SCHEMA_VERSION,
             key_provider: self.key_provider.clone(),
@@ -665,6 +698,316 @@ impl EncryptedVaultDb {
         Ok(Some(value))
     }
 
+    pub fn load_app_lock_verifier(&self) -> Result<Option<AppLockVerifier>, StorageError> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+                params![APP_LOCK_VERIFIER_META_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = raw else {
+            return Ok(None);
+        };
+        let verifier: AppLockVerifier = serde_json::from_slice(&bytes)?;
+        Ok(Some(verifier))
+    }
+
+    pub fn save_app_lock_verifier(
+        &mut self,
+        verifier: Option<&AppLockVerifier>,
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        match verifier {
+            Some(v) => {
+                let bytes = serde_json::to_vec(v)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                    params![APP_LOCK_VERIFIER_META_KEY, bytes],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM vault_meta WHERE meta_key = ?1",
+                    params![APP_LOCK_VERIFIER_META_KEY],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_portfolio_snapshots(
+        &self,
+    ) -> Result<Vec<StoredPortfolioSnapshot>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ciphertext FROM portfolio_snapshots ORDER BY imported_at_utc ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            let (id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            snapshots.push(serde_json::from_slice(&plaintext)?);
+        }
+        Ok(snapshots)
+    }
+
+    pub fn load_all_paper_orders(&self) -> Result<Vec<StoredPaperOrder>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ciphertext FROM paper_orders ORDER BY submitted_at_utc ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut orders = Vec::new();
+        for row in rows {
+            let (id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            orders.push(serde_json::from_slice(&plaintext)?);
+        }
+        Ok(orders)
+    }
+
+    pub fn load_all_settings(&self) -> Result<BTreeMap<String, String>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT setting_key, ciphertext FROM app_settings ORDER BY setting_key ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut settings = BTreeMap::new();
+        for row in rows {
+            let (key, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "app_settings", &key);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            let value = String::from_utf8(plaintext.to_vec()).map_err(|_| {
+                StorageError::Integrity(format!("setting {key} decrypted to invalid UTF-8"))
+            })?;
+            settings.insert(key, value);
+        }
+        Ok(settings)
+    }
+
+    /// Export all encrypted tables and the device signing seed into a payload ready for
+    /// Argon2id + AES-256-GCM `.fhvault` backup encryption.
+    pub fn export_backup_payload(&self) -> Result<VaultBackupPayload, StorageError> {
+        let evidence_entries = self.load_evidence_entries()?;
+        let portfolio_snapshots = self.load_all_portfolio_snapshots()?;
+        let paper_orders = self.load_all_paper_orders()?;
+        let quote_cache = self.load_quote_cache()?;
+        let settings = self.load_all_settings()?;
+        let seed_hex = self.keys.device_signing_seed_hex();
+
+        Ok(VaultBackupPayload {
+            schema_version: STORAGE_SCHEMA_VERSION,
+            exported_at_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            device_signing_seed_hex: seed_hex.to_string(),
+            evidence_entries,
+            portfolio_snapshots,
+            paper_orders,
+            quote_cache,
+            settings,
+        })
+    }
+
+    /// Fail-closed atomic restore from a decrypted `.fhvault` backup payload.
+    ///
+    /// Guarantees:
+    /// - Validates schema version, Ed25519 signing seed, complete evidence signature chain,
+    ///   and all record constraints BEFORE mutating the OS keyring or SQLite database.
+    /// - Replaces all workspace tables inside a single SQLite transaction re-encrypted under
+    ///   this device's OS-managed `db_master_key`.
+    /// - Rolls back the OS keyring signing seed if the SQLite transaction fails.
+    pub fn restore_from_backup_payload(
+        &mut self,
+        payload: VaultBackupPayload,
+        key_store: &dyn KeyStore,
+    ) -> Result<(EvidenceJournal, VaultRestoreSummaryDto), StorageError> {
+        if payload.schema_version != STORAGE_SCHEMA_VERSION {
+            return Err(StorageError::Integrity(format!(
+                "unsupported backup schema version {}",
+                payload.schema_version
+            )));
+        }
+
+        let restored_signing_key = decode_signing_key_hex(&payload.device_signing_seed_hex)?;
+        let verified_journal =
+            EvidenceJournal::from_persisted(restored_signing_key, payload.evidence_entries.clone())
+                .map_err(|error| {
+                    StorageError::Integrity(format!(
+                        "backup evidence chain failed cryptographic verification: {error}"
+                    ))
+                })?;
+
+        for snapshot in &payload.portfolio_snapshots {
+            if snapshot.id.trim().is_empty() || snapshot.fingerprint.trim().is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "backup contains portfolio snapshot with empty id or fingerprint".to_string(),
+                ));
+            }
+        }
+        for order in &payload.paper_orders {
+            if order.id.trim().is_empty()
+                || !matches!(order.workspace_mode.as_str(), "mock" | "local-csv")
+            {
+                return Err(StorageError::InvalidInput(
+                    "backup contains invalid paper order".to_string(),
+                ));
+            }
+        }
+        for key in payload.settings.keys() {
+            if key.trim().is_empty() || key.len() > 128 {
+                return Err(StorageError::InvalidInput(
+                    "backup contains invalid setting key".to_string(),
+                ));
+            }
+        }
+
+        // Pre-encrypt every restored record with this device's db_master_key before mutating DB.
+        let mut encrypted_evidence = Vec::with_capacity(payload.evidence_entries.len());
+        for entry in &payload.evidence_entries {
+            let seq = i64::try_from(entry.event.sequence).map_err(|_| {
+                StorageError::InvalidInput("evidence sequence overflow".to_string())
+            })?;
+            let aad = build_aad(
+                STORAGE_SCHEMA_VERSION,
+                "evidence_entries",
+                &entry.event.sequence.to_string(),
+            );
+            let plaintext = serde_json::to_vec(entry)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_evidence.push((
+                seq,
+                entry.event.event_id.clone(),
+                entry.event.occurred_at_utc.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_portfolios = Vec::with_capacity(payload.portfolio_snapshots.len());
+        for snapshot in &payload.portfolio_snapshots {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &snapshot.id);
+            let plaintext = serde_json::to_vec(snapshot)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_portfolios.push((
+                snapshot.id.clone(),
+                snapshot.fingerprint.clone(),
+                snapshot.source_format.clone(),
+                snapshot.imported_at_utc.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_orders = Vec::with_capacity(payload.paper_orders.len());
+        for order in &payload.paper_orders {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
+            let plaintext = serde_json::to_vec(order)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_orders.push((
+                order.id.clone(),
+                order.workspace_mode.clone(),
+                order.submitted_at.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_quotes = Vec::with_capacity(payload.quote_cache.len());
+        for quote in &payload.quote_cache {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "quote_cache", &quote.symbol);
+            let plaintext = serde_json::to_vec(quote)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_quotes.push((
+                quote.symbol.clone(),
+                quote.provider.clone(),
+                quote.as_of_utc.clone(),
+                ciphertext,
+            ));
+        }
+
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let mut encrypted_settings = Vec::with_capacity(payload.settings.len());
+        for (key, value_json) in &payload.settings {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "app_settings", key);
+            let ciphertext =
+                encrypt_record(self.keys.db_master_key(), &aad, value_json.as_bytes())?;
+            encrypted_settings.push((key.clone(), now.clone(), ciphertext));
+        }
+
+        let previous_seed = self
+            .keys
+            .replace_signing_seed(key_store, &payload.device_signing_seed_hex)?;
+
+        let db_result: Result<(), StorageError> = (|| {
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM evidence_entries", [])?;
+            tx.execute("DELETE FROM portfolio_snapshots", [])?;
+            tx.execute("DELETE FROM paper_orders", [])?;
+            tx.execute("DELETE FROM quote_cache", [])?;
+            tx.execute("DELETE FROM app_settings", [])?;
+
+            for (seq, event_id, occurred_at_utc, ciphertext) in &encrypted_evidence {
+                tx.execute(
+                    "INSERT INTO evidence_entries (sequence, event_id, occurred_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![seq, event_id, occurred_at_utc, ciphertext],
+                )?;
+            }
+            for (id, fingerprint, source_format, imported_at_utc, ciphertext) in
+                &encrypted_portfolios
+            {
+                tx.execute(
+                    "INSERT INTO portfolio_snapshots (id, fingerprint, source_format, imported_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, fingerprint, source_format, imported_at_utc, ciphertext],
+                )?;
+            }
+            for (id, workspace_mode, submitted_at_utc, ciphertext) in &encrypted_orders {
+                tx.execute(
+                    "INSERT INTO paper_orders (id, workspace_mode, submitted_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, workspace_mode, submitted_at_utc, ciphertext],
+                )?;
+            }
+            for (symbol, provider, as_of_utc, ciphertext) in &encrypted_quotes {
+                tx.execute(
+                    "INSERT INTO quote_cache (symbol, provider, as_of_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![symbol, provider, as_of_utc, ciphertext],
+                )?;
+            }
+            for (key, updated_at_utc, ciphertext) in &encrypted_settings {
+                tx.execute(
+                    "INSERT INTO app_settings (setting_key, updated_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3)",
+                    params![key, updated_at_utc, ciphertext],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if let Err(error) = db_result {
+            let _ = self.keys.restore_signing_seed(key_store, previous_seed);
+            return Err(error);
+        }
+
+        let summary = VaultRestoreSummaryDto {
+            evidence_count: encrypted_evidence.len(),
+            portfolio_count: encrypted_portfolios.len(),
+            paper_order_count: encrypted_orders.len(),
+            quote_count: encrypted_quotes.len(),
+            setting_count: encrypted_settings.len(),
+            signer_public_key: verified_journal.signer_public_key_hex(),
+        };
+        Ok((verified_journal, summary))
+    }
+
     /// Clear all workspace records inside one atomic transaction while keeping
     /// the device key and vault canary intact.
     pub fn clear_all_workspace_data(&mut self) -> Result<(), StorageError> {
@@ -885,5 +1228,89 @@ mod tests {
         ));
 
         cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn restores_verified_backup_payload_to_fresh_device_and_preserves_db_on_invalid_backup() {
+        let src_path = unique_temp_db("backup-src");
+        let dst_path = unique_temp_db("backup-dst");
+        let src_keys = InMemoryKeyStore::new();
+        let dst_keys = InMemoryKeyStore::new();
+
+        let exported_payload = {
+            let mut db =
+                EncryptedVaultDb::open(&src_path, &src_keys, "in-memory-test").expect("src open");
+            let mut journal = EvidenceJournal::from_signing_key(db.signing_key());
+            let (entry, _) = journal
+                .append_entry(AppendEvidenceRequest {
+                    kind: "portfolio_import".into(),
+                    payload: BTreeMap::from([("mode".into(), "local-csv".into())]),
+                    app_version: Some("0.1.0".into()),
+                    occurred_at_utc: Some("2026-11-22T02:00:00Z".into()),
+                    account_ref: Some("acct_local_csv".into()),
+                    intent_id: Some("imp-01".into()),
+                })
+                .expect("append");
+            db.insert_evidence_entry(&entry).expect("insert evidence");
+            db.save_portfolio_snapshot(&sample_snapshot("fp-backup"))
+                .expect("save portfolio");
+            db.save_setting("protections", r#"{"autoLock":true}"#)
+                .expect("save setting");
+            db.export_backup_payload().expect("export payload")
+        };
+
+        {
+            let mut dst_db =
+                EncryptedVaultDb::open(&dst_path, &dst_keys, "in-memory-test").expect("dst open");
+            dst_db
+                .save_setting("existing_marker", r#""preserve-me""#)
+                .expect("save marker");
+
+            // Tampered evidence inside backup must fail closed without touching existing DB!
+            let mut tampered = exported_payload.clone();
+            tampered.evidence_entries[0]
+                .event
+                .payload
+                .fields
+                .insert("mode".into(), "tampered".into());
+            assert!(dst_db
+                .restore_from_backup_payload(tampered, &dst_keys)
+                .is_err());
+            assert_eq!(
+                dst_db.load_setting("existing_marker").expect("load"),
+                Some(r#""preserve-me""#.to_string())
+            );
+
+            // Valid backup restores everything atomically and preserves signer continuity.
+            let (restored_journal, summary) = dst_db
+                .restore_from_backup_payload(exported_payload.clone(), &dst_keys)
+                .expect("restore ok");
+            assert_eq!(summary.evidence_count, 1);
+            assert_eq!(summary.portfolio_count, 1);
+            assert_eq!(summary.setting_count, 1);
+            assert!(restored_journal.verify().valid);
+            assert_eq!(
+                dst_db.load_setting("protections").expect("protections"),
+                Some(r#"{"autoLock":true}"#.to_string())
+            );
+            assert!(dst_db
+                .load_setting("existing_marker")
+                .expect("old")
+                .is_none());
+        }
+
+        // Reopen destination DB after restart and confirm Ed25519 signer and records persist intact.
+        {
+            let reopened =
+                EncryptedVaultDb::open(&dst_path, &dst_keys, "in-memory-test").expect("reopen dst");
+            let entries = reopened.load_evidence_entries().expect("entries");
+            let journal = EvidenceJournal::from_persisted(reopened.signing_key(), entries)
+                .expect("chain valid after restart");
+            assert!(journal.verify().valid);
+            assert_eq!(journal.list().len(), 1);
+        }
+
+        cleanup_temp_db(&src_path);
+        cleanup_temp_db(&dst_path);
     }
 }
