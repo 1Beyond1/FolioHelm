@@ -765,12 +765,21 @@ export function SettingsPage({
       );
       return;
     }
+    const epoch = getCurrentLockEpoch();
     setBackupBusy(true);
     const pass = backupPassphrase;
     setBackupPassphrase("");
     try {
       const summary = await invokeVaultRestoreBackup(backupRawContent, pass);
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       const hydrated = await hydrateWorkspaceFromVault();
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       if (hydrated.status) setVaultStatus(hydrated.status);
       setBackupStatusMessage(
         chinese
@@ -779,6 +788,10 @@ export function SettingsPage({
       );
       closeBackupModal();
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       setBackupModalError(
         chinese
           ? `恢复失败（Fail-Closed，原加密库未被修改）：${error instanceof Error ? error.message : String(error)}`

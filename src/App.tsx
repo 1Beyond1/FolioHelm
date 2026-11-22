@@ -198,6 +198,7 @@ export function App() {
             if (status.lockState === "user-locked") {
               purgeAllFrontendSensitiveMemory();
               setSelectedBenchmark(null);
+              setBenchmarkLoading(false);
               setBenchmarkNotice(null);
               setTradePrefill(null);
               setSearchOpen(false);
@@ -209,6 +210,7 @@ export function App() {
             } else {
               purgeAllFrontendSensitiveMemory();
               setSelectedBenchmark(null);
+              setBenchmarkLoading(false);
               setBenchmarkNotice(null);
               setVaultErrorLocked(true);
               setVaultLockedReason(status.lockedReason ?? null);
@@ -265,6 +267,7 @@ export function App() {
     // sanitize window title, and engage LockScreen synchronously BEFORE awaiting any IPC.
     purgeAllFrontendSensitiveMemory();
     setSelectedBenchmark(null);
+    setBenchmarkLoading(false);
     setBenchmarkNotice(null);
     setTradePrefill(null);
     setSearchOpen(false);

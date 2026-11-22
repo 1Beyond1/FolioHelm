@@ -23,11 +23,14 @@ import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../src/domai
 import {
   clearPersistedLocalPortfolio,
   commitBrokerCsv,
+  loadPersistedAccountPortfolios,
+  loadPersistedLocalPortfolio,
   parseCsvLocally,
   recordNavSnapshotsForPortfolio,
 } from "../../src/domain/csvImport";
 import { clearEvidence } from "../../src/domain/evidenceJournal";
 import {
+  buyingPowerForCurrency,
   findHoldingInSnapshot,
   findQuoteInSnapshot,
   MOCK_BROKER,
@@ -51,12 +54,16 @@ import {
   persistPaperOrder,
   purgeAllFrontendSensitiveMemory,
   saveWorkspacePreferences,
+  WORKSPACE_PREFS_KEY,
 } from "../../src/domain/vaultStorage";
+import { AutomationPage } from "../../src/features/automation/AutomationPage";
+import { getMarketSecurities } from "../../src/features/markets/marketsData";
 import { OrdersPage } from "../../src/features/orders/OrdersPage";
 import { PortfolioPage } from "../../src/features/portfolio/PortfolioPage";
+import { SettingsPage } from "../../src/features/settings/SettingsPage";
 import { TradePage } from "../../src/features/trade/TradePage";
 import { getCopy } from "../../src/i18n";
-import { clearFolioHelmStored } from "../../src/platform/storage";
+import { clearFolioHelmStored, readStored } from "../../src/platform/storage";
 import { quantity as makeQty } from "../../src/domain/decimal";
 
 function makeSnap(
@@ -843,5 +850,416 @@ describe("Stage 5 Hardening: P1-1..P1-10 Logic, Chart, Heatmap, Quotes, Accounts
 
     render(<App />);
     expect(screen.getByTestId("home-page")).toBeInTheDocument();
+  });
+});
+
+describe("Stage 5 Recheck Closure: P0-1, P1-1, P1-2, P1-3 & P2", () => {
+  it("Recheck P0-1: single-currency HKD account strictly blocks buying USD stock AAPL with $0 USD buying power and never touches ALL/acct_default USD buying power", async () => {
+    await ACCOUNT_STORE.createOrUpdateAccount({
+      id: "acct_futu_hk",
+      name: "Futu HK",
+      broker: "Futu",
+      accountType: "taxable",
+      baseCurrency: "HKD",
+    });
+
+    const defaultUsdCsv = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nAAPL,Apple Inc,5,190.00,200.00,USD,1000.00\n";
+    const futuHkdCsv = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\n00700.HK,Tencent,100,320.00,400.00,HKD,100000.00\n";
+
+    const committedDefault = await commitBrokerCsv(defaultUsdCsv, "default.csv", DEFAULT_ACCOUNT_ID, "Default Account");
+    const committedFutu = await commitBrokerCsv(futuHkdCsv, "futu.csv", "acct_futu_hk", "Futu HK");
+
+    MOCK_BROKER.applyAccountPortfolioSnapshots(
+      [committedDefault.snapshot, committedFutu.snapshot],
+      { switchMode: true, selectedAccountId: ALL_ACCOUNTS_ID },
+    );
+    MOCK_BROKER.setPublicQuotesEnabled(true);
+    MOCK_BROKER.applyPublicQuotes(
+      [
+        {
+          symbol: "AAPL",
+          price: "200.00",
+          change: "2.00",
+          changePct: "1.01",
+          currency: "USD",
+          provider: "stooq.com",
+          asOfUtc: "2026-11-22T15:00:00.000Z",
+          delayed: true,
+        },
+      ],
+      "stooq.com",
+    );
+
+    const hkSnap = MOCK_BROKER.getAccountSnapshot("acct_futu_hk");
+    expect(hkSnap.account.isMultiCurrency).toBe(false);
+    expect(hkSnap.account.currency).toBe("HKD");
+    expect(buyingPowerForCurrency(hkSnap.account, "HKD")).toBe("100000");
+    expect(buyingPowerForCurrency(hkSnap.account, "USD")).toBe("0");
+
+    // Single-currency HKD account MUST reject buying USD AAPL (even 1 share or 400 shares)
+    let caughtError: unknown = null;
+    try {
+      MOCK_BROKER.previewOrder({
+        symbol: "AAPL",
+        side: "buy",
+        type: "market",
+        quantity: makeQty("400"),
+        limitPrice: null,
+        currency: "USD",
+        accountId: "acct_futu_hk",
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+    expect(caughtError).toBeInstanceOf(MockBrokerError);
+    expect((caughtError as MockBrokerError).code).toBe("insufficient-buying-power");
+
+    expect(() =>
+      MOCK_BROKER.previewOrder({
+        symbol: "AAPL",
+        side: "buy",
+        type: "market",
+        quantity: makeQty("1"),
+        limitPrice: null,
+        currency: "USD",
+        accountId: "acct_futu_hk",
+      }),
+    ).toThrow(/insufficient/i);
+
+    // ALL-view USD buying power (from acct_default) & acct_futu_hk HKD buying power stay completely untouched
+    const allSnap = MOCK_BROKER.getSnapshot();
+    expect(buyingPowerForCurrency(allSnap.account, "USD")).toBe("1000");
+    expect(buyingPowerForCurrency(allSnap.account, "HKD")).toBe("100000");
+    expect(allSnap.orders).toHaveLength(0);
+
+    // UI check: TradePage with acct_futu_hk + AAPL (USD) reports $0.00 USD buying power and fails buying-power check
+    render(
+      <TradePage
+        language="en"
+        initialSymbol="AAPL"
+        initialPrefill={{
+          symbol: "AAPL",
+          side: "buy",
+          quantity: "1",
+          orderType: "market",
+          currency: "USD",
+          accountId: "acct_futu_hk",
+        }}
+        onClose={vi.fn()}
+        onViewOrders={vi.fn()}
+      />,
+    );
+    expect((screen.getByTestId("trade-account-select") as HTMLSelectElement).value).toBe("acct_futu_hk");
+    expect(screen.getByText("$0.00")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByTestId("trade-check-buying-power")).toHaveAttribute("data-state", "blocked");
+    expect(screen.getByText(/Insufficient buying power/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Continue to Mock preview/i }));
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByTestId("trade-preview")).toBeNull();
+  });
+
+  it("Recheck P1-1: locking mid-flight during benchmark sync resets benchmarkLoading so the sync button is usable after unlock", async () => {
+    tauriMocks.isTauri.mockReturnValue(true);
+    const benchDef = deferred<{
+      series: unknown;
+      fromCache: boolean;
+      degradedReason: null;
+      provider: string;
+    }>();
+
+    const parsed = await parseCsvLocally(
+      "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nVOO,VOO,10,450.00,500.00,USD,5000.00\n",
+      "voo.csv",
+      DEFAULT_ACCOUNT_ID,
+      "Default Account",
+    );
+    const snaps = [
+      makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 10_000),
+      makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 11_000),
+    ];
+
+    const unlockedStatus = {
+      unlocked: true,
+      lockState: "unlocked",
+      hasLockPassphrase: false,
+      retryAfterSeconds: 0,
+      cipher: "AES-256-GCM",
+      schemaVersion: 1,
+      keyProvider: "os-keyring",
+      signerPublicKey: "pub",
+      evidenceCount: 1,
+      hasLocalPortfolio: true,
+      lockedReason: null,
+    };
+
+    const lockedStatus = {
+      ...unlockedStatus,
+      unlocked: false,
+      lockState: "user-locked",
+    };
+
+    const prefsJson = JSON.stringify({
+      workspaceMode: "local-csv",
+      publicQuotesEnabled: true,
+      idleLockMinutes: 15,
+      quoteProvider: "stooq",
+    });
+
+    tauriMocks.invoke.mockImplementation(async (cmd, args) => {
+      switch (cmd) {
+        case "vault_status":
+          return unlockedStatus;
+        case "vault_load_setting":
+          return args?.key === WORKSPACE_PREFS_KEY ? prefsJson : null;
+        case "vault_list_accounts":
+          return [
+            {
+              id: DEFAULT_ACCOUNT_ID,
+              name: "Default Account",
+              broker: "Local CSV",
+              accountType: "taxable",
+              baseCurrency: "USD",
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+          ];
+        case "vault_load_account_portfolios":
+          return [parsed.snapshot];
+        case "vault_load_paper_orders":
+          return [];
+        case "quotes_load_cached":
+          return [];
+        case "nav_list_snapshots":
+          return snaps;
+        case "benchmark_load_cached":
+          return [];
+        case "benchmark_fetch_history":
+          return benchDef.promise;
+        case "vault_lock":
+          return lockedStatus;
+        case "vault_unlock":
+          return unlockedStatus;
+        default:
+          return null;
+      }
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("real-nav-chart")).toBeInTheDocument());
+
+    // Start benchmark sync (enters loading state)
+    fireEvent.click(screen.getByTestId("benchmark-opt-SPY"));
+    fireEvent.click(screen.getByTestId("benchmark-sync-button"));
+    expect(screen.getByTestId("benchmark-sync-button")).toBeDisabled();
+
+    // Lock session while benchmark_fetch_history is still in-flight!
+    fireEvent.click(screen.getByTestId("topbar-lock-button"));
+    await waitFor(() => expect(screen.getByTestId("app-lock-screen")).toBeInTheDocument());
+
+    // Stale pre-lock benchmark response resolves while locked
+    await act(async () => {
+      benchDef.resolve({
+        series: {
+          symbol: "SPY",
+          currency: "USD",
+          provider: "stooq.com",
+          asOfUtc: "2026-11-22T00:00:00.000Z",
+          points: [{ date: "2026-11-19", closeMicros: "550000000" }],
+        },
+        fromCache: false,
+        degradedReason: null,
+        provider: "stooq.com",
+      });
+      await Promise.resolve();
+    });
+
+    // Unlock session -> benchmark sync button MUST NOT be stuck disabled!
+    fireEvent.click(screen.getByTestId("app-lock-unlock-button"));
+    await waitFor(() => expect(screen.getByTestId("real-nav-chart")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("benchmark-opt-SPY"));
+    expect(screen.getByTestId("benchmark-sync-button")).not.toBeDisabled();
+  });
+
+  it("Recheck P1-2: lockEpoch blocks stale AutomationPage setting load and SettingsPage .fhvault post-restore hydration", async () => {
+    tauriMocks.isTauri.mockReturnValue(true);
+
+    // (A) AutomationPage: in-flight loadEncryptedSetting resolves AFTER lockEpoch bump (without unmount)
+    const autoLoadDef = deferred<string | null>();
+    tauriMocks.invoke.mockImplementation(async (cmd, args) => {
+      if (cmd === "vault_load_setting" && args?.key === "automation") {
+        return autoLoadDef.promise;
+      }
+      return null;
+    });
+
+    render(<AutomationPage language="en" />);
+    // Simulate vaultErrorLocked / lock epoch bump while AutomationPage stays mounted
+    act(() => {
+      purgeAllFrontendSensitiveMemory();
+    });
+
+    await act(async () => {
+      autoLoadDef.resolve(
+        JSON.stringify({
+          ...DEFAULT_AUTOMATION_STATE,
+          enabled: true,
+          strategyName: "Stale Secret Strategy",
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(AUTOMATION_CONTROLLER.getState().strategyName).toBe(DEFAULT_AUTOMATION_STATE.strategyName);
+    expect(AUTOMATION_CONTROLLER.getState().enabled).toBe(false);
+
+    // (B) SettingsPage: .fhvault restore completes AFTER lockEpoch bump -> MUST NOT call hydrateWorkspaceFromVault
+    cleanup();
+    const restoreDef = deferred<{ portfolioCount: number; paperOrderCount: number; evidenceCount: number }>();
+    let hydrateTriggeredAfterLock = false;
+    let locked = false;
+
+    tauriMocks.invoke.mockImplementation(async (cmd) => {
+      if (locked && (cmd === "vault_status" || cmd === "vault_load_account_portfolios" || cmd === "nav_list_snapshots")) {
+        hydrateTriggeredAfterLock = true;
+      }
+      switch (cmd) {
+        case "vault_status":
+          return {
+            unlocked: true,
+            lockState: "unlocked",
+            hasLockPassphrase: false,
+            retryAfterSeconds: 0,
+            cipher: "AES-256-GCM",
+            schemaVersion: 1,
+            keyProvider: "os-keyring",
+            signerPublicKey: "pub",
+            evidenceCount: 1,
+            hasLocalPortfolio: false,
+            lockedReason: null,
+          };
+        case "dialog_open_fhvault_file":
+          return { fileName: "backup.fhvault", content: "{\"version\":1}" };
+        case "vault_restore_backup":
+          return restoreDef.promise;
+        default:
+          return null;
+      }
+    });
+
+    render(<SettingsPage language="en" onLanguageChange={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("fhvault-restore-open"));
+    await waitFor(() => expect(screen.getByTestId("fhvault-restore-modal")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("fhvault-choose-file"));
+    await waitFor(() => expect(screen.getByTestId("fhvault-selected-name")).toHaveTextContent("backup.fhvault"));
+
+    fireEvent.change(screen.getByTestId("fhvault-passphrase-input"), {
+      target: { value: "strong-passphrase-123" },
+    });
+    fireEvent.click(screen.getByTestId("fhvault-modal-submit"));
+
+    // Lock happens while vault_restore_backup is still in-flight!
+    locked = true;
+    purgeAllFrontendSensitiveMemory();
+
+    await act(async () => {
+      restoreDef.resolve({ portfolioCount: 2, paperOrderCount: 3, evidenceCount: 5 });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(hydrateTriggeredAfterLock).toBe(false);
+    expect(MOCK_BROKER.hasLocalPortfolio()).toBe(false);
+  });
+
+  it("Recheck P1-3: browser-mode deleteAccount cleans/updates local-csv-portfolio so deleted sole account never resurrects on refresh", async () => {
+    // Case 1: Only non-default account acct_schwab has an imported CSV
+    await ACCOUNT_STORE.createOrUpdateAccount({
+      id: "acct_schwab",
+      name: "Schwab Taxable",
+      broker: "Schwab",
+      accountType: "taxable",
+      baseCurrency: "USD",
+    });
+    const schwabCsv = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nAAPL,Apple Inc,10,180.00,200.00,USD,5000.00\n";
+    const committedSchwab = await commitBrokerCsv(schwabCsv, "schwab.csv", "acct_schwab", "Schwab Taxable");
+    MOCK_BROKER.applyAccountPortfolioSnapshots([committedSchwab.snapshot], { switchMode: true });
+    expect(readStored("local-csv-portfolio", null)).not.toBeNull();
+
+    const deleted = await ACCOUNT_STORE.deleteAccount("acct_schwab");
+    expect(deleted).toBe(true);
+    expect(readStored("local-csv-portfolio", null)).toBeNull();
+    expect(await loadPersistedLocalPortfolio()).toBeNull();
+    expect(await loadPersistedAccountPortfolios()).toHaveLength(0);
+
+    // Simulate full page reload -> hydrateWorkspaceFromVault MUST NOT resurrect acct_schwab!
+    MOCK_BROKER.reset();
+    ACCOUNT_STORE.purgeSensitiveMemory();
+    NAV_STORE.purgeSensitiveMemory();
+    await hydrateWorkspaceFromVault();
+
+    expect(MOCK_BROKER.hasLocalPortfolio()).toBe(false);
+    expect(ACCOUNT_STORE.getAllAccountSnapshots()).toHaveLength(0);
+    expect(ACCOUNT_STORE.getAccounts().map((a) => a.id)).toEqual([DEFAULT_ACCOUNT_ID]);
+
+    // Case 2: Both acct_default and acct_ibkr imported (acct_ibkr imported last -> sits in local-csv-portfolio)
+    await ACCOUNT_STORE.createOrUpdateAccount({
+      id: "acct_ibkr",
+      name: "IBKR",
+      broker: "IBKR",
+      accountType: "margin",
+      baseCurrency: "USD",
+    });
+    const defaultCsv = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nVOO,VOO,5,450.00,500.00,USD,1000.00\n";
+    const cDef = await commitBrokerCsv(defaultCsv, "def.csv", DEFAULT_ACCOUNT_ID, "Default Account");
+    const cIbkr = await commitBrokerCsv(schwabCsv, "ibkr.csv", "acct_ibkr", "IBKR");
+    MOCK_BROKER.applyAccountPortfolioSnapshots([cDef.snapshot, cIbkr.snapshot], { switchMode: true });
+
+    const beforeLegacy = await loadPersistedLocalPortfolio();
+    expect(beforeLegacy?.accountId).toBe("acct_ibkr");
+
+    await ACCOUNT_STORE.deleteAccount("acct_ibkr");
+    const afterLegacy = await loadPersistedLocalPortfolio();
+    expect(afterLegacy?.accountId).toBe(DEFAULT_ACCOUNT_ID);
+  });
+
+  it("Recheck P2: getMarketSecurities strictly matches symbol|currency without cross-currency holding fallback", async () => {
+    const hkdCsv = "Symbol,Description,Quantity,Average Cost,Last Price,Currency,Cash\nDUAL,Dual HK Listing,50,80.00,90.00,HKD,0.00\n";
+    const parsed = await parseCsvLocally(hkdCsv, "hk.csv", DEFAULT_ACCOUNT_ID, "Default Account");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(parsed.snapshot, { switchMode: true });
+    const realSnap = MOCK_BROKER.getSnapshot();
+
+    const snapSpy = vi.spyOn(MOCK_BROKER, "getSnapshot").mockReturnValue({
+      ...realSnap,
+      quotes: [
+        ...realSnap.quotes,
+        {
+          symbol: "DUAL",
+          companyEn: "Dual US Listing",
+          companyZh: "Dual US Listing",
+          price: "12.00" as never,
+          change: "0.00" as never,
+          changePct: "0.00" as never,
+          asOf: "2026-11-22T15:00:00.000Z",
+          status: "available",
+          currency: "USD",
+          source: "public-delayed",
+        },
+      ],
+    });
+    try {
+      const securities = getMarketSecurities();
+      const dualHkd = securities.find((s) => s.symbol === "DUAL" && s.currency === "HKD");
+      const dualUsd = securities.find((s) => s.symbol === "DUAL" && s.currency === "USD");
+      expect(dualHkd).toBeDefined();
+      expect(dualHkd!.shares).toBe(50);
+      expect(dualUsd).toBeDefined();
+      // Strictly matched by symbol|currency: USD quote MUST NOT inherit HKD holding's 50 shares!
+      expect(dualUsd!.shares).toBe(0);
+      expect(dualUsd!.holdingValue).toBe(0);
+      expect(dualUsd!.averageCost).toBe(0);
+    } finally {
+      snapSpy.mockRestore();
+    }
   });
 });
