@@ -75,6 +75,9 @@ export interface TauriStoredPortfolioSnapshot {
   accountLabel: string;
   currency: string;
   cash: string;
+  cashByCurrency?: Record<string, string>;
+  currencies?: string[];
+  isMultiCurrency?: boolean;
   holdings: TauriStoredPortfolioHolding[];
   transactions: TauriStoredPortfolioTransaction[];
   warnings: string[];
@@ -83,6 +86,14 @@ export interface TauriStoredPortfolioSnapshot {
 export interface TauriCsvColumnMapping {
   canonicalField: string;
   sourceHeader: string;
+}
+
+export interface TauriCsvCurrencySubtotal {
+  currency: string;
+  holdingsValue: string;
+  cash: string;
+  totalValue: string;
+  holdingsCount: number;
 }
 
 export interface TauriCsvImportPreview {
@@ -94,6 +105,7 @@ export interface TauriCsvImportPreview {
   skippedRows: number;
   alreadyImported: boolean;
   warnings: string[];
+  currencySubtotals?: TauriCsvCurrencySubtotal[];
   snapshot: TauriStoredPortfolioSnapshot;
 }
 

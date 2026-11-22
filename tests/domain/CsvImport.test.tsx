@@ -145,4 +145,49 @@ NVDA,"=CMD|' /C calc'!A0",10,115.25,130.00,500.00`;
     expect(screen.getByTestId("portfolio-holding-row-SPY")).toBeInTheDocument();
     expect(screen.queryByTestId("portfolio-holding-row-VOO")).not.toBeInTheDocument();
   });
+
+  it("supports Fidelity, Vanguard, Futu, and Tiger CSV headers while isolating multi-currency portfolios fail-safe", async () => {
+    const fidelityCsv = `Account Number,Account Name,Symbol,Description,Quantity,Last Price,Current Value,Cost Basis Total,Average Cost Basis,Percent Of Account
+X123,Individual,VOO,VANGUARD S&P 500 ETF,10,$515.00,$5150.00,$4600.00,$460.00,65%
+X123,Individual,SPAXX**,FIDELITY GOVERNMENT MONEY MARKET,--,--,$2850.00,--,--,35%`;
+    const fid = await parseCsvLocally(fidelityCsv, "fidelity.csv");
+    expect(fid.detectedFormat).toBe("fidelity_positions");
+    expect(fid.snapshot.cash).toBe("2850.00");
+    expect(fid.snapshot.holdings[0]).toMatchObject({ symbol: "VOO", averageCost: "460.0000", lastPrice: "515.0000" });
+
+    const vanguardCsv = `Account Number,Investment Name,Symbol,Shares,Share Price,Total Value
+123456,Vanguard Total Stock Market ETF,VTI,20,$280.50,$5610.00
+123456,Vanguard Federal Money Market Fund,VMFXX,1200.50,$1.00,$1200.50`;
+    const van = await parseCsvLocally(vanguardCsv, "vanguard.csv");
+    expect(van.detectedFormat).toBe("vanguard_positions");
+    expect(van.snapshot.cash).toBe("1200.50");
+    expect(van.snapshot.holdings[0]).toMatchObject({ symbol: "VTI", quantity: "20", lastPrice: "280.5000" });
+
+    const futuMultiCurrencyCsv = `股票代码,股票名称,持有数量,稀释成本价,现价,市值,币种
+US.QQQ,纳指100ETF,10,450.00,490.00,4900.00,美元
+HK.00700,腾讯控股,100,320.00,380.00,38000.00,港元
+美元现金,--,--,--,--,2000.00,美元
+港元现金,--,--,--,--,15000.00,港元`;
+    const futu = await parseCsvLocally(futuMultiCurrencyCsv, "futu.csv");
+    expect(futu.detectedFormat).toBe("futu_positions");
+    expect(futu.snapshot.isMultiCurrency).toBe(true);
+    expect(futu.snapshot.currency).toBe("MULTI");
+    expect(futu.snapshot.currencies).toEqual(["HKD", "USD"]);
+    expect(futu.snapshot.cash).toBe("0.00");
+    expect(futu.snapshot.cashByCurrency).toEqual({ HKD: "15000.00", USD: "2000.00" });
+    expect(futu.currencySubtotals).toEqual([
+      { currency: "HKD", holdingsValue: "38000.00", cash: "15000.00", totalValue: "53000.00", holdingsCount: 1 },
+      { currency: "USD", holdingsValue: "4900.00", cash: "2000.00", totalValue: "6900.00", holdingsCount: 1 },
+    ]);
+    expect(futu.warnings.some((w) => w.includes("Multi-currency CSV detected"))).toBe(true);
+    expect(futu.snapshot.holdings.map((h) => h.symbol)).toEqual(["00700.HK", "QQQ"]);
+
+    const tigerCsv = `标的代码,标的名称,持仓数量,持仓均价,最新价,持仓市值,结算币种,账户现金
+BRK.B,伯克希尔B,5,410.00,455.00,$2275.00,USD,$1500.00`;
+    const tiger = await parseCsvLocally(tigerCsv, "tiger.csv");
+    expect(tiger.detectedFormat).toBe("tiger_positions");
+    expect(tiger.snapshot.isMultiCurrency).toBe(false);
+    expect(tiger.snapshot.cash).toBe("1500.00");
+    expect(tiger.snapshot.holdings[0]).toMatchObject({ symbol: "BRK.B", averageCost: "410.0000", lastPrice: "455.0000" });
+  });
 });

@@ -11,7 +11,7 @@
 //! - Opening an existing DB whose canary or records fail GCM authentication
 //!   fails immediately and preserves the untouched file for forensics/recovery.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
@@ -85,8 +85,17 @@ pub struct StoredPortfolioSnapshot {
     pub imported_at_utc: String,
     pub account_label: String,
     pub currency: String,
-    /// Exact decimal string.
+    /// Exact decimal string (for single-currency snapshots; "0.00" when multi-currency cash is isolated).
     pub cash: String,
+    /// Exact decimal cash balances isolated by currency code (never summed cross-currency).
+    #[serde(default)]
+    pub cash_by_currency: BTreeMap<String, String>,
+    /// Sorted unique currency codes across holdings and non-zero cash balances.
+    #[serde(default)]
+    pub currencies: Vec<String>,
+    /// True when more than one currency is detected; UI and domain must isolate totals by currency.
+    #[serde(default)]
+    pub is_multi_currency: bool,
     pub holdings: Vec<StoredPortfolioHolding>,
     pub transactions: Vec<StoredPortfolioTransaction>,
     pub warnings: Vec<String>,
@@ -714,6 +723,9 @@ mod tests {
             account_label: "Local CSV Portfolio".to_string(),
             currency: "USD".to_string(),
             cash: "14250.50".to_string(),
+            cash_by_currency: BTreeMap::from([("USD".to_string(), "14250.50".to_string())]),
+            currencies: vec!["USD".to_string()],
+            is_multi_currency: false,
             holdings: vec![StoredPortfolioHolding {
                 symbol: "AAPL".to_string(),
                 company: "Apple Inc.".to_string(),

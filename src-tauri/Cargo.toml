@@ -16,17 +16,21 @@ tauri-build = { version = "=2.6.3", features = ["codegen"] }
 
 [dependencies]
 aes-gcm = { version = "=0.10.3", features = ["zeroize"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+base64 = { version = "=0.22.1" }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde"] }
 ed25519-dalek = { version = "=3.0.0" }
 getrandom = { version = "=0.3.4" }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "charset", "http2"] }
 rusqlite = { version = "=0.32.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = { version = "=1.0.151" }
+serde_json = { version = "=1.0.151", features = ["raw_value"] }
 sha2 = { version = "=0.10.9" }
+subtle = { version = "=2.6.1" }
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.0"
 thiserror = { version = "=2.0.20" }
+tokio = { version = "=1.53.1", features = ["sync", "time", "rt", "macros"] }
 zeroize = { version = "=1.9.2", features = ["derive"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

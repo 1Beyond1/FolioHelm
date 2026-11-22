@@ -3,6 +3,10 @@
 //! Supported formats:
 //! - Charles Schwab Positions CSV & Transactions CSV
 //! - Interactive Brokers (IBKR) Activity / Positions CSV (both multi-section and flat exports)
+//! - Fidelity Positions CSV
+//! - Vanguard Positions CSV
+//! - Futu / Moomoo (富途) Positions CSV (EN / ZH)
+//! - Tiger Brokers (老虎证券) Positions CSV (EN / ZH)
 //! - Generic standard CSV (`symbol, quantity, average_cost, price, cash, currency, date, action`)
 //!
 //! Security guarantees:
@@ -10,9 +14,11 @@
 //! - CSV formula injection sanitization (strips leading `=`, `+`, `-`, `@`, `\t`, `\r` on text cells).
 //! - Exact fixed-point decimal arithmetic (10^8 scale via `i128`, zero IEEE-754 float math).
 //! - Strict symbol validation (`^[A-Z0-9][A-Z0-9.-]{0,9}$`) and non-negative share quantities.
+//! - Multi-currency fail-safe isolation: balances and market values are grouped per currency
+//!   and NEVER summed across different currencies without verified FX rates.
 //! - Deterministic SHA-256 fingerprint for idempotent imports (re-importing never doubles positions).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,6 +36,119 @@ pub const MAX_CSV_ROWS: usize = 10_000;
 const FIXED_SCALE: u32 = 8;
 const FIXED_FACTOR: i128 = 100_000_000;
 
+const SYMBOL_ALIASES: &[&str] = &[
+    "symbol",
+    "ticker",
+    "code",
+    "stock code",
+    "contract",
+    "代码",
+    "股票代码",
+    "标的",
+    "标的代码",
+    "合约代码",
+];
+
+const COMPANY_ALIASES: &[&str] = &[
+    "description",
+    "company",
+    "name",
+    "security description",
+    "investment name",
+    "fund name",
+    "security name",
+    "stock name",
+    "contract name",
+    "名称",
+    "股票名称",
+    "标的名称",
+];
+
+const QUANTITY_ALIASES: &[&str] = &[
+    "quantity",
+    "qty",
+    "shares",
+    "position",
+    "holding qty",
+    "holdings",
+    "持有数量",
+    "持仓数量",
+    "持仓",
+    "数量",
+];
+
+const PRICE_ALIASES: &[&str] = &[
+    "price",
+    "last",
+    "last price",
+    "share price",
+    "current price",
+    "latest price",
+    "markprice",
+    "mark price",
+    "close price",
+    "market price",
+    "现价",
+    "最新价",
+    "市价",
+    "收盘价",
+];
+
+const AVG_COST_ALIASES: &[&str] = &[
+    "average_cost",
+    "average cost",
+    "average cost basis",
+    "cost basis per share",
+    "avg_cost",
+    "avg cost",
+    "avg price",
+    "costbasisprice",
+    "cost basis price",
+    "cost price",
+    "diluted cost",
+    "cost/share",
+    "成本价",
+    "稀释成本价",
+    "平均成本价",
+    "平均成本",
+    "持仓均价",
+    "均价",
+];
+
+const COST_BASIS_ALIASES: &[&str] = &[
+    "cost basis",
+    "cost_basis",
+    "costbasis",
+    "cost basis total",
+    "total cost basis",
+    "总成本",
+    "持仓成本",
+];
+
+const MARKET_VALUE_ALIASES: &[&str] = &[
+    "market value",
+    "market_value",
+    "mkt val",
+    "mkt val (market value)",
+    "current value",
+    "total value",
+    "持仓市值",
+    "参考市值",
+    "市值",
+];
+
+const CURRENCY_ALIASES: &[&str] = &["currency", "ccy", "币种", "货币", "结算币种"];
+
+const CASH_COL_ALIASES: &[&str] = &[
+    "cash",
+    "cash balance",
+    "cash_balance",
+    "现金",
+    "现金余额",
+    "可用现金",
+    "账户现金",
+];
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CsvImportError {
     #[error("CSV payload is empty")]
@@ -38,7 +157,9 @@ pub enum CsvImportError {
     FileTooLarge { actual: usize },
     #[error("CSV file exceeds the {MAX_CSV_ROWS} row safety limit")]
     TooManyRows,
-    #[error("could not detect a supported header row (Schwab, IBKR, or standard CSV)")]
+    #[error(
+        "could not detect a supported header row (Schwab, IBKR, Fidelity, Vanguard, Futu, Tiger, or standard CSV)"
+    )]
     UnrecognizedFormat,
     #[error("invalid decimal value in row {row}, column '{column}': {value}")]
     InvalidDecimal {
@@ -65,6 +186,19 @@ pub struct CsvColumnMappingDto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CsvCurrencySubtotalDto {
+    pub currency: String,
+    /// Exact decimal string.
+    pub holdings_value: String,
+    /// Exact decimal string.
+    pub cash: String,
+    /// Exact decimal string (`holdings_value + cash` within this single currency).
+    pub total_value: String,
+    pub holdings_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CsvImportPreviewDto {
     pub detected_format: String,
     pub format_label_en: String,
@@ -74,6 +208,7 @@ pub struct CsvImportPreviewDto {
     pub skipped_rows: usize,
     pub already_imported: bool,
     pub warnings: Vec<String>,
+    pub currency_subtotals: Vec<CsvCurrencySubtotalDto>,
     pub snapshot: StoredPortfolioSnapshot,
 }
 
@@ -91,6 +226,10 @@ enum DetectedFormat {
     SchwabTransactions,
     IbkrActivity,
     IbkrPositions,
+    FidelityPositions,
+    VanguardPositions,
+    FutuPositions,
+    TigerPositions,
     GenericStandard,
 }
 
@@ -101,6 +240,10 @@ impl DetectedFormat {
             Self::SchwabTransactions => "schwab_transactions",
             Self::IbkrActivity => "ibkr_activity",
             Self::IbkrPositions => "ibkr_positions",
+            Self::FidelityPositions => "fidelity_positions",
+            Self::VanguardPositions => "vanguard_positions",
+            Self::FutuPositions => "futu_positions",
+            Self::TigerPositions => "tiger_positions",
             Self::GenericStandard => "generic_csv",
         }
     }
@@ -111,6 +254,10 @@ impl DetectedFormat {
             Self::SchwabTransactions => ("Charles Schwab Transactions CSV", "嘉信理财交易流水 CSV"),
             Self::IbkrActivity => ("IBKR Activity Statement CSV", "盈透证券活动报表 CSV"),
             Self::IbkrPositions => ("IBKR Positions CSV", "盈透证券持仓 CSV"),
+            Self::FidelityPositions => ("Fidelity Positions CSV", "富达 (Fidelity) 持仓 CSV"),
+            Self::VanguardPositions => ("Vanguard Positions CSV", "先锋领航 (Vanguard) 持仓 CSV"),
+            Self::FutuPositions => ("Futu / Moomoo Positions CSV", "富途 (Futu) 持仓 CSV"),
+            Self::TigerPositions => ("Tiger Brokers Positions CSV", "老虎证券 (Tiger) 持仓 CSV"),
             Self::GenericStandard => ("Standard Portfolio CSV", "通用标准持仓 CSV"),
         }
     }
@@ -140,19 +287,24 @@ pub fn parse_and_preview_csv(
     let mut warnings = Vec::new();
     let safe_source_label = sanitize_text_cell(source_label, "filename", &mut warnings);
 
-    let (format, mappings, holdings, transactions, cash_fixed, currency, skipped_rows) =
+    let (format, mappings, holdings, transactions, cash_by_currency_fixed, skipped_rows) =
         if is_ibkr_multi_section(&rows) {
             parse_ibkr_multi_section(&rows, &mut warnings)?
         } else {
             parse_tabular_csv(&rows, &mut warnings)?
         };
 
-    if holdings.is_empty() && transactions.is_empty() && cash_fixed == 0 {
+    let has_any_cash = cash_by_currency_fixed.values().any(|&v| v != 0);
+    if holdings.is_empty() && transactions.is_empty() && !has_any_cash {
         return Err(CsvImportError::NoUsableData);
     }
 
     let mut sorted_holdings = holdings;
-    sorted_holdings.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    sorted_holdings.sort_by(|a, b| {
+        a.symbol
+            .cmp(&b.symbol)
+            .then_with(|| a.currency.cmp(&b.currency))
+    });
     let mut sorted_transactions = transactions;
     sorted_transactions.sort_by(|a, b| {
         a.date
@@ -162,11 +314,59 @@ pub fn parse_and_preview_csv(
             .then_with(|| a.quantity.cmp(&b.quantity))
     });
 
-    let cash_str = format_fixed(cash_fixed, 2);
+    let mut currency_set = BTreeSet::new();
+    for h in &sorted_holdings {
+        currency_set.insert(h.currency.clone());
+    }
+    for (curr, &amount) in &cash_by_currency_fixed {
+        if amount != 0 {
+            currency_set.insert(curr.clone());
+        }
+    }
+    if currency_set.is_empty() {
+        for t in &sorted_transactions {
+            currency_set.insert(t.currency.clone());
+        }
+    }
+    if currency_set.is_empty() {
+        currency_set.insert("USD".to_string());
+    }
+
+    let currencies: Vec<String> = currency_set.into_iter().collect();
+    let is_multi_currency = currencies.len() > 1;
+    let primary_currency = if is_multi_currency {
+        "MULTI".to_string()
+    } else {
+        currencies[0].clone()
+    };
+
+    let mut cash_by_currency: BTreeMap<String, String> = BTreeMap::new();
+    for curr in &currencies {
+        let amt = cash_by_currency_fixed.get(curr).copied().unwrap_or(0);
+        cash_by_currency.insert(curr.clone(), format_fixed(amt, 2));
+    }
+
+    let cash_str = if is_multi_currency {
+        warnings.push(format!(
+            "Multi-currency CSV detected ({}): balances and valuations are isolated by currency with no FX conversion",
+            currencies.join(", ")
+        ));
+        "0.00".to_string()
+    } else {
+        cash_by_currency
+            .get(&primary_currency)
+            .cloned()
+            .unwrap_or_else(|| "0.00".to_string())
+    };
+
+    let currency_subtotals =
+        compute_currency_subtotals(&currencies, &sorted_holdings, &cash_by_currency_fixed)?;
+
     let fingerprint = compute_snapshot_fingerprint(
         format.code(),
-        &currency,
+        &primary_currency,
         &cash_str,
+        &cash_by_currency,
         &sorted_holdings,
         &sorted_transactions,
     );
@@ -186,8 +386,11 @@ pub fn parse_and_preview_csv(
         },
         imported_at_utc: now,
         account_label: "Local Portfolio (CSV + Paper)".to_string(),
-        currency,
+        currency: primary_currency,
         cash: cash_str,
+        cash_by_currency,
+        currencies,
+        is_multi_currency,
         holdings: sorted_holdings,
         transactions: sorted_transactions,
         warnings: warnings.clone(),
@@ -202,8 +405,42 @@ pub fn parse_and_preview_csv(
         skipped_rows,
         already_imported,
         warnings,
+        currency_subtotals,
         snapshot,
     })
+}
+
+fn compute_currency_subtotals(
+    currencies: &[String],
+    holdings: &[StoredPortfolioHolding],
+    cash_by_currency_fixed: &BTreeMap<String, i128>,
+) -> Result<Vec<CsvCurrencySubtotalDto>, CsvImportError> {
+    let mut out = Vec::with_capacity(currencies.len());
+    for curr in currencies {
+        let mut mv_sum: i128 = 0;
+        let mut count = 0_usize;
+        for h in holdings.iter().filter(|h| &h.currency == curr) {
+            let qty = parse_decimal_fixed(&h.quantity, 0, "Quantity")?;
+            let px = parse_decimal_fixed(&h.last_price, 0, "Price")?;
+            let mv = fixed_mul(qty, px)?;
+            mv_sum = mv_sum
+                .checked_add(mv)
+                .ok_or(CsvImportError::ArithmeticOverflow)?;
+            count += 1;
+        }
+        let cash = cash_by_currency_fixed.get(curr).copied().unwrap_or(0);
+        let total = mv_sum
+            .checked_add(cash)
+            .ok_or(CsvImportError::ArithmeticOverflow)?;
+        out.push(CsvCurrencySubtotalDto {
+            currency: curr.clone(),
+            holdings_value: format_fixed(mv_sum, 2),
+            cash: format_fixed(cash, 2),
+            total_value: format_fixed(total, 2),
+            holdings_count: count,
+        });
+    }
+    Ok(out)
 }
 
 fn is_ibkr_multi_section(rows: &[Vec<String>]) -> bool {
@@ -222,10 +459,21 @@ type ParsedCsvResult = (
     Vec<CsvColumnMappingDto>,
     Vec<StoredPortfolioHolding>,
     Vec<StoredPortfolioTransaction>,
-    i128,
-    String,
+    BTreeMap<String, i128>,
     usize,
 );
+
+fn add_cash(
+    map: &mut BTreeMap<String, i128>,
+    currency: &str,
+    amount: i128,
+) -> Result<(), CsvImportError> {
+    let entry = map.entry(currency.to_string()).or_insert(0);
+    *entry = entry
+        .checked_add(amount)
+        .ok_or(CsvImportError::ArithmeticOverflow)?;
+    Ok(())
+}
 
 fn parse_ibkr_multi_section(
     rows: &[Vec<String>],
@@ -235,10 +483,9 @@ fn parse_ibkr_multi_section(
     let mut trade_headers: Option<Vec<String>> = None;
     let mut cash_headers: Option<Vec<String>> = None;
     let mut mappings = Vec::new();
-    let mut holdings_map: BTreeMap<String, HoldingAccumulator> = BTreeMap::new();
+    let mut holdings_map: BTreeMap<(String, String), HoldingAccumulator> = BTreeMap::new();
     let mut transactions = Vec::new();
-    let mut cash_fixed: i128 = 0;
-    let mut account_currency = "USD".to_string();
+    let mut cash_by_currency: BTreeMap<String, i128> = BTreeMap::new();
     let mut skipped_rows = 0_usize;
 
     for (idx, row) in rows.iter().enumerate() {
@@ -291,18 +538,19 @@ fn parse_ibkr_multi_section(
                         continue;
                     }
                 }
-                let raw_symbol = find_cell(headers, values, &["symbol", "ticker"]).unwrap_or("");
+                let raw_symbol = find_cell(headers, values, SYMBOL_ALIASES).unwrap_or("");
                 if is_summary_or_blank_symbol(raw_symbol) {
                     skipped_rows += 1;
                     continue;
                 }
                 let symbol = validate_symbol(raw_symbol, row_num)?;
-                let qty_raw = find_cell(headers, values, &["quantity", "position", "shares"])
-                    .ok_or_else(|| CsvImportError::InvalidDecimal {
+                let qty_raw = find_cell(headers, values, QUANTITY_ALIASES).ok_or_else(|| {
+                    CsvImportError::InvalidDecimal {
                         row: row_num,
                         column: "Quantity".into(),
                         value: String::new(),
-                    })?;
+                    }
+                })?;
                 let qty_fixed = parse_decimal_fixed(qty_raw, row_num, "Quantity")?;
                 if qty_fixed < 0 {
                     return Err(CsvImportError::NegativeQuantity {
@@ -315,26 +563,12 @@ fn parse_ibkr_multi_section(
                     continue;
                 }
 
-                let cost_price_opt = find_cell(
-                    headers,
-                    values,
-                    &[
-                        "cost price",
-                        "costbasisprice",
-                        "cost basis price",
-                        "average cost",
-                        "avg cost",
-                    ],
-                )
-                .filter(|v| !v.trim().is_empty());
-                let cost_basis_opt = find_cell(headers, values, &["cost basis", "costbasis"])
-                    .filter(|v| !v.trim().is_empty());
-                let mark_price_opt = find_cell(
-                    headers,
-                    values,
-                    &["close price", "markprice", "mark price", "price"],
-                )
-                .filter(|v| !v.trim().is_empty());
+                let cost_price_opt =
+                    find_cell(headers, values, AVG_COST_ALIASES).filter(|v| !v.trim().is_empty());
+                let cost_basis_opt =
+                    find_cell(headers, values, COST_BASIS_ALIASES).filter(|v| !v.trim().is_empty());
+                let mark_price_opt =
+                    find_cell(headers, values, PRICE_ALIASES).filter(|v| !v.trim().is_empty());
 
                 let last_price_fixed = match mark_price_opt {
                     Some(v) => parse_decimal_fixed(v, row_num, "Close Price")?,
@@ -354,12 +588,11 @@ fn parse_ibkr_multi_section(
                     avg_cost_fixed
                 };
 
-                let company_raw =
-                    find_cell(headers, values, &["description", "company", "name"]).unwrap_or("");
+                let company_raw = find_cell(headers, values, COMPANY_ALIASES).unwrap_or("");
                 let company = sanitize_text_cell(company_raw, "Description", warnings);
-                let currency =
-                    normalize_currency(find_cell(headers, values, &["currency"]).unwrap_or("USD"));
-                account_currency = currency.clone();
+                let currency = normalize_currency(
+                    find_cell(headers, values, CURRENCY_ALIASES).unwrap_or("USD"),
+                );
 
                 accumulate_holding(
                     &mut holdings_map,
@@ -376,13 +609,13 @@ fn parse_ibkr_multi_section(
                     skipped_rows += 1;
                     continue;
                 };
-                let raw_symbol = find_cell(headers, values, &["symbol", "ticker"]).unwrap_or("");
+                let raw_symbol = find_cell(headers, values, SYMBOL_ALIASES).unwrap_or("");
                 if is_summary_or_blank_symbol(raw_symbol) {
                     skipped_rows += 1;
                     continue;
                 }
                 let symbol = validate_symbol(raw_symbol, row_num)?;
-                let qty_raw = find_cell(headers, values, &["quantity", "shares"]).unwrap_or("0");
+                let qty_raw = find_cell(headers, values, QUANTITY_ALIASES).unwrap_or("0");
                 let qty_fixed = parse_decimal_fixed(qty_raw, row_num, "Quantity")?;
                 let price_raw = find_cell(headers, values, &["t. price", "trade price", "price"])
                     .unwrap_or("0");
@@ -397,8 +630,9 @@ fn parse_ibkr_multi_section(
                 let date_raw =
                     find_cell(headers, values, &["date/time", "date", "trade date"]).unwrap_or("");
                 let date = sanitize_text_cell(date_raw, "Date/Time", warnings);
-                let currency =
-                    normalize_currency(find_cell(headers, values, &["currency"]).unwrap_or("USD"));
+                let currency = normalize_currency(
+                    find_cell(headers, values, CURRENCY_ALIASES).unwrap_or("USD"),
+                );
                 let action = if qty_fixed >= 0 { "BUY" } else { "SELL" };
 
                 transactions.push(StoredPortfolioTransaction {
@@ -421,9 +655,20 @@ fn parse_ibkr_multi_section(
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 if summary_label.contains("ending cash") {
+                    let raw_curr = find_cell(headers, values, CURRENCY_ALIASES).unwrap_or("USD");
+                    if raw_curr
+                        .trim()
+                        .to_ascii_lowercase()
+                        .contains("base currency")
+                    {
+                        // Skip IBKR converted base currency summary to prevent FX mixing.
+                        skipped_rows += 1;
+                        continue;
+                    }
+                    let row_currency = normalize_currency(raw_curr);
                     if let Some(total_raw) = find_cell(headers, values, &["total", "amount"]) {
                         if let Ok(parsed) = parse_decimal_fixed(total_raw, row_num, "Ending Cash") {
-                            cash_fixed = parsed;
+                            cash_by_currency.insert(row_currency, parsed);
                         }
                     }
                 }
@@ -443,8 +688,7 @@ fn parse_ibkr_multi_section(
         dedup_mappings(mappings),
         finalize_holdings(holdings_map)?,
         transactions,
-        cash_fixed,
-        account_currency,
+        cash_by_currency,
         skipped_rows,
     ))
 }
@@ -462,10 +706,9 @@ fn parse_tabular_csv(
     let mut mappings = Vec::new();
     collect_mappings(&headers, &mut mappings);
 
-    let mut holdings_map: BTreeMap<String, HoldingAccumulator> = BTreeMap::new();
+    let mut holdings_map: BTreeMap<(String, String), HoldingAccumulator> = BTreeMap::new();
     let mut transactions = Vec::new();
-    let mut cash_fixed: i128 = 0;
-    let mut currency = "USD".to_string();
+    let mut cash_by_currency: BTreeMap<String, i128> = BTreeMap::new();
     let mut skipped_rows = header_index;
 
     for (offset, row) in rows.iter().enumerate().skip(header_index + 1) {
@@ -475,40 +718,58 @@ fn parse_tabular_csv(
             continue;
         }
 
-        let raw_symbol = find_cell(&headers, row, &["symbol", "ticker"]).unwrap_or("");
+        let raw_symbol = find_cell(&headers, row, SYMBOL_ALIASES).unwrap_or("");
         let symbol_lower = raw_symbol.trim().to_ascii_lowercase();
+        let company_raw = find_cell(&headers, row, COMPANY_ALIASES).unwrap_or("");
 
-        // Schwab / brokerage cash rows: "Cash & Cash Investments" or "CASH"
-        if is_cash_row(&symbol_lower) {
+        let explicit_currency = find_cell(&headers, row, CURRENCY_ALIASES)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(normalize_currency);
+
+        // Cash rows (Schwab, Fidelity SPAXX/FCASH, Vanguard VMFXX, Futu/Tiger 现金)
+        if is_cash_row(&symbol_lower, company_raw) {
             if let Some(val_raw) = find_cell(
                 &headers,
                 row,
                 &[
                     "market value",
+                    "market_value",
                     "mkt val",
+                    "current value",
+                    "total value",
                     "amount",
                     "cash",
                     "price",
                     "value",
+                    "市值",
+                    "持仓市值",
+                    "现金",
                 ],
             ) {
                 if !val_raw.trim().is_empty() && !is_na_placeholder(val_raw) {
                     let parsed = parse_decimal_fixed(val_raw, row_num, "Cash")?;
-                    cash_fixed = cash_fixed
-                        .checked_add(parsed)
-                        .ok_or(CsvImportError::ArithmeticOverflow)?;
+                    let row_currency = explicit_currency
+                        .clone()
+                        .or_else(|| infer_currency_from_cash_symbol(&symbol_lower))
+                        .or_else(|| infer_currency_from_amount(val_raw))
+                        .unwrap_or_else(|| "USD".to_string());
+                    add_cash(&mut cash_by_currency, &row_currency, parsed)?;
                 }
             }
             continue;
         }
 
-        // Optional explicit cash column on standard CSV rows
-        if let Some(cash_col) = find_cell(&headers, row, &["cash", "cash balance", "cash_balance"])
-        {
+        // Optional explicit cash column on standard/Futu/Tiger CSV rows
+        if let Some(cash_col) = find_cell(&headers, row, CASH_COL_ALIASES) {
             if !cash_col.trim().is_empty() && !is_na_placeholder(cash_col) {
                 let parsed = parse_decimal_fixed(cash_col, row_num, "cash")?;
-                if parsed > 0 && cash_fixed == 0 {
-                    cash_fixed = parsed;
+                let cash_curr = explicit_currency
+                    .clone()
+                    .or_else(|| infer_currency_from_amount(cash_col))
+                    .unwrap_or_else(|| "USD".to_string());
+                if parsed > 0 && cash_by_currency.get(&cash_curr).copied().unwrap_or(0) == 0 {
+                    cash_by_currency.insert(cash_curr, parsed);
                 }
             }
         }
@@ -516,12 +777,6 @@ fn parse_tabular_csv(
         if is_summary_or_blank_symbol(raw_symbol) {
             skipped_rows += 1;
             continue;
-        }
-
-        if let Some(curr) = find_cell(&headers, row, &["currency", "ccy"]) {
-            if !curr.trim().is_empty() {
-                currency = normalize_currency(curr);
-            }
         }
 
         let is_transaction_row = format == DetectedFormat::SchwabTransactions
@@ -535,7 +790,7 @@ fn parse_tabular_csv(
             let date_raw =
                 find_cell(&headers, row, &["date", "trade date", "settlement date"]).unwrap_or("");
             let date = sanitize_text_cell(date_raw, "Date", warnings);
-            let qty_raw = find_cell(&headers, row, &["quantity", "qty", "shares"]).unwrap_or("0");
+            let qty_raw = find_cell(&headers, row, QUANTITY_ALIASES).unwrap_or("0");
             let price_raw =
                 find_cell(&headers, row, &["price", "trade price", "unit price"]).unwrap_or("0");
             let fees_raw =
@@ -564,6 +819,11 @@ fn parse_tabular_csv(
                 parse_decimal_fixed(amount_raw, row_num, "Amount")?
             };
 
+            let row_currency = explicit_currency
+                .or_else(|| infer_currency_from_amount(price_raw))
+                .or_else(|| infer_currency_from_amount(amount_raw))
+                .unwrap_or_else(|| "USD".to_string());
+
             let symbol = validate_symbol(raw_symbol, row_num)?;
             transactions.push(StoredPortfolioTransaction {
                 date,
@@ -573,19 +833,20 @@ fn parse_tabular_csv(
                 price: format_fixed(price_fixed.abs(), 4),
                 amount: format_fixed(amount_fixed, 2),
                 fees: format_fixed(fees_fixed.abs(), 2),
-                currency: currency.clone(),
+                currency: row_currency,
             });
             continue;
         }
 
         // Position row
         let symbol = validate_symbol(raw_symbol, row_num)?;
-        let qty_raw = find_cell(&headers, row, &["quantity", "qty", "shares", "position"])
-            .ok_or_else(|| CsvImportError::InvalidDecimal {
+        let qty_raw = find_cell(&headers, row, QUANTITY_ALIASES).ok_or_else(|| {
+            CsvImportError::InvalidDecimal {
                 row: row_num,
                 column: "Quantity".into(),
                 value: String::new(),
-            })?;
+            }
+        })?;
         let qty_fixed = parse_decimal_fixed(qty_raw, row_num, "Quantity")?;
         if qty_fixed < 0 {
             return Err(CsvImportError::NegativeQuantity {
@@ -598,51 +859,14 @@ fn parse_tabular_csv(
             continue;
         }
 
-        let price_opt = find_cell(
-            &headers,
-            row,
-            &[
-                "price",
-                "last",
-                "last price",
-                "markprice",
-                "mark price",
-                "close price",
-                "market price",
-            ],
-        )
-        .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
-
-        let avg_cost_opt = find_cell(
-            &headers,
-            row,
-            &[
-                "average_cost",
-                "average cost",
-                "avg_cost",
-                "avg cost",
-                "costbasisprice",
-                "cost basis price",
-                "cost price",
-                "cost/share",
-            ],
-        )
-        .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
-
-        let cost_basis_opt = find_cell(&headers, row, &["cost basis", "cost_basis", "costbasis"])
+        let price_opt = find_cell(&headers, row, PRICE_ALIASES)
             .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
-
-        let mkt_val_opt = find_cell(
-            &headers,
-            row,
-            &[
-                "market value",
-                "market_value",
-                "mkt val",
-                "mkt val (market value)",
-            ],
-        )
-        .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
+        let avg_cost_opt = find_cell(&headers, row, AVG_COST_ALIASES)
+            .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
+        let cost_basis_opt = find_cell(&headers, row, COST_BASIS_ALIASES)
+            .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
+        let mkt_val_opt = find_cell(&headers, row, MARKET_VALUE_ALIASES)
+            .filter(|v| !v.trim().is_empty() && !is_na_placeholder(v));
 
         let last_price_fixed = if let Some(v) = price_opt {
             parse_decimal_fixed(v, row_num, "Price")?
@@ -668,12 +892,13 @@ fn parse_tabular_csv(
             avg_cost_fixed
         };
 
-        let company_raw = find_cell(
-            &headers,
-            row,
-            &["description", "company", "name", "security description"],
-        )
-        .unwrap_or("");
+        let row_currency = explicit_currency
+            .or_else(|| price_opt.and_then(infer_currency_from_amount))
+            .or_else(|| mkt_val_opt.and_then(infer_currency_from_amount))
+            .or_else(|| avg_cost_opt.and_then(infer_currency_from_amount))
+            .or_else(|| infer_currency_from_symbol(&symbol))
+            .unwrap_or_else(|| "USD".to_string());
+
         let company = sanitize_text_cell(company_raw, "Description", warnings);
 
         accumulate_holding(
@@ -683,7 +908,7 @@ fn parse_tabular_csv(
             qty_fixed,
             avg_cost_fixed,
             effective_last,
-            currency.clone(),
+            row_currency,
         )?;
     }
 
@@ -696,8 +921,7 @@ fn parse_tabular_csv(
         dedup_mappings(mappings),
         finalize_holdings(holdings_map)?,
         transactions,
-        cash_fixed,
-        currency,
+        cash_by_currency,
         skipped_rows,
     ))
 }
@@ -712,7 +936,7 @@ struct HoldingAccumulator {
 }
 
 fn accumulate_holding(
-    map: &mut BTreeMap<String, HoldingAccumulator>,
+    map: &mut BTreeMap<(String, String), HoldingAccumulator>,
     symbol: String,
     company: String,
     qty_fixed: i128,
@@ -721,7 +945,8 @@ fn accumulate_holding(
     currency: String,
 ) -> Result<(), CsvImportError> {
     let added_cost = fixed_mul(qty_fixed, avg_cost_fixed)?;
-    if let Some(entry) = map.get_mut(&symbol) {
+    let key = (symbol.clone(), currency.clone());
+    if let Some(entry) = map.get_mut(&key) {
         entry.quantity = entry
             .quantity
             .checked_add(qty_fixed)
@@ -738,7 +963,7 @@ fn accumulate_holding(
         }
     } else {
         map.insert(
-            symbol.clone(),
+            key,
             HoldingAccumulator {
                 symbol,
                 company,
@@ -754,10 +979,9 @@ fn accumulate_holding(
 
 fn replay_transactions_into_holdings(
     transactions: &[StoredPortfolioTransaction],
-    map: &mut BTreeMap<String, HoldingAccumulator>,
+    map: &mut BTreeMap<(String, String), HoldingAccumulator>,
     warnings: &mut Vec<String>,
 ) -> Result<(), CsvImportError> {
-    // Replay oldest-first using exact weighted average cost.
     let mut chronological: Vec<&StoredPortfolioTransaction> = transactions.iter().collect();
     chronological.sort_by(|a, b| a.date.cmp(&b.date));
 
@@ -780,7 +1004,8 @@ fn replay_transactions_into_holdings(
                 tx.currency.clone(),
             )?;
         } else if action_lower.contains("sell") {
-            if let Some(entry) = map.get_mut(&tx.symbol) {
+            let key = (tx.symbol.clone(), tx.currency.clone());
+            if let Some(entry) = map.get_mut(&key) {
                 if qty >= entry.quantity {
                     entry.quantity = 0;
                     entry.total_cost = 0;
@@ -806,7 +1031,7 @@ fn replay_transactions_into_holdings(
 }
 
 fn finalize_holdings(
-    map: BTreeMap<String, HoldingAccumulator>,
+    map: BTreeMap<(String, String), HoldingAccumulator>,
 ) -> Result<Vec<StoredPortfolioHolding>, CsvImportError> {
     let mut holdings = Vec::with_capacity(map.len());
     for (_, acc) in map {
@@ -840,7 +1065,7 @@ fn locate_header_row(rows: &[Vec<String>]) -> Option<(usize, DetectedFormat)> {
         let normalized: Vec<String> = row.iter().map(|c| normalize_header(c)).collect();
         let has_symbol = normalized
             .iter()
-            .any(|h| matches!(h.as_str(), "symbol" | "ticker"));
+            .any(|h| SYMBOL_ALIASES.contains(&h.as_str()));
         if !has_symbol {
             continue;
         }
@@ -861,9 +1086,45 @@ fn locate_header_row(rows: &[Vec<String>]) -> Option<(usize, DetectedFormat)> {
                 "costbasisprice" | "markprice" | "fifopnlunrealized"
             )
         });
+        let has_fidelity = normalized.iter().any(|h| {
+            matches!(
+                h.as_str(),
+                "cost basis total"
+                    | "average cost basis"
+                    | "percent of account"
+                    | "today's gain/loss dollar"
+            )
+        }) || (normalized.iter().any(|h| h == "current value")
+            && normalized.iter().any(|h| h == "last price"));
+        let has_vanguard = normalized.iter().any(|h| h == "investment name")
+            || (normalized.iter().any(|h| h == "share price")
+                && normalized.iter().any(|h| h == "total value"));
+        let has_futu = normalized.iter().any(|h| {
+            matches!(
+                h.as_str(),
+                "持有数量"
+                    | "稀释成本价"
+                    | "平均成本价"
+                    | "holding qty"
+                    | "diluted cost"
+                    | "股票代码"
+            )
+        });
+        let has_tiger = normalized.iter().any(|h| {
+            matches!(
+                h.as_str(),
+                "标的"
+                    | "标的代码"
+                    | "合约代码"
+                    | "持仓均价"
+                    | "持仓市值"
+                    | "账户现金"
+                    | "contract"
+            )
+        });
         let has_qty = normalized
             .iter()
-            .any(|h| matches!(h.as_str(), "quantity" | "qty" | "shares" | "position"));
+            .any(|h| QUANTITY_ALIASES.contains(&h.as_str()));
 
         if has_action && (has_fees_comm || normalized.iter().any(|h| h == "date")) {
             return Some((idx, DetectedFormat::SchwabTransactions));
@@ -874,6 +1135,18 @@ fn locate_header_row(rows: &[Vec<String>]) -> Option<(usize, DetectedFormat)> {
         if has_ibkr_flat && has_qty {
             return Some((idx, DetectedFormat::IbkrPositions));
         }
+        if has_fidelity && has_qty {
+            return Some((idx, DetectedFormat::FidelityPositions));
+        }
+        if has_vanguard && has_qty {
+            return Some((idx, DetectedFormat::VanguardPositions));
+        }
+        if has_futu && has_qty {
+            return Some((idx, DetectedFormat::FutuPositions));
+        }
+        if has_tiger && has_qty {
+            return Some((idx, DetectedFormat::TigerPositions));
+        }
         if has_qty {
             return Some((idx, DetectedFormat::GenericStandard));
         }
@@ -883,37 +1156,15 @@ fn locate_header_row(rows: &[Vec<String>]) -> Option<(usize, DetectedFormat)> {
 
 fn collect_mappings(headers: &[String], out: &mut Vec<CsvColumnMappingDto>) {
     let specs: &[(&str, &[&str])] = &[
-        ("symbol", &["symbol", "ticker"]),
-        ("company", &["description", "company", "name"]),
-        ("quantity", &["quantity", "qty", "shares", "position"]),
-        (
-            "averageCost",
-            &[
-                "average_cost",
-                "average cost",
-                "avg_cost",
-                "avg cost",
-                "costbasisprice",
-                "cost basis price",
-                "cost price",
-                "cost basis",
-                "cost_basis",
-            ],
-        ),
-        (
-            "price",
-            &[
-                "price",
-                "last",
-                "last price",
-                "markprice",
-                "mark price",
-                "close price",
-                "t. price",
-            ],
-        ),
-        ("cash", &["cash", "cash balance", "cash_balance"]),
-        ("currency", &["currency", "ccy"]),
+        ("symbol", SYMBOL_ALIASES),
+        ("company", COMPANY_ALIASES),
+        ("quantity", QUANTITY_ALIASES),
+        ("averageCost", AVG_COST_ALIASES),
+        ("costBasis", COST_BASIS_ALIASES),
+        ("price", PRICE_ALIASES),
+        ("marketValue", MARKET_VALUE_ALIASES),
+        ("cash", CASH_COL_ALIASES),
+        ("currency", CURRENCY_ALIASES),
         ("date", &["date", "date/time", "trade date"]),
         ("action", &["action", "side", "transaction type"]),
     ];
@@ -954,17 +1205,98 @@ fn normalize_header(header: &str) -> String {
     header
         .trim()
         .trim_matches('"')
-        .to_ascii_lowercase()
+        .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn is_cash_row(symbol_lower: &str) -> bool {
-    matches!(
-        symbol_lower,
-        "cash" | "cash & cash investments" | "cash & money market" | "usd" | "cash balance"
-    )
+fn is_cash_row(symbol_lower: &str, company_raw: &str) -> bool {
+    let clean = symbol_lower.trim_end_matches('*');
+    if matches!(
+        clean,
+        "cash"
+            | "cash & cash investments"
+            | "cash & money market"
+            | "usd"
+            | "hkd"
+            | "cny"
+            | "eur"
+            | "gbp"
+            | "sgd"
+            | "cash balance"
+            | "spaxx"
+            | "fdrxx"
+            | "fcash"
+            | "vmfxx"
+            | "settlement fund"
+            | "pending activity"
+            | "现金"
+            | "美元现金"
+            | "港元现金"
+            | "港币现金"
+            | "人民币现金"
+            | "现金余额"
+    ) {
+        return true;
+    }
+    let company_lower = company_raw.trim().to_ascii_lowercase();
+    company_lower.contains("settlement fund")
+        || company_lower.contains("cash & money market")
+        || company_lower == "cash"
+}
+
+fn infer_currency_from_cash_symbol(symbol_lower: &str) -> Option<String> {
+    match symbol_lower.trim_end_matches('*') {
+        "usd" | "美元现金" | "spaxx" | "fdrxx" | "fcash" | "vmfxx" => Some("USD".to_string()),
+        "hkd" | "港元现金" | "港币现金" => Some("HKD".to_string()),
+        "cny" | "人民币现金" => Some("CNY".to_string()),
+        "eur" => Some("EUR".to_string()),
+        "gbp" => Some("GBP".to_string()),
+        "sgd" => Some("SGD".to_string()),
+        _ => None,
+    }
+}
+
+fn infer_currency_from_symbol(symbol: &str) -> Option<String> {
+    if symbol.ends_with(".HK") {
+        Some("HKD".to_string())
+    } else if symbol.ends_with(".SS") || symbol.ends_with(".SZ") {
+        Some("CNY".to_string())
+    } else if symbol.ends_with(".SI") {
+        Some("SGD".to_string())
+    } else {
+        None
+    }
+}
+
+fn infer_currency_from_amount(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches(['(', '-', '+', ' ']);
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("HK$") || upper.starts_with("HKD") {
+        Some("HKD".to_string())
+    } else if upper.starts_with("US$") || upper.starts_with("USD") {
+        Some("USD".to_string())
+    } else if upper.starts_with("S$") || upper.starts_with("SGD") {
+        Some("SGD".to_string())
+    } else if upper.starts_with("C$") || upper.starts_with("CAD") {
+        Some("CAD".to_string())
+    } else if upper.starts_with("A$") || upper.starts_with("AUD") {
+        Some("AUD".to_string())
+    } else if upper.starts_with("CN¥")
+        || upper.starts_with("CN￥")
+        || upper.starts_with("RMB")
+        || trimmed.starts_with('¥')
+        || trimmed.starts_with('￥')
+    {
+        Some("CNY".to_string())
+    } else if trimmed.starts_with('€') {
+        Some("EUR".to_string())
+    } else if trimmed.starts_with('£') {
+        Some("GBP".to_string())
+    } else {
+        None
+    }
 }
 
 fn is_summary_or_blank_symbol(raw: &str) -> bool {
@@ -972,12 +1304,16 @@ fn is_summary_or_blank_symbol(raw: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    let lower = trimmed.to_ascii_lowercase();
+    let lower = trimmed.to_lowercase();
     lower.contains("total")
         || lower.starts_with("positions for")
         || lower.starts_with("account ")
         || lower == "--"
         || lower == "n/a"
+        || lower == "合计"
+        || lower == "总计"
+        || lower == "小计"
+        || lower.starts_with("the data and information")
 }
 
 fn is_na_placeholder(raw: &str) -> bool {
@@ -988,8 +1324,21 @@ fn is_na_placeholder(raw: &str) -> bool {
 }
 
 fn normalize_currency(raw: &str) -> String {
-    let clean: String = raw
-        .trim()
+    let trimmed = raw.trim();
+    match trimmed {
+        "美元" | "美金" => return "USD".to_string(),
+        "港元" | "港币" => return "HKD".to_string(),
+        "人民币" | "离岸人民币" => return "CNY".to_string(),
+        "新元" | "新加坡元" => return "SGD".to_string(),
+        "欧元" => return "EUR".to_string(),
+        "英镑" => return "GBP".to_string(),
+        "日元" => return "JPY".to_string(),
+        "加元" => return "CAD".to_string(),
+        "澳元" => return "AUD".to_string(),
+        _ => {}
+    }
+
+    let clean: String = trimmed
         .chars()
         .filter(char::is_ascii_alphabetic)
         .map(|c| c.to_ascii_uppercase())
@@ -1003,7 +1352,23 @@ fn normalize_currency(raw: &str) -> String {
 }
 
 pub fn validate_symbol(raw: &str, row: usize) -> Result<String, CsvImportError> {
-    let trimmed = raw.trim().trim_start_matches('$').to_ascii_uppercase();
+    let mut trimmed = raw
+        .trim()
+        .trim_start_matches('$')
+        .trim_end_matches('*')
+        .to_ascii_uppercase();
+
+    // Normalize common Futu / Moomoo market prefixes: US.AAPL -> AAPL, HK.00700 -> 00700.HK
+    if let Some(rest) = trimmed.strip_prefix("US.") {
+        if !rest.is_empty() {
+            trimmed = rest.to_string();
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("HK.") {
+        if !rest.is_empty() && rest.len() + 3 <= 10 {
+            trimmed = format!("{rest}.HK");
+        }
+    }
+
     let bytes = trimmed.as_bytes();
     let valid = !bytes.is_empty()
         && bytes.len() <= 10
@@ -1051,6 +1416,18 @@ pub fn sanitize_text_cell(raw: &str, field_name: &str, warnings: &mut Vec<String
     stripped.chars().take(120).collect()
 }
 
+fn strip_currency_prefix(text: &str) -> &str {
+    for prefix in [
+        "HK$", "US$", "S$", "C$", "A$", "CN¥", "CN￥", "RMB", "USD", "HKD", "CNY", "EUR", "GBP",
+        "SGD", "$", "¥", "￥", "€", "£",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    text
+}
+
 /// Strict decimal parser converting currency/accounting strings into `10^8` fixed-point `i128`.
 /// Never uses `f32`/`f64`.
 pub fn parse_decimal_fixed(raw: &str, row: usize, column: &str) -> Result<i128, CsvImportError> {
@@ -1075,11 +1452,14 @@ pub fn parse_decimal_fixed(raw: &str, row: usize, column: &str) -> Result<i128, 
         text = rest.trim();
     }
 
-    text = text.trim_start_matches('$').trim();
+    text = strip_currency_prefix(text);
     if let Some(rest) = text.strip_prefix('-') {
         negative = !negative;
         text = rest.trim();
+    } else if let Some(rest) = text.strip_prefix('+') {
+        text = rest.trim();
     }
+    text = strip_currency_prefix(text);
 
     let compact: String = text.chars().filter(|&c| c != ',' && c != ' ').collect();
     if compact.is_empty() {
@@ -1140,7 +1520,6 @@ pub fn parse_decimal_fixed(raw: &str, row: usize, column: &str) -> Result<i128, 
             value: raw.to_string(),
         })?;
 
-    // Round half-up if input had more than 8 fractional digits.
     if frac_part.len() > scale_usize && frac_part.as_bytes()[scale_usize] >= b'5' {
         frac_val += 1;
     }
@@ -1213,6 +1592,7 @@ fn compute_snapshot_fingerprint(
     source_format: &str,
     currency: &str,
     cash: &str,
+    cash_by_currency: &BTreeMap<String, String>,
     holdings: &[StoredPortfolioHolding],
     transactions: &[StoredPortfolioTransaction],
 ) -> String {
@@ -1224,6 +1604,9 @@ fn compute_snapshot_fingerprint(
     hasher.update(b"\n");
     hasher.update(cash.as_bytes());
     hasher.update(b"\n");
+    for (curr, amt) in cash_by_currency {
+        hasher.update(format!("C|{curr}|{amt}\n").as_bytes());
+    }
     for h in holdings {
         hasher.update(
             format!(
@@ -1322,6 +1705,8 @@ mod tests {
 
         let preview = parse_and_preview_csv(csv, "schwab-positions.csv", false).expect("parse");
         assert_eq!(preview.detected_format, "schwab_positions");
+        assert!(!preview.snapshot.is_multi_currency);
+        assert_eq!(preview.snapshot.currency, "USD");
         assert_eq!(preview.snapshot.cash, "12345.67");
         assert_eq!(preview.snapshot.holdings.len(), 2);
         assert_eq!(preview.snapshot.holdings[0].symbol, "AAPL");
@@ -1351,6 +1736,86 @@ Cash Report,Data,Ending Cash,USD,8420.15
         assert_eq!(preview.snapshot.holdings[0].quantity, "25");
         assert_eq!(preview.snapshot.holdings[0].average_cost, "380.2500");
         assert_eq!(preview.snapshot.holdings[0].last_price, "421.1000");
+    }
+
+    #[test]
+    fn parses_fidelity_and_vanguard_positions_csv_with_core_cash() {
+        let fidelity_csv = r#"Account Number,Account Name,Symbol,Description,Quantity,Last Price,Current Value,Cost Basis Total,Average Cost Basis,Percent Of Account
+X12345678,Individual,VOO,VANGUARD S&P 500 ETF,10,$515.00,$5150.00,$4600.00,$460.00,64.38%
+X12345678,Individual,SPAXX**,FIDELITY GOVERNMENT MONEY MARKET,--,--,$2850.00,--,--,35.62%
+"#;
+        let fid = parse_and_preview_csv(fidelity_csv, "fidelity.csv", false).expect("fidelity");
+        assert_eq!(fid.detected_format, "fidelity_positions");
+        assert_eq!(fid.snapshot.cash, "2850.00");
+        assert_eq!(fid.snapshot.holdings.len(), 1);
+        assert_eq!(fid.snapshot.holdings[0].symbol, "VOO");
+        assert_eq!(fid.snapshot.holdings[0].average_cost, "460.0000");
+        assert_eq!(fid.snapshot.holdings[0].last_price, "515.0000");
+
+        let vanguard_csv = r#"Account Number,Investment Name,Symbol,Shares,Share Price,Total Value
+12345678,Vanguard Total Stock Market ETF,VTI,20,$280.50,$5610.00
+12345678,Vanguard Federal Money Market Fund,VMFXX,1200.50,$1.00,$1200.50
+"#;
+        let van = parse_and_preview_csv(vanguard_csv, "vanguard.csv", false).expect("vanguard");
+        assert_eq!(van.detected_format, "vanguard_positions");
+        assert_eq!(van.snapshot.cash, "1200.50");
+        assert_eq!(van.snapshot.holdings.len(), 1);
+        assert_eq!(van.snapshot.holdings[0].symbol, "VTI");
+        assert_eq!(van.snapshot.holdings[0].last_price, "280.5000");
+    }
+
+    #[test]
+    fn parses_futu_and_tiger_csv_and_isolates_multi_currency_fail_safe() {
+        let futu_csv = "股票代码,股票名称,持有数量,稀释成本价,现价,市值,币种\n\
+                        US.QQQ,纳指100ETF,10,450.00,490.00,4900.00,美元\n\
+                        HK.00700,腾讯控股,100,320.00,380.00,38000.00,港元\n\
+                        美元现金,--,--,--,--,2000.00,美元\n\
+                        港元现金,--,--,--,--,15000.00,港元\n";
+        let futu = parse_and_preview_csv(futu_csv, "futu.csv", false).expect("futu");
+        assert_eq!(futu.detected_format, "futu_positions");
+        assert!(futu.snapshot.is_multi_currency);
+        assert_eq!(futu.snapshot.currency, "MULTI");
+        assert_eq!(futu.snapshot.currencies, vec!["HKD", "USD"]);
+        // Fail-safe: never sum USD + HKD cash into single cash scalar
+        assert_eq!(futu.snapshot.cash, "0.00");
+        assert_eq!(
+            futu.snapshot
+                .cash_by_currency
+                .get("USD")
+                .map(String::as_str),
+            Some("2000.00")
+        );
+        assert_eq!(
+            futu.snapshot
+                .cash_by_currency
+                .get("HKD")
+                .map(String::as_str),
+            Some("15000.00")
+        );
+        assert_eq!(futu.currency_subtotals.len(), 2);
+        assert_eq!(futu.currency_subtotals[0].currency, "HKD");
+        assert_eq!(futu.currency_subtotals[0].holdings_value, "38000.00");
+        assert_eq!(futu.currency_subtotals[0].total_value, "53000.00");
+        assert_eq!(futu.currency_subtotals[1].currency, "USD");
+        assert_eq!(futu.currency_subtotals[1].holdings_value, "4900.00");
+        assert_eq!(futu.currency_subtotals[1].total_value, "6900.00");
+        assert!(futu
+            .warnings
+            .iter()
+            .any(|w| w.contains("Multi-currency CSV detected")));
+        assert_eq!(futu.snapshot.holdings[0].symbol, "00700.HK");
+        assert_eq!(futu.snapshot.holdings[1].symbol, "QQQ");
+
+        let tiger_csv = "标的代码,标的名称,持仓数量,持仓均价,最新价,持仓市值,结算币种,账户现金\n\
+                         BRK.B,伯克希尔B,5,410.00,455.00,$2275.00,USD,$1500.00\n";
+        let tiger = parse_and_preview_csv(tiger_csv, "tiger.csv", false).expect("tiger");
+        assert_eq!(tiger.detected_format, "tiger_positions");
+        assert!(!tiger.snapshot.is_multi_currency);
+        assert_eq!(tiger.snapshot.currency, "USD");
+        assert_eq!(tiger.snapshot.cash, "1500.00");
+        assert_eq!(tiger.snapshot.holdings[0].symbol, "BRK.B");
+        assert_eq!(tiger.snapshot.holdings[0].average_cost, "410.0000");
+        assert_eq!(tiger.snapshot.holdings[0].last_price, "455.0000");
     }
 
     #[test]
