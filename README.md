@@ -1,91 +1,106 @@
+English | [简体中文](README.zh-CN.md)
+
 # FolioHelm
 
-FolioHelm 是一个非官方的 Charles Schwab 本地优先 Windows 桌面客户端。
+FolioHelm is a local-first, security-first Windows desktop portfolio and paper-trading workbench built with **Tauri 2, Rust, React, and TypeScript**.
 
-## 当前状态
+> **Honest capability boundary**: FolioHelm currently operates in two strictly isolated local modes — **Mock Demo** and **Local Portfolio (CSV + Paper)** — with zero brokerage write capability. Direct Charles Schwab OAuth login and live order execution remain intentionally disabled pending official [API Gate](docs/api-gate.md) approval.
 
-当前版本是一套可交互的本地 Mock 交易终端，已包含首页、市场、自选列表、个股详情、投资组合、订单、四步模拟下单和安全设置。所有报价、持仓与订单都是虚构数据；当前版本不能连接券商，也不能提交真实订单。
+## What's Implemented
 
-当前可体验：
+- **Encrypted Local Persistence (Fail-Closed)**:
+  - Stores your imported portfolios, cash snapshots, paper orders, evidence journal, cached quotes, and safety preferences in a bundled SQLite database (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + per-record AAD binding `schema_version|table|record_id`).
+  - Protects the 256-bit database master key and **Ed25519** device signing seed inside the operating system credential manager (**Windows Credential Manager** / OS Keyring) and scrubs key buffers from memory with `zeroize`.
+  - **Fail-Closed by design**: if an existing encrypted vault cannot be decrypted or its OS keyring key is missing, FolioHelm locks the vault, preserves the untouched ciphertext, and never silently resets or downgrades to plaintext.
+- **Tamper-Evident Ed25519 Evidence Journal**:
+  - Records trade previews, confirmations, reconciliations, safety setting changes, and CSV portfolio imports into a hash-chained, Ed25519-signed local evidence journal that persists across restarts and rejects credentials or sensitive fields before writing.
+- **Safe Brokerage CSV Import & Mode Isolation**:
+  - Supports **Charles Schwab Positions / Transactions CSV**, **Interactive Brokers (IBKR) Activity / Positions CSV**, and **Standard Portfolio CSV**.
+  - Enforces a 5 MB / 10,000-row safety limit, neutralizes spreadsheet formula injection (`=`, `+`, `-`, `@` prefixes), validates ticker format and non-negative share quantities, calculates cost basis and P&L with **exact `Decimal` / fixed-point arithmetic** (never IEEE-754 floats), and computes deterministic SHA-256 fingerprints for **idempotent deduplication**.
+  - Keeps **Mock Demo** and **Local Portfolio (CSV + Paper)** strictly separated in the top bar, status bar, and portfolio ledger.
+- **Optional Delayed Public Quotes (Off by Default)**:
+  - Disabled by default for local-first operation. When explicitly enabled in **Settings**, the Rust backend fetches unauthenticated, delayed read-only quotes exclusively from HTTPS-allowlisted hosts (`stooq.com` and `query1.finance.yahoo.com`) with redirects disabled, short timeouts, encrypted cache persistence, and automatic offline fallback to cached or CSV baseline prices.
+  - Every public quote view is clearly marked **"Delayed read-only public quotes · Not for live order execution"**.
+- **Native Desktop File Dialogs & Strict CSP**:
+  - Uses controlled Rust `tauri-plugin-dialog` commands for opening brokerage CSVs and saving evidence bundles or safety diagnostics (gracefully falling back to browser file inputs and deferred-revoke Blob downloads in browser previews).
+  - Preserves a strict WebView Content Security Policy without exposing external network origins or unrestricted filesystem access to the frontend.
+- **Interactive Workbench**:
+  - Global symbol search (`Ctrl+K`), market/instrument explorer, portfolio allocation & return views, annual investing activity/return heatmap, working/filled/canceled/rejected/unknown order timelines with reconciliation, and a 4-step simulated trade workflow (`Ticket → Safety check → Mock preview → Demo receipt`).
 
-- 全局搜索与市场/个股浏览
-- 投资组合、持仓、收益曲线与年度活动/收益热力图
-- 首页组合图和个股价格图支持悬浮查看值/价格，以及滚轮连续调整时间跨度
-- Working / Filled / Canceled / Rejected / Unknown 订单状态与时间线
-- 统一风格的交易模态窗口：Ticket → Safety check → Mock preview → Demo receipt
-- 默认开启的安全保护，以及关闭保护时的风险阅读、倒计时和二次确认
-- 可切换的 Mock 故障场景、动态账户快照、Unknown/对账提示和本地 Dry Run 记录
+### Not Yet Implemented (API Gate Bounded)
 
-明确未实现：Schwab OAuth/API、真实行情、真实下单、SQLCipher 持久化和远端证据服务。当前证据日志仅是本地 Mock 版本的浏览器存储 Hash Chain；项目不应被描述为具备真实券商或完整金融审计能力。
+- Direct Charles Schwab OAuth / live API connection
+- Real-time brokerage execution quotes and live order submission
+- Remote notary service deployment (local Ed25519 checkpoint/receipt primitives exist in Rust; no remote notary calls are enabled)
 
-## 界面预览
+## Interface Preview
 
-以下截图来自本地 Mock 演示，统一采用 16:9 比例；其中的行情、持仓和订单内容均为虚构数据。
+Screenshots from the local workbench (16:9; demo figures shown are fictional):
 
-![首页](docs/images/home-16x9.jpg)
+![Home](docs/images/home-16x9.jpg)
 
-![市场页](docs/images/market-16x9.jpg)
+![Markets](docs/images/market-16x9.jpg)
 
-![个股详情与图表悬浮](docs/images/instrument-hover-16x9.jpg)
+![Instrument Detail & Hover](docs/images/instrument-hover-16x9.jpg)
 
-![交易工作区弹窗](docs/images/trade-modal-16x9.jpg)
+![Trade Workspace Modal](docs/images/trade-modal-16x9.jpg)
 
-## 技术栈
+## Tech Stack
 
-- Tauri 2
-- React
-- TypeScript
-- Rust
+- **Desktop & Security Core**: Tauri 2 (`2.11.x`), Rust (`rusqlite` bundled, `aes-gcm`, `ed25519-dalek`, `zeroize`, `keyring`, `reqwest` `rustls-tls`, `tauri-plugin-dialog`)
+- **Frontend**: React 19, TypeScript, Vite, Vitest, React Testing Library
 
-## 安全边界
+## Security Boundaries
 
-- BYO Developer App：使用者负责提供并管理自己的开发者应用配置。
-- 秘密不得进入前端或日志。
-- 真实交易默认关闭。
-- 不做自动重试。
-- 遇到 `Unknown` 状态时，先对账，再继续后续操作。
-- 当前自动化只能运行 Mock / Paper Trading / Dry Run；Real Trading 按钮不可用。
-- 任何 API 能力、限流、行情许可和开源分发条件都必须先通过官方 `API Gate`。
+- **BYO Developer App**: Future broker integrations will require users to provide their own developer credentials under official terms.
+- **No Secrets in Frontend or Logs**: Key material stays inside OS Credential Manager and Rust `Zeroizing` buffers; evidence payloads actively reject secret-like keys and tokens.
+- **Live Trading Locked**: Real brokerage order submission is unavailable in this build.
+- **No Automatic Write Retries**: Uncertain (`Unknown`) states require explicit reconciliation before continuing.
+- **API Gate First**: Any future live API scope, rate limit, market-data license, and redistribution term must clear [docs/api-gate.md](docs/api-gate.md).
 
-## 开发
+## Development & Verification
 
-前端命令：
+Prerequisites on Windows: Node.js 22+, Rust toolchain (`rust-toolchain.toml` / 1.92.0+), MSVC Build Tools, and WebView2.
 
-```bash
+```powershell
+# Install frontend dependencies
 npm install
+
+# TypeScript check, Vitest unit/UI tests, and frontend production build
+npx tsc -b
 npm test
 npm run build
 
-# Tauri 开发模式（会启动 Vite）
+# Rust formatting, locked unit tests (uses in-memory keystore; does not touch host Windows Credential Manager), and Clippy
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features -- -D warnings
+
+# Desktop dev mode (starts Vite + Tauri shell)
 npm run desktop:dev
 
-# Windows Release（必须用这个，不能用裸 cargo build 代替）
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+# Portable Windows desktop build (validates Tauri version parity, icons, CSP & frontend bundling)
+npm run desktop:build:portable
+
+# Full Windows installer build (NSIS)
 npm run desktop:build
 ```
 
-Rust/Tauri 项目的 Cargo manifest 位于 `src-tauri/Cargo.toml`：
+> Always build standalone Windows executables via `npm run desktop:build:portable` or `npm run desktop:build` rather than bare `cargo build`, so Tauri embeds the compiled frontend assets properly.
 
-```bash
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
-```
+## Documentation
 
-`cargo build` 只验证/编译 Rust 壳，不负责执行 Tauri CLI 的前端资源打包；直接运行它生成的 EXE 可能仍依赖 `devUrl`。要生成可独立运行的 Windows Release，使用上面的 `npm run desktop:build`。
+- [Engineering & Security Guide (`AGENTS.md`)](AGENTS.md)
+- [ADR-0001: Dual Evidence Journal](docs/architecture-decisions/ADR-0001-dual-evidence-journal.md)
+- [Security Policy](SECURITY.md) · [Security Model](docs/security-model.md) · [Evidence Threat Model](docs/security/evidence-threat-model-v1.md)
+- [Evidence Journal Specification](docs/evidence-journal.md)
+- [Mock Broker Contract](docs/mock-broker.md)
+- [Schwab API Gate](docs/api-gate.md) · [Schwab API Capability Matrix](docs/schwab-api-capability-matrix-v1.md)
+- [Test Plan](docs/test-plan.md) · [Windows Release Checklist](docs/release-checklist.md) · [Windows Toolchain Guide](docs/development/windows-toolchain.md)
+- [Contributing Guide](CONTRIBUTING.md)
+- [English User Guide](docs/user-guide-en.md) · [中文使用说明](docs/user-guide-zh.md)
 
-## 设计资料
+## License & Disclaimer
 
-- [ADR-0001：双证据日志](docs/architecture-decisions/ADR-0001-dual-evidence-journal.md)
-- [安全策略](SECURITY.md)
-- [贡献指南](CONTRIBUTING.md)
-- [Mock Broker 契约](docs/mock-broker.md)
-- [证据日志说明](docs/evidence-journal.md)
-- [安全模型](docs/security-model.md)
-- [Schwab API Gate](docs/api-gate.md)
-- [测试计划](docs/test-plan.md)
-- [Windows 发布清单](docs/release-checklist.md)
-- [English user guide](docs/user-guide-en.md) · [中文使用说明](docs/user-guide-zh.md)
-
-## 许可与声明
-
-本项目采用 [Apache-2.0](LICENSE) 许可。内容不构成投资建议。FolioHelm 与 Charles Schwab 不存在隶属、赞助或认可关系。
+Licensed under [Apache-2.0](LICENSE). Nothing in this software constitutes financial or investment advice. FolioHelm is an independent open-source project and is not affiliated with, sponsored by, or endorsed by Charles Schwab or Interactive Brokers.
