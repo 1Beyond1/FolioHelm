@@ -542,6 +542,35 @@ describe("C4: PortfolioPage target allocation & read-only rebalance calculator U
     // Explicitly verify NO batch execution control exists in the rebalance panel
     expect(panel.textContent).not.toMatch(/execute all|batch submit|一键批量下单/i);
   });
+
+  it("debounces rebalance target-weight text input persistence instead of writing on every keystroke", () => {
+    vi.useFakeTimers();
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+
+    render(
+      <PortfolioPage
+        language="en"
+        onOpenInstrument={vi.fn()}
+        onOpenTrade={vi.fn()}
+      />,
+    );
+
+    setItemSpy.mockClear();
+    const input = screen.getByTestId("rebalance-weight-input-AAPL");
+    fireEvent.change(input, { target: { value: "2" } });
+    fireEvent.change(input, { target: { value: "25" } });
+    fireEvent.change(input, { target: { value: "25.5" } });
+
+    // Not written yet while typing rapidly
+    expect(setItemSpy).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    // Coalesced into a single write after 350ms debounce
+    expect(setItemSpy).toHaveBeenCalledTimes(1);
+    setItemSpy.mockRestore();
+  });
 });
 
 describe("Stage 4 Security Core: Heap purge on lock, sleep/wake idle lock, full restore replacement, and LockScreen/vaultErrorLocked hardening", () => {

@@ -118,6 +118,7 @@ export interface BrokerOrder {
   quantity: Quantity;
   filledQuantity: Quantity;
   limitPrice: Price | null;
+  currency?: string;
   status: BrokerOrderStatus;
   submittedAt: string;
   events: readonly BrokerOrderEvent[];
@@ -151,6 +152,7 @@ export interface OrderDraft {
   type: BrokerOrderType;
   quantity: Quantity;
   limitPrice: Price | null;
+  currency?: string;
 }
 
 export interface MockPreview {

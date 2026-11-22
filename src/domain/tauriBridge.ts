@@ -74,6 +74,7 @@ export interface TauriStoredPaperOrder {
   quantity: string;
   filledQuantity: string;
   limitPrice: string | null;
+  currency?: string;
   status: "working" | "filled" | "canceled" | "rejected" | "unknown";
   submittedAt: string;
   events: TauriStoredPaperOrderEvent[];

@@ -545,6 +545,8 @@ export function App() {
           activeDays={mockPortfolio.activeDays}
           ordersFilled={mockPortfolio.ordersFilled}
           netChange={mockPortfolio.netChange}
+          currency={mockPortfolio.currency}
+          isMultiCurrency={mockPortfolio.isMultiCurrency}
         />
         <aside className="side-stack">
           <PositionsCard

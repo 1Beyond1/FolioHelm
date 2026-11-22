@@ -167,6 +167,7 @@ function toStoredPaperOrder(workspaceMode: WorkspaceMode, order: BrokerOrder): T
     quantity: order.quantity,
     filledQuantity: order.filledQuantity,
     limitPrice: order.limitPrice,
+    currency: order.currency ?? "USD",
     status: order.status,
     submittedAt: order.submittedAt,
     events: order.events.map((event) => ({
@@ -184,6 +185,9 @@ function fromStoredPaperOrder(raw: TauriStoredPaperOrder): BrokerOrder | null {
     if (raw.side !== "buy" && raw.side !== "sell") return null;
     if (raw.orderType !== "market" && raw.orderType !== "limit") return null;
     if (!["working", "filled", "canceled", "rejected", "unknown"].includes(raw.status)) return null;
+    const normalizedCurrency = typeof raw.currency === "string" && raw.currency.trim()
+      ? raw.currency.trim().toUpperCase()
+      : "USD";
     return {
       id: raw.id,
       symbol: raw.symbol,
@@ -192,6 +196,7 @@ function fromStoredPaperOrder(raw: TauriStoredPaperOrder): BrokerOrder | null {
       quantity: quantity(raw.quantity),
       filledQuantity: quantity(raw.filledQuantity),
       limitPrice: raw.limitPrice === null ? null : price(raw.limitPrice),
+      currency: normalizedCurrency,
       status: raw.status,
       submittedAt: raw.submittedAt,
       events: (Array.isArray(raw.events) ? raw.events : []).map((event) => ({

@@ -90,13 +90,16 @@ function buildHoldings(language: Language): PortfolioHolding[] {
     const denominator = isMultiCurrency
       ? (breakdownByCurrency.get(currency) ?? 0)
       : totalEquity;
+    const matchedQuote = snapshot.quotes.find(
+      (quote) => quote.symbol === holding.symbol && (quote.currency ?? "USD") === currency,
+    ) ?? snapshot.quotes.find((quote) => quote.symbol === holding.symbol);
     return {
       symbol: holding.symbol,
       company: language === "zh" ? holding.companyZh : holding.companyEn,
       currency,
       shares: decimalToNumber(holding.quantity),
       avgCost: decimalToNumber(holding.averageCost),
-      last: decimalToNumber(snapshot.quotes.find((quote) => quote.symbol === holding.symbol)?.price ?? holding.averageCost),
+      last: decimalToNumber(matchedQuote?.price ?? holding.averageCost),
       marketValue,
       dayPnl: decimalToNumber(holding.dayPnl),
       totalPnl: decimalToNumber(holding.totalPnl),
@@ -501,20 +504,23 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   // C4: Rebalance state (pure exact-Decimal inputs, persisted per workspace mode)
   const rebalanceHoldings: RebalanceHoldingInput[] = useMemo(() => {
     return snapshot.holdings.map((holding) => {
-      const quote = snapshot.quotes.find((item) => item.symbol === holding.symbol);
+      const holdingCurrency = holding.currency ?? accountCurrency;
+      const quote = snapshot.quotes.find(
+        (item) => item.symbol === holding.symbol && (item.currency ?? "USD") === holdingCurrency,
+      ) ?? snapshot.quotes.find((item) => item.symbol === holding.symbol);
       return {
         symbol: holding.symbol,
         company: language === "zh" ? holding.companyZh : holding.companyEn,
         shares: holding.quantity,
         price: quote?.price ?? toPrice(holding.averageCost),
         marketValue: holding.marketValue,
-        currency: holding.currency ?? accountCurrency,
+        currency: holdingCurrency,
       };
     });
   }, [accountCurrency, language, snapshot.holdings, snapshot.quotes]);
 
   const holdingSignature = useMemo(
-    () => `${workspaceMode}:${rebalanceHoldings.map((item) => item.symbol).join(",")}`,
+    () => `${workspaceMode}:${rebalanceHoldings.map((item) => `${item.symbol}:${item.currency}`).join(",")}`,
     [rebalanceHoldings, workspaceMode],
   );
 
@@ -579,36 +585,81 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [holdingSignature, rebalanceSettingKey, rebalanceLegacyKey]);
 
-  function persistRebalanceConfig(next: PersistedRebalanceConfig) {
+  const rebalancePersistTimerRef = useRef<number | null>(null);
+  const pendingRebalanceSaveRef = useRef<{
+    settingKey: string;
+    legacyKey: string;
+    config: PersistedRebalanceConfig;
+  } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (rebalancePersistTimerRef.current !== null) {
+        window.clearTimeout(rebalancePersistTimerRef.current);
+        rebalancePersistTimerRef.current = null;
+      }
+      if (pendingRebalanceSaveRef.current) {
+        const pending = pendingRebalanceSaveRef.current;
+        pendingRebalanceSaveRef.current = null;
+        void saveEncryptedSetting(pending.settingKey, pending.config, pending.legacyKey);
+      }
+    };
+  }, [rebalanceSettingKey, rebalanceLegacyKey]);
+
+  function persistRebalanceConfigNow(next: PersistedRebalanceConfig) {
+    if (rebalancePersistTimerRef.current !== null) {
+      window.clearTimeout(rebalancePersistTimerRef.current);
+      rebalancePersistTimerRef.current = null;
+    }
+    pendingRebalanceSaveRef.current = null;
     void saveEncryptedSetting(rebalanceSettingKey, next, rebalanceLegacyKey);
+  }
+
+  function persistRebalanceConfigDebounced(next: PersistedRebalanceConfig) {
+    pendingRebalanceSaveRef.current = {
+      settingKey: rebalanceSettingKey,
+      legacyKey: rebalanceLegacyKey,
+      config: next,
+    };
+    if (rebalancePersistTimerRef.current !== null) {
+      window.clearTimeout(rebalancePersistTimerRef.current);
+    }
+    rebalancePersistTimerRef.current = window.setTimeout(() => {
+      rebalancePersistTimerRef.current = null;
+      const pending = pendingRebalanceSaveRef.current;
+      pendingRebalanceSaveRef.current = null;
+      if (pending) {
+        void saveEncryptedSetting(pending.settingKey, pending.config, pending.legacyKey);
+      }
+    }, 350);
   }
 
   function handleRebalanceModeChange(nextMode: RebalanceMode) {
     setRebalanceMode(nextMode);
-    persistRebalanceConfig({ mode: nextMode, additionalCash, weights: targetWeights });
+    persistRebalanceConfigNow({ mode: nextMode, additionalCash, weights: targetWeights });
   }
 
   function handleAdditionalCashChange(value: string) {
     setAdditionalCash(value);
-    persistRebalanceConfig({ mode: rebalanceMode, additionalCash: value, weights: targetWeights });
+    persistRebalanceConfigDebounced({ mode: rebalanceMode, additionalCash: value, weights: targetWeights });
   }
 
   function handleTargetWeightChange(symbol: string, value: string) {
     const nextWeights = { ...targetWeights, [symbol]: value };
     setTargetWeights(nextWeights);
-    persistRebalanceConfig({ mode: rebalanceMode, additionalCash, weights: nextWeights });
+    persistRebalanceConfigDebounced({ mode: rebalanceMode, additionalCash, weights: nextWeights });
   }
 
   function handleApplyEqualWeights() {
     const nextWeights = buildEqualTargetWeights(rebalanceHoldings.map((item) => item.symbol));
     setTargetWeights(nextWeights);
-    persistRebalanceConfig({ mode: rebalanceMode, additionalCash, weights: nextWeights });
+    persistRebalanceConfigNow({ mode: rebalanceMode, additionalCash, weights: nextWeights });
   }
 
   function handleSyncCurrentWeights() {
     const nextWeights = buildCurrentTargetWeights(rebalanceHoldings, account.cash);
     setTargetWeights(nextWeights);
-    persistRebalanceConfig({ mode: rebalanceMode, additionalCash, weights: nextWeights });
+    persistRebalanceConfigNow({ mode: rebalanceMode, additionalCash, weights: nextWeights });
   }
 
   const rebalancePlan = useMemo(
@@ -1016,7 +1067,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <tbody>
               {sortedHoldings.map((holding) => (
                 <tr
-                  key={holding.symbol}
+                  key={`${holding.symbol}:${holding.currency}`}
                   className="fh-holding-row"
                   data-testid={`portfolio-holding-row-${holding.symbol}`}
                   data-symbol={holding.symbol}

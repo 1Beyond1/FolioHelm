@@ -173,13 +173,57 @@ function holdingSeed(
   };
 }
 
+function symbolCurrencyKey(symbol: string, currency = "USD"): string {
+  return `${symbol.toUpperCase()}|${(currency || "USD").toUpperCase()}`;
+}
+
+function matchQuote(
+  quotes: readonly BrokerQuote[],
+  symbol: string,
+  currency?: string,
+): BrokerQuote | undefined {
+  if (currency) {
+    const exact = quotes.find(
+      (item) => item.symbol === symbol && (item.currency ?? "USD") === currency,
+    );
+    if (exact) return exact;
+  }
+  return quotes.find((item) => item.symbol === symbol);
+}
+
+function matchHolding(
+  holdings: readonly BrokerHolding[],
+  symbol: string,
+  currency?: string,
+): BrokerHolding | undefined {
+  if (currency) {
+    const exact = holdings.find(
+      (item) => item.symbol === symbol && (item.currency ?? "USD") === currency,
+    );
+    if (exact) return exact;
+  }
+  return holdings.find((item) => item.symbol === symbol);
+}
+
 function deriveHoldings(
   seeds: readonly HoldingSeed[],
   quotes: readonly BrokerQuote[],
 ): BrokerHolding[] {
-  const quoteBySymbol = new Map(quotes.map((item) => [item.symbol, item]));
+  const quoteByKey = new Map(
+    quotes.map((item) => [symbolCurrencyKey(item.symbol, item.currency), item]),
+  );
+  const quoteBySymbol = new Map<string, BrokerQuote>();
+  for (const item of quotes) {
+    if (!quoteBySymbol.has(item.symbol)) quoteBySymbol.set(item.symbol, item);
+  }
   return seeds.map((seed) => {
-    const matchedQuote = quoteBySymbol.get(seed.symbol);
+    const seedCurrency = seed.currency ?? "USD";
+    const exactQuote = quoteByKey.get(symbolCurrencyKey(seed.symbol, seedCurrency));
+    const fallbackQuote = quoteBySymbol.get(seed.symbol);
+    const matchedQuote = exactQuote
+      ?? (fallbackQuote && (!fallbackQuote.currency || fallbackQuote.currency === seedCurrency)
+        ? fallbackQuote
+        : undefined);
     const currentPrice = matchedQuote?.price ?? seed.averageCost;
     const dailyChange = matchedQuote?.change ?? ZERO_PRICE;
     const marketValue = decimalRound(decimalMultiply(currentPrice, seed.quantity), 2, "half-even") as Money;
@@ -415,7 +459,8 @@ const BASE_SNAPSHOT: BrokerSnapshot = {
 };
 
 function stableDraftHash(draft: OrderDraft): string {
-  return [draft.symbol, draft.side, draft.type, draft.quantity, draft.limitPrice ?? "market"].join(":");
+  const base = [draft.symbol, draft.side, draft.type, draft.quantity, draft.limitPrice ?? "market"];
+  return draft.currency ? [...base, draft.currency].join(":") : base.join(":");
 }
 
 function nowValue(clock: () => number = () => Date.now()): { timestamp: number; iso: string } {
@@ -629,19 +674,95 @@ function deriveLocalCurrencies(imported: ImportedPortfolioSnapshot): string[] {
   return [...set].sort();
 }
 
+function applyOpenOrderReservations(
+  account: BrokerAccount,
+  holdings: readonly BrokerHolding[],
+  quotes: readonly BrokerQuote[],
+  orders: readonly BrokerOrder[],
+): { account: BrokerAccount; holdings: BrokerHolding[] } {
+  let nextAccount: BrokerAccount = {
+    ...account,
+    currencyBreakdowns: account.currencyBreakdowns?.map((item) => ({ ...item })),
+  };
+  let nextHoldings: BrokerHolding[] = holdings.map((item) => ({ ...item }));
+
+  for (const order of orders) {
+    if (order.status !== "working" && order.status !== "unknown") continue;
+    const openQty = decimalCompare(order.quantity, order.filledQuantity) > 0
+      ? decimalSubtract(order.quantity, order.filledQuantity) as Quantity
+      : ZERO_QUANTITY;
+    if (decimalCompare(openQty, ZERO_QUANTITY) <= 0) continue;
+
+    const matchedQuote = matchQuote(quotes, order.symbol, order.currency);
+    const orderCurrency = order.currency ?? matchedQuote?.currency ?? nextAccount.currency ?? "USD";
+
+    if (order.side === "buy") {
+      const unitPrice = order.limitPrice ?? matchedQuote?.price ?? ZERO_PRICE;
+      if (decimalCompare(unitPrice, ZERO_PRICE) <= 0) continue;
+      const reserved = decimalRound(decimalMultiply(unitPrice, openQty), 2, "half-even") as Money;
+      if (nextAccount.currencyBreakdowns) {
+        nextAccount = {
+          ...nextAccount,
+          currencyBreakdowns: nextAccount.currencyBreakdowns.map((item) => {
+            if (item.currency !== orderCurrency) return item;
+            return {
+              ...item,
+              buyingPower: decimalCompare(item.buyingPower, reserved) > 0
+                ? decimalSubtract(item.buyingPower, reserved) as Money
+                : ZERO_MONEY,
+            };
+          }),
+        };
+      }
+      if (!nextAccount.isMultiCurrency && orderCurrency === (nextAccount.currency ?? "USD")) {
+        nextAccount = {
+          ...nextAccount,
+          buyingPower: decimalCompare(nextAccount.buyingPower, reserved) > 0
+            ? decimalSubtract(nextAccount.buyingPower, reserved) as Money
+            : ZERO_MONEY,
+        };
+      }
+    } else if (order.side === "sell") {
+      let matchedIndex = nextHoldings.findIndex(
+        (item) => item.symbol === order.symbol && (item.currency ?? "USD") === orderCurrency,
+      );
+      if (matchedIndex === -1 && !order.currency) {
+        matchedIndex = nextHoldings.findIndex((item) => item.symbol === order.symbol);
+      }
+      if (matchedIndex !== -1) {
+        const target = nextHoldings[matchedIndex]!;
+        const remaining = decimalCompare(target.availableQuantity, openQty) > 0
+          ? decimalSubtract(target.availableQuantity, openQty) as Quantity
+          : ZERO_QUANTITY;
+        nextHoldings = nextHoldings.map((item, idx) =>
+          idx === matchedIndex ? { ...item, availableQuantity: remaining } : item,
+        );
+      }
+    }
+  }
+
+  return { account: nextAccount, holdings: nextHoldings };
+}
+
 function buildLocalSnapshotFromCsv(
   imported: ImportedPortfolioSnapshot,
   existingOrders: readonly BrokerOrder[] = [],
   publicQuoteMap?: ReadonlyMap<string, PublicQuoteUpdate>,
 ): BrokerSnapshot {
   const quotes: BrokerQuote[] = [];
+  const seenSymbolCurrencies = new Set<string>();
   const seenSymbols = new Set<string>();
 
   for (const holding of imported.holdings) {
+    const holdingCurr = holding.currency || "USD";
+    const key = symbolCurrencyKey(holding.symbol, holdingCurr);
+    if (seenSymbolCurrencies.has(key)) continue;
+    seenSymbolCurrencies.add(key);
     seenSymbols.add(holding.symbol);
+
     const livePublic = publicQuoteMap?.get(holding.symbol);
     const usePublic = Boolean(
-      livePublic && (!livePublic.currency || livePublic.currency === holding.currency),
+      livePublic && (!livePublic.currency || livePublic.currency === holdingCurr),
     );
     const unitPrice = price(usePublic && livePublic ? livePublic.price : holding.lastPrice);
     const dailyChange = price(usePublic && livePublic ? livePublic.change : "0");
@@ -657,7 +778,7 @@ function buildLocalSnapshotFromCsv(
       changePct,
       asOf: usePublic && livePublic ? livePublic.asOfUtc : imported.importedAtUtc,
       status: "available",
-      currency: holding.currency || "USD",
+      currency: holdingCurr,
       source: usePublic ? "public-delayed" : "csv-import",
       delayed: usePublic && livePublic ? livePublic.delayed : true,
       provider: usePublic && livePublic ? livePublic.provider : imported.sourceFormat,
@@ -695,12 +816,12 @@ function buildLocalSnapshotFromCsv(
     currency: item.currency || "USD",
   }));
 
-  const holdings = deriveHoldings(holdingSeeds, quotes);
+  const rawHoldings = deriveHoldings(holdingSeeds, quotes);
   const currencies = deriveLocalCurrencies(imported);
   const isMultiCurrency = Boolean(imported.isMultiCurrency) || currencies.length > 1;
 
   const currencyBreakdowns: CurrencySummary[] = currencies.map((curr) => {
-    const currHoldings = holdings.filter((h) => (h.currency ?? "USD") === curr);
+    const currHoldings = rawHoldings.filter((h) => (h.currency ?? "USD") === curr);
     const holdingsValue = currHoldings.reduce<Money>(
       (total, item) => decimalAdd(total, item.marketValue) as Money,
       ZERO_MONEY,
@@ -728,7 +849,7 @@ function buildLocalSnapshotFromCsv(
     };
   });
 
-  const account: BrokerAccount = isMultiCurrency
+  const baseAccount: BrokerAccount = isMultiCurrency
     ? {
         accountKey: `local-csv-${imported.fingerprint.slice(0, 8)}`,
         // Fail-safe: never sum cross-currency balances into a combined total.
@@ -759,8 +880,17 @@ function buildLocalSnapshotFromCsv(
           isMultiCurrency: false,
           currencyBreakdowns,
         },
-        holdings,
+        rawHoldings,
       );
+
+  // Replay open (`working` / `unknown`) paper orders so frozen buying power and locked sell
+  // shares are preserved across quote toggles, quote refreshes, CSV reloads, and vault hydration.
+  const { account, holdings } = applyOpenOrderReservations(
+    baseAccount,
+    rawHoldings,
+    quotes,
+    existingOrders,
+  );
 
   // Use flat baseline points anchored to real imported total equity rather than fictional demo curves.
   const flatSeries = (len: number): readonly Money[] =>
@@ -1011,8 +1141,21 @@ export class MockBroker implements BrokerAdapter {
       // and keep only the immutable demo baseline plus orders present in the restored vault.
       const baseOrders = replace ? BASE_SNAPSHOT.orders : this.snapshot.orders;
       const nextOrders = mergeOrders(baseOrders);
+      const baseTarget = replace ? BASE_SNAPSHOT : this.snapshot;
+      const baseOrderIds = new Set(BASE_SNAPSHOT.orders.map((o) => o.id));
+      const extraOpenOrders = replace
+        ? nextOrders.filter((o) => !baseOrderIds.has(o.id))
+        : persistedOrders.filter((o) => !this.snapshot.orders.some((existing) => existing.id === o.id));
+      const reserved = applyOpenOrderReservations(
+        baseTarget.account,
+        baseTarget.holdings,
+        baseTarget.quotes,
+        extraOpenOrders,
+      );
       this.snapshot = {
-        ...(replace ? BASE_SNAPSHOT : this.snapshot),
+        ...baseTarget,
+        account: reserved.account,
+        holdings: reserved.holdings,
         orders: nextOrders,
         ordersFilled: nextOrders.filter((o) => o.status === "filled").length,
       };
@@ -1145,14 +1288,14 @@ export class MockBroker implements BrokerAdapter {
     }
 
     const snapshot = this.getSnapshot();
-    const matchedQuote = snapshot.quotes.find((item) => item.symbol === draft.symbol);
+    const matchedQuote = matchQuote(snapshot.quotes, draft.symbol, draft.currency);
     if (!matchedQuote) throw new Error(`No mock quote for ${draft.symbol}`);
     if (matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
 
     const unitPrice = draft.limitPrice ?? matchedQuote.price;
-    const quoteCurrency = matchedQuote.currency ?? "USD";
+    const quoteCurrency = matchedQuote.currency ?? draft.currency ?? "USD";
     const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(decimalMultiply(unitPrice, draft.quantity), 2, "half-even") as Money;
     if (draft.side === "buy" && decimalCompare(estimatedAmount, availableBuyingPower) > 0) {
@@ -1162,7 +1305,7 @@ export class MockBroker implements BrokerAdapter {
       if (this.workspaceMode === "mock" && this.scenario === "insufficient-quantity") {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
-      const matchedHolding = snapshot.holdings.find((item) => item.symbol === draft.symbol);
+      const matchedHolding = matchHolding(snapshot.holdings, draft.symbol, quoteCurrency);
       if (!matchedHolding || decimalCompare(draft.quantity, matchedHolding.availableQuantity) > 0) {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
@@ -1203,11 +1346,15 @@ export class MockBroker implements BrokerAdapter {
     if (preview.draftHash !== draftHash) throw new Error("Mock preview does not match the current draft");
 
     const snapshot = this.getSnapshot();
-    const matchedQuote = snapshot.quotes.find((item) => item.symbol === preview.draft.symbol);
+    const matchedQuote = matchQuote(
+      snapshot.quotes,
+      preview.draft.symbol,
+      preview.draft.currency ?? preview.quote.currency,
+    );
     if (!matchedQuote || matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
-    const quoteCurrency = matchedQuote.currency ?? "USD";
+    const quoteCurrency = matchedQuote.currency ?? preview.draft.currency ?? "USD";
     const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(
       decimalMultiply(preview.draft.limitPrice ?? matchedQuote.price, preview.draft.quantity),
@@ -1221,7 +1368,7 @@ export class MockBroker implements BrokerAdapter {
       if (this.workspaceMode === "mock" && this.scenario === "insufficient-quantity") {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
-      const matchedHolding = snapshot.holdings.find((item) => item.symbol === preview.draft.symbol);
+      const matchedHolding = matchHolding(snapshot.holdings, preview.draft.symbol, quoteCurrency);
       if (!matchedHolding || decimalCompare(preview.draft.quantity, matchedHolding.availableQuantity) > 0) {
         throw new MockBrokerError("insufficient-quantity", "Mock position quantity is insufficient");
       }
@@ -1244,6 +1391,7 @@ export class MockBroker implements BrokerAdapter {
       quantity: preview.draft.quantity,
       filledQuantity: quantity("0"),
       limitPrice: preview.draft.limitPrice,
+      currency: quoteCurrency,
       status: unknown ? "unknown" : "working",
       submittedAt: eventAt,
       events: [
@@ -1273,12 +1421,21 @@ export class MockBroker implements BrokerAdapter {
             buyingPower: decimalCompare(activeTarget.account.buyingPower, estimatedAmount) > 0
               ? decimalSubtract(activeTarget.account.buyingPower, estimatedAmount) as Money
               : ZERO_MONEY,
+            currencyBreakdowns: activeTarget.account.currencyBreakdowns?.map((item) => {
+              if (item.currency !== quoteCurrency) return item;
+              return {
+                ...item,
+                buyingPower: decimalCompare(item.buyingPower, estimatedAmount) > 0
+                  ? decimalSubtract(item.buyingPower, estimatedAmount) as Money
+                  : ZERO_MONEY,
+              };
+            }),
           }
       : activeTarget.account;
 
     const nextHoldings: readonly BrokerHolding[] = preview.draft.side === "sell"
       ? activeTarget.holdings.map((item) => {
-          if (item.symbol !== preview.draft.symbol) return item;
+          if (item.symbol !== preview.draft.symbol || (item.currency ?? "USD") !== quoteCurrency) return item;
           const remaining = decimalCompare(item.availableQuantity, preview.draft.quantity) > 0
             ? decimalSubtract(item.availableQuantity, preview.draft.quantity) as Quantity
             : ZERO_QUANTITY;
@@ -1341,12 +1498,12 @@ export class MockBroker implements BrokerAdapter {
 
 export const MOCK_BROKER = new MockBroker();
 
-export function findMockQuote(symbol: string): BrokerQuote | undefined {
-  return MOCK_BROKER.getSnapshot().quotes.find((item) => item.symbol === symbol);
+export function findMockQuote(symbol: string, currency?: string): BrokerQuote | undefined {
+  return matchQuote(MOCK_BROKER.getSnapshot().quotes, symbol, currency);
 }
 
-export function findMockHolding(symbol: string): BrokerHolding | undefined {
-  return MOCK_BROKER.getSnapshot().holdings.find((item) => item.symbol === symbol);
+export function findMockHolding(symbol: string, currency?: string): BrokerHolding | undefined {
+  return matchHolding(MOCK_BROKER.getSnapshot().holdings, symbol, currency);
 }
 
 export function mockDraftHash(draft: OrderDraft): string {

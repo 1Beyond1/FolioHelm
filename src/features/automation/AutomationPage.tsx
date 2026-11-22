@@ -77,6 +77,7 @@ const COPY = {
     evidenceSaving: "Saving the local evidence record…",
     evidenceSaved: "Local evidence saved",
     evidenceFailed: "This run is visible in memory, but its local evidence could not be saved. Check storage before relying on the record.",
+    nonUsdIsolated: (items: string) => `Non-USD holdings isolated (Fail-Safe): ${items}. Automation caps are USD-denominated; non-USD symbols are excluded until verified FX rates exist.`,
   },
   zh: {
     title: "自动化",
@@ -126,6 +127,7 @@ const COPY = {
     evidenceSaving: "正在保存本地证据记录……",
     evidenceSaved: "本地证据已保存",
     evidenceFailed: "这次运行仅显示在内存中，本地证据没有保存成功。请先检查存储，再依赖这条记录。",
+    nonUsdIsolated: (items: string) => `已隔离非美元持仓（Fail-Safe）：${items}。自动化金额上限以美元计价，未接入权威汇率前禁止非美元标的参与自动化模拟。`,
   },
 } as const;
 
@@ -182,6 +184,10 @@ function automationReasonLabel(reason: string, language: Language): string {
     "Order input is invalid; action was blocked": "订单输入无效；操作已阻止",
     "Backpressure: maximum concurrent task count reached": "已达到最大并发任务数",
   };
+  const nonUsdMatch = /^Non-USD symbol \(([A-Z]+)\) is isolated from USD-denominated automation caps$/.exec(reason);
+  if (nonUsdMatch) {
+    return `非美元标的 (${nonUsdMatch[1]}) 已从美元上限自动化中隔离`;
+  }
   return labels[reason] ?? reason;
 }
 
@@ -215,13 +221,39 @@ export function AutomationPage({ language }: AutomationPageProps) {
 
   useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
 
-  const availableSymbols = useMemo<readonly BrokerSymbol[]>(() => {
+  const { availableSymbols, excludedNonUsdHoldings } = useMemo(() => {
     void brokerTick;
-    const set = new Set<string>(DEFAULT_SYMBOLS);
     const snap = MOCK_BROKER.getSnapshot();
-    for (const h of snap.holdings) set.add(h.symbol);
-    for (const s of state.policy.allowedSymbols) set.add(s);
-    return [...set];
+    const nonUsdSet = new Map<string, string>();
+    const usdSet = new Set<string>(DEFAULT_SYMBOLS);
+
+    for (const h of snap.holdings) {
+      const curr = (h.currency ?? "USD").toUpperCase();
+      if (curr !== "USD") {
+        nonUsdSet.set(h.symbol, curr);
+      } else {
+        usdSet.add(h.symbol);
+      }
+    }
+    for (const q of snap.quotes) {
+      const curr = (q.currency ?? "USD").toUpperCase();
+      if (curr !== "USD" && !usdSet.has(q.symbol)) {
+        nonUsdSet.set(q.symbol, curr);
+      }
+    }
+    for (const s of state.policy.allowedSymbols) {
+      if (!nonUsdSet.has(s)) {
+        usdSet.add(s);
+      }
+    }
+    for (const nonUsdSym of nonUsdSet.keys()) {
+      usdSet.delete(nonUsdSym);
+    }
+
+    return {
+      availableSymbols: [...usdSet] as readonly BrokerSymbol[],
+      excludedNonUsdHoldings: [...nonUsdSet.entries()].map(([symbol, currency]) => ({ symbol, currency })),
+    };
   }, [brokerTick, state.policy.allowedSymbols]);
 
   useEffect(() => {
@@ -284,6 +316,7 @@ export function AutomationPage({ language }: AutomationPageProps) {
       side: "buy",
       quantity: quantity("1"),
       price: quote?.price ?? price("0"),
+      currency: quote?.currency ?? "USD",
       idempotencyKey: createRunIdempotencyKey(selectedSymbol),
       marketSession,
     });
@@ -364,6 +397,11 @@ export function AutomationPage({ language }: AutomationPageProps) {
       <section className="automation-card automation-card--wide">
         <div className="automation-card-heading"><div><span>03</span><h2>{copy.allowlist}</h2></div><span className="automation-fixed">{copy.session}</span></div>
         <p className="automation-muted">{copy.sessionBody}</p>
+        {excludedNonUsdHoldings.length > 0 && (
+          <p className="automation-muted" role="status" data-testid="automation-non-usd-notice">
+            {copy.nonUsdIsolated(excludedNonUsdHoldings.map((item) => `${item.symbol} (${item.currency})`).join(", "))}
+          </p>
+        )}
         <div className="automation-symbols">{availableSymbols.map((symbol) => <label key={symbol}><input type="checkbox" checked={state.policy.allowedSymbols.includes(symbol)} onChange={() => toggleSymbol(symbol)} /><span>{symbol}</span></label>)}</div>
         <div className="automation-run-row"><label className="automation-field"><span>{copy.selectSymbol}</span><select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value as BrokerSymbol)}>{availableSymbols.map((symbol) => <option key={symbol} value={symbol} disabled={!state.policy.allowedSymbols.includes(symbol)}>{symbol}</option>)}</select></label><button className="automation-primary" type="button" onClick={runNow}>{copy.runNow}</button></div>
       </section>

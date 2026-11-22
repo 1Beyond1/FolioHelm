@@ -24,7 +24,11 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
   const isLocalMode = workspaceMode === "local-csv";
   const localMeta = MOCK_BROKER.getLocalPortfolioMeta();
   const chinese = language === "zh";
-  const quoteBySymbol = new Map(snapshot.quotes.map((item) => [item.symbol, item]));
+  const quoteByKey = new Map(snapshot.quotes.map((item) => [`${item.symbol}|${item.currency ?? "USD"}`, item]));
+  const quoteBySymbol = new Map<string, (typeof snapshot.quotes)[number]>();
+  for (const item of snapshot.quotes) {
+    if (!quoteBySymbol.has(item.symbol)) quoteBySymbol.set(item.symbol, item);
+  }
   const positions: Position[] = snapshot.holdings.map((holding) => ({
     ticker: holding.symbol,
     company: `${chinese ? holding.companyZh : holding.companyEn} · ${holding.quantity} ${chinese ? "股" : "shares"}`,
@@ -52,8 +56,9 @@ export function getMockPortfolio(language: Language = "en"): PortfolioMockData {
   ];
 
   const activity: ActivityItem[] = snapshot.orders.slice(0, 3).map((order) => {
-    const quote = quoteBySymbol.get(order.symbol);
-    const quoteCurr = quote?.currency ?? "USD";
+    const quote = (order.currency ? quoteByKey.get(`${order.symbol}|${order.currency}`) : undefined)
+      ?? quoteBySymbol.get(order.symbol);
+    const quoteCurr = order.currency ?? quote?.currency ?? "USD";
     const isFilled = order.status === "filled";
     const detailPrice = order.limitPrice === null
       ? quote ? formatCurrency(decimalToNumber(quote.price), language, quoteCurr) : chinese ? "市价" : "market"

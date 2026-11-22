@@ -85,6 +85,7 @@ function chartBoundaryLabels(period: MarketPeriod, language: Language): [string,
 function InstrumentChart({
   points,
   symbol,
+  currency,
   period,
   chartDescription,
   chartInteractionHint,
@@ -92,6 +93,7 @@ function InstrumentChart({
 }: {
   points: readonly number[];
   symbol: string;
+  currency: string;
   period: MarketPeriod;
   chartDescription: string;
   chartInteractionHint: string;
@@ -178,9 +180,9 @@ function InstrumentChart({
           <span>
             {displayPeriod(period, language)} · {chartPointLabel(period, hoverIndex, safePointCount, language)}
           </span>
-          <strong>{formatPrice(hoveredPoint)}</strong>
+          <strong>{formatPrice(hoveredPoint, language, currency)}</strong>
           <em className={hoveredPoint - (points[0] ?? hoveredPoint) >= 0 ? "positive" : "negative"}>
-            {formatSignedPrice(hoveredPoint - (points[0] ?? hoveredPoint))}
+            {formatSignedPrice(hoveredPoint - (points[0] ?? hoveredPoint), language, currency)}
           </em>
         </div>
       )}
@@ -270,6 +272,18 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
   }, []);
 
   if (security.status === "no-data") {
+    const isLocalWorkspace = MOCK_BROKER.getWorkspaceMode() === "local-csv";
+    const emptyKicker = isLocalWorkspace
+      ? (chinese ? "本地持仓 · CSV + 纸上模拟" : "Local Portfolio · CSV + Paper")
+      : copy.instrumentKicker;
+    const emptyTitle = isLocalWorkspace
+      ? (chinese ? "本地持仓中未找到此标的" : "No local portfolio data for this symbol")
+      : copy.instrumentNoDataTitle;
+    const emptyBody = isLocalWorkspace
+      ? (chinese
+          ? "该代码不在您当前导入的本地 CSV 持仓或已缓存的延迟行情中。请返回市场页选择已导入标的。"
+          : "This symbol is not present in your imported local CSV portfolio or cached delayed quotes. Return to Markets to pick an imported holding.")
+      : copy.instrumentNoDataBody;
     return (
       <main className="instrument-page instrument-page--empty" data-testid="instrument-page">
         <button type="button" className="instrument-back-button" data-testid="instrument-back" onClick={onBack}>
@@ -281,7 +295,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
           <div className="instrument-heading-copy">
             <div className="instrument-symbol-row">
               <span className="instrument-symbol">{security.symbol}</span>
-              <span className="instrument-demo-chip">{copy.instrumentKicker}</span>
+              <span className="instrument-demo-chip">{emptyKicker}</span>
             </div>
             <h1>{companyForLanguage(security, language)}</h1>
           </div>
@@ -289,9 +303,9 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
 
         <DataStateNotice language={language} status="no-data" />
         <section className="instrument-no-data-card" data-testid="instrument-no-data" aria-labelledby="instrument-no-data-title">
-          <span className="markets-kicker">{copy.instrumentKicker}</span>
-          <h2 id="instrument-no-data-title">{copy.instrumentNoDataTitle}</h2>
-          <p>{copy.instrumentNoDataBody}</p>
+          <span className="markets-kicker">{emptyKicker}</span>
+          <h2 id="instrument-no-data-title">{emptyTitle}</h2>
+          <p>{emptyBody}</p>
           <button type="button" className="instrument-back-button instrument-back-button--card" onClick={onBack}>
             <BackIcon />
             <span>{copy.backToMarkets}</span>
@@ -389,6 +403,7 @@ export function InstrumentPage({ language, symbol, onBack, onOpenTrade }: Instru
             <InstrumentChart
               points={chartPoints}
               symbol={security.symbol}
+              currency={securityCurrency}
               period={period}
               chartDescription={copy.chartDescription}
               chartInteractionHint={copy.chartInteractionHint}

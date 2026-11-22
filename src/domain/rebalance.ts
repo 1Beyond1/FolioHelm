@@ -352,7 +352,7 @@ export function calculateRebalancePlan(input: RebalanceInput): RebalancePlanResu
       });
     }
 
-    // Cash row summary
+    // Cash row summary — currentValue uses pre-contribution input.cash to match currentWeightPct.
     const cashTargetWeight = parsedWeights.get(REBALANCE_CASH_SYMBOL) ?? ZERO_PERCENT;
     const cashCurrentWeight = currentWeightOf(input.cash);
     const cashTargetValue = targetValueOf(cashTargetWeight);
@@ -361,7 +361,7 @@ export function calculateRebalancePlan(input: RebalanceInput): RebalancePlanResu
       symbol: REBALANCE_CASH_SYMBOL,
       company: "Cash Reserve",
       currency,
-      currentValue: availableCash,
+      currentValue: input.cash,
       currentWeightPct: cashCurrentWeight,
       targetWeightPct: cashTargetWeight,
       driftPct: decimalSubtract(cashCurrentWeight, cashTargetWeight) as Percent,
@@ -458,7 +458,7 @@ export function calculateRebalancePlan(input: RebalanceInput): RebalancePlanResu
       symbol: REBALANCE_CASH_SYMBOL,
       company: "Cash Reserve",
       currency,
-      currentValue: availableCash,
+      currentValue: input.cash,
       currentWeightPct: cashCurrentWeight,
       targetWeightPct: cashTargetWeight,
       driftPct: decimalSubtract(cashCurrentWeight, cashTargetWeight) as Percent,

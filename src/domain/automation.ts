@@ -284,6 +284,7 @@ export class AutomationController {
       side: BrokerOrderSide;
       quantity: Quantity;
       price: Price;
+      currency?: string;
       idempotencyKey: string;
       at?: string;
       marketSession?: AutomationMarketSession;
@@ -299,6 +300,9 @@ export class AutomationController {
     const idempotencyKey = typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : "";
     const symbol = isBrokerSymbol(input.symbol) ? input.symbol : "SPY";
     const side = isBrokerOrderSide(input.side) ? input.side : "buy";
+    const normalizedCurrency = typeof input.currency === "string" && input.currency.trim() !== ""
+      ? input.currency.trim().toUpperCase()
+      : "USD";
     let normalizedQuantity = quantity("0");
     let normalizedPrice = price("0");
     let amount = ZERO_MONEY;
@@ -334,6 +338,9 @@ export class AutomationController {
     } else if (this.state.policy.regularSessionOnly && marketSession !== "regular") {
       status = "blocked";
       reason = "Regular market session is closed; automation is restricted to regular hours";
+    } else if (normalizedCurrency !== "USD") {
+      status = "blocked";
+      reason = `Non-USD symbol (${normalizedCurrency}) is isolated from USD-denominated automation caps`;
     } else if (!validAmount) {
       status = "blocked";
       reason = "Quantity and price must be positive decimals";

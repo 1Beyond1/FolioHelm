@@ -726,9 +726,16 @@ export const MARKET_SECURITIES: readonly MarketSecurity[] = LEGACY_MARKET_SECURI
 export function getMarketSecurities(): readonly MarketSecurity[] {
   if (MOCK_BROKER.getWorkspaceMode() === "local-csv") {
     const snapshot = MOCK_BROKER.getSnapshot();
-    const holdingBySymbol = new Map(snapshot.holdings.map((h) => [h.symbol, h]));
+    const holdingByKey = new Map(
+      snapshot.holdings.map((h) => [`${h.symbol}|${h.currency ?? "USD"}`, h]),
+    );
+    const holdingBySymbol = new Map<string, (typeof snapshot.holdings)[number]>();
+    for (const h of snapshot.holdings) {
+      if (!holdingBySymbol.has(h.symbol)) holdingBySymbol.set(h.symbol, h);
+    }
     return snapshot.quotes.map((q): MarketSecurity => {
-      const holding = holdingBySymbol.get(q.symbol);
+      const quoteCurrency = q.currency ?? "USD";
+      const holding = holdingByKey.get(`${q.symbol}|${quoteCurrency}`) ?? holdingBySymbol.get(q.symbol);
       const priceValue = decimalToNumber(q.price);
       return {
         symbol: q.symbol,

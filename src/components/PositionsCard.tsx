@@ -22,7 +22,7 @@ export function PositionsCard({ copy, language, positions, onOpenInstrument, onV
         {positions.length === 0 ? (
           <DataStateNotice language={language} status="no-data" compact />
         ) : positions.map((position) => (
-          <button className="position-row" type="button" key={position.ticker} onClick={() => onOpenInstrument(position.ticker)}>
+          <button className="position-row" type="button" key={`${position.ticker}:${position.currency ?? "USD"}`} onClick={() => onOpenInstrument(position.ticker)}>
             <span className={`asset-icon ${position.iconClass}`}>{position.ticker.slice(0, 1)}</span>
             <span className="asset-name"><b>{position.ticker}</b><small>{position.company}</small></span>
             <span className="asset-value"><b>{formatCurrency(position.marketValue, language, position.currency)}</b><small className={position.unrealizedPnl >= 0 ? "positive" : "negative"}>{formatSignedCurrency(position.unrealizedPnl, language, position.currency)}</small></span>

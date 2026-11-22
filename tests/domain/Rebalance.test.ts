@@ -215,4 +215,26 @@ describe("pure Decimal target allocation & read-only rebalance calculator", () =
     expect(plan.valid).toBe(true);
     expect(plan.totalTargetWeightPct).toBe("100");
   });
+
+  it("keeps CASH row currentValue consistent with currentWeightPct (pre-contribution cash) when additionalCash > 0", () => {
+    // Current holdings = $10,000, current cash = $1,000 => currentPortfolioValue = $11,000
+    // Additional cash = $2,000 => projectedPortfolioValue = $13,000, availableCash = $3,000
+    for (const mode of ["full-rebalance", "cash-only-buy"] as const) {
+      const plan = calculateRebalancePlan({
+        holdings: SAMPLE_HOLDINGS,
+        cash: money("1000.00"),
+        currency: "USD",
+        targetWeights: { VOO: "40", QQQ: "30", "BRK.B": "20", CASH: "10" },
+        mode,
+        additionalCash: "2000.00",
+      });
+      expect(plan.valid).toBe(true);
+      expect(plan.currentPortfolioValue).toBe("11000");
+      expect(plan.availableCash).toBe("3000");
+      const cashRow = plan.suggestions.find((s) => s.symbol === REBALANCE_CASH_SYMBOL)!;
+      // CASH currentValue MUST be pre-contribution cash ($1,000), matching its 9.09% currentWeightPct
+      expect(cashRow.currentValue).toBe("1000");
+      expect(cashRow.currentWeightPct).toBe("9.09");
+    }
+  });
 });

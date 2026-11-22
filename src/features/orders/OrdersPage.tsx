@@ -52,7 +52,7 @@ function readOrders(language: Language): OrderRecord[] {
     qty: decimalToNumber(order.quantity),
     filled: decimalToNumber(order.filledQuantity),
     limit: order.limitPrice === null ? null : decimalToNumber(order.limitPrice),
-    currency: currencyBySymbol.get(order.symbol) ?? "USD",
+    currency: order.currency ?? currencyBySymbol.get(order.symbol) ?? "USD",
     status: order.status,
     submitted: new Intl.DateTimeFormat(locale, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(new Date(order.submittedAt)).replace(",", " ·"),
     timeline: order.events.map((event) => ({

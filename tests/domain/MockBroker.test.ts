@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MOCK_BROKER, MockBroker, MockBrokerError, mockDraftHash } from "../../src/domain/mockBroker";
+import { parseCsvLocally } from "../../src/domain/csvImport";
+import { loadPersistedPaperOrders, persistPaperOrder } from "../../src/domain/vaultStorage";
 import { decimalAdd, decimalCompare, decimalMultiply, decimalRound, decimalSubtract, money, price, quantity, type Money } from "../../src/domain/decimal";
 
 afterEach(() => {
@@ -174,5 +176,84 @@ describe("MockBroker subscriptions", () => {
         expect(decimalCompare(snapshot.account.allTimeChange, money("0"))).toBe(-1);
       }
     }
+  });
+
+  it("preserves frozen buying power, locked sell shares, persisted currency, and composite (symbol, currency) isolation on localSnapshot rebuilds", async () => {
+    const broker = new MockBroker();
+    // Same ticker DUAL held in two currencies (USD & HKD) + cash in both currencies
+    const csv = [
+      "symbol,description,quantity,average_cost,price,currency",
+      "DUAL,Dual USD,10,100.00,120.00,USD",
+      "DUAL,Dual HKD,100,20.00,25.00,HKD",
+      "USD,USD Cash,1,1000.00,1000.00,USD",
+      "HKD,HKD Cash,1,5000.00,5000.00,HKD",
+    ].join("\n");
+    const parsed = await parseCsvLocally(csv, "multi-dual.csv");
+    broker.applyLocalPortfolioSnapshot(parsed.snapshot, { switchMode: true });
+
+    // Confirm composite (symbol, currency) kept distinct quotes & holdings without collision
+    const initial = broker.getSnapshot();
+    expect(initial.holdings).toHaveLength(2);
+    expect(initial.holdings.find((h) => h.symbol === "DUAL" && h.currency === "USD")?.marketValue).toBe("1200");
+    expect(initial.holdings.find((h) => h.symbol === "DUAL" && h.currency === "HKD")?.marketValue).toBe("2500");
+
+    // Place working HKD buy (100 * 25 = 2500 HKD) & working HKD sell (40 shares)
+    const buyDraft = {
+      symbol: "DUAL",
+      side: "buy" as const,
+      type: "limit" as const,
+      quantity: quantity("100"),
+      limitPrice: price("25.00"),
+      currency: "HKD",
+    };
+    const buyPreview = broker.previewOrder(buyDraft);
+    const buyOrder = broker.consumePreview(buyPreview.previewId, buyPreview.draftHash);
+    expect(buyOrder.currency).toBe("HKD");
+
+    const sellDraft = {
+      symbol: "DUAL",
+      side: "sell" as const,
+      type: "market" as const,
+      quantity: quantity("40"),
+      limitPrice: null,
+      currency: "HKD",
+    };
+    const sellPreview = broker.previewOrder(sellDraft);
+    const sellOrder = broker.consumePreview(sellPreview.previewId, sellPreview.draftHash);
+    expect(sellOrder.currency).toBe("HKD");
+
+    // Persist and reload order currency cleanly
+    await persistPaperOrder("local-csv", buyOrder);
+    const reloadedOrders = await loadPersistedPaperOrders("local-csv");
+    expect(reloadedOrders.find((o) => o.id === buyOrder.id)?.currency).toBe("HKD");
+
+    // Trigger localSnapshot rebuilds via public quotes toggle + quote update
+    broker.setPublicQuotesEnabled(true);
+    broker.applyPublicQuotes([
+      {
+        symbol: "DUAL",
+        price: "26.00",
+        change: "1.00",
+        changePct: "4.00",
+        currency: "HKD",
+        asOfUtc: "2026-11-22T06:00:00.000Z",
+        provider: "stooq.com",
+        delayed: true,
+      },
+    ]);
+    broker.setPublicQuotesEnabled(false);
+
+    // Frozen HKD buying power (5000 - 2500 = 2500) & locked HKD shares (100 - 40 = 60) MUST survive rebuild!
+    // Meanwhile USD holding (10 shares) and USD buying power (1000) MUST remain untouched!
+    const rebuilt = broker.getSnapshot();
+    const hkdSummary = rebuilt.account.currencyBreakdowns?.find((c) => c.currency === "HKD");
+    const usdSummary = rebuilt.account.currencyBreakdowns?.find((c) => c.currency === "USD");
+    expect(hkdSummary?.buyingPower).toBe("2500");
+    expect(usdSummary?.buyingPower).toBe("1000");
+
+    const hkdHolding = rebuilt.holdings.find((h) => h.symbol === "DUAL" && h.currency === "HKD");
+    const usdHolding = rebuilt.holdings.find((h) => h.symbol === "DUAL" && h.currency === "USD");
+    expect(hkdHolding?.availableQuantity).toBe("60");
+    expect(usdHolding?.availableQuantity).toBe("10");
   });
 });

@@ -1,7 +1,16 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { InvestingHeatmap } from "../../src/components/InvestingHeatmap";
+import { parseCsvLocally } from "../../src/domain/csvImport";
+import { MOCK_BROKER } from "../../src/domain/mockBroker";
+import { getCopy } from "../../src/i18n";
 import { InstrumentPage, MarketsPage } from "../../src/features/markets";
 import { getMarketSecurity } from "../../src/features/markets/marketsData";
+
+afterEach(() => {
+  cleanup();
+  MOCK_BROKER.reset();
+});
 
 describe("FolioHelm markets demo", () => {
   it("filters the watchlist immediately by symbol", () => {
@@ -155,5 +164,69 @@ describe("FolioHelm markets demo", () => {
     expect(aapl.price).toBeLessThanOrEqual(yearHigh);
     // Uses cumulative totalPnl rather than dayPnl
     expect(aapl.holdingPnl).toBe(1250);
+  });
+
+  it("formats InvestingHeatmap with actual non-USD currency and suppresses misleading $0.00 in multi-currency mode", () => {
+    const sampleEntries = [
+      {
+        date: "2026-11-20",
+        dataStatus: "available" as const,
+        level: 2 as const,
+        actions: 1,
+        dailyReturnPct: 1.25,
+        dailyReturnUsd: 500,
+      },
+    ];
+    const { rerender } = render(
+      <InvestingHeatmap
+        copy={getCopy("en")}
+        language="en"
+        entries={sampleEntries}
+        activeDays={1}
+        ordersFilled={1}
+        netChange={1250}
+        currency="HKD"
+        isMultiCurrency={false}
+      />,
+    );
+    expect(screen.getByTestId("heatmap-net-change")).toHaveTextContent(/HK\$/);
+    fireEvent.click(screen.getByTestId("heatmap-mode-return"));
+    expect(screen.getByTestId("heatmap-unit-usd")).toHaveTextContent("HKD");
+
+    rerender(
+      <InvestingHeatmap
+        copy={getCopy("en")}
+        language="en"
+        entries={sampleEntries}
+        activeDays={1}
+        ordersFilled={1}
+        netChange={0}
+        currency="MULTI"
+        isMultiCurrency
+      />,
+    );
+    expect(screen.getByTestId("heatmap-net-change")).toHaveTextContent("Multi-currency");
+    expect(screen.queryByTestId("heatmap-unit-usd")).not.toBeInTheDocument();
+  });
+
+  it("renders honest local-csv copy on MarketsPage and InstrumentPage without fictional demo leaks", async () => {
+    const csv = "symbol,description,quantity,average_cost,price,currency\n00700.HK,Tencent Holdings,100,320.00,380.00,HKD\n";
+    const parsed = await parseCsvLocally(csv, "hk-only.csv");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(parsed.snapshot, { switchMode: true });
+
+    const { unmount } = render(
+      <MarketsPage language="en" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />,
+    );
+    expect(screen.getByTestId("markets-page")).toHaveTextContent(/Search local portfolio/i);
+    expect(screen.getByTestId("markets-page")).toHaveTextContent(/Try 00700\.HK/i);
+    expect(screen.getByTestId("markets-movers-empty")).toBeInTheDocument();
+    expect(screen.getByTestId("markets-page")).not.toHaveTextContent(/Every quote on this page is invented/i);
+    unmount();
+
+    render(
+      <InstrumentPage language="en" symbol="UNKNOWN" onBack={vi.fn()} onOpenTrade={vi.fn()} />,
+    );
+    expect(screen.getByTestId("instrument-no-data")).toHaveTextContent(/No local portfolio data for this symbol/i);
+    expect(screen.getByTestId("instrument-no-data")).not.toHaveTextContent(/fictional/i);
   });
 });

@@ -103,13 +103,35 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
     return sorted.slice(0, 3);
   }, [marketSecurities, moverMode]);
 
+  const localSymbolHints = marketSecurities.slice(0, 5).map((s) => s.symbol).join(", ");
+  const headerSubtitle = isLocalMode
+    ? (chinese ? "浏览本地导入的 CSV 持仓及可选只读延迟公开行情。" : "Review your locally imported CSV holdings and optional delayed public quotes.")
+    : copy.subtitle;
+  const searchLabelText = isLocalMode
+    ? (chinese ? "搜索本地持仓" : "Search local portfolio")
+    : copy.searchLabel;
+  const searchHintText = isLocalMode
+    ? (localSymbolHints
+        ? (chinese ? `试试 ${localSymbolHints}` : `Try ${localSymbolHints}`)
+        : (chinese ? "输入代码或名称筛选已导入标的" : "Filter your imported holdings by symbol or name"))
+    : copy.searchHint;
+  const watchlistKickerText = isLocalMode
+    ? (chinese ? "本地持仓列表" : "Local portfolio")
+    : copy.watchlistKicker;
+  const watchlistDescriptionText = isLocalMode
+    ? (chinese ? "按导入 CSV 基准价或已开启的只读延迟公开行情展示。" : "Imported holdings priced by CSV baseline or opted-in delayed read-only quotes.")
+    : copy.watchlistDescription;
+  const moversNoteText = isLocalMode
+    ? (chinese ? "基于 CSV 基准价或已开启的延迟公开行情；未开启延迟行情时不虚构日内涨跌幅。" : "Based on CSV baseline or opted-in delayed public quotes; no fabricated intraday moves.")
+    : copy.fictionalDataDescription;
+
   return (
     <main className="markets-page" data-testid="markets-page">
       <header className="markets-heading">
         <div className="markets-heading-copy">
           <span className="markets-kicker">{copy.marketDesk}</span>
           <h1>{copy.title}</h1>
-          <p>{copy.subtitle}</p>
+          <p>{headerSubtitle}</p>
         </div>
         <div className="markets-status" role="status" aria-live="polite">
           <span className="markets-status-dot" aria-hidden="true" />
@@ -140,7 +162,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
       <section className="markets-search-card" aria-labelledby="markets-search-title">
         <div className="markets-search-heading">
           <div>
-            <span className="markets-kicker">{copy.searchLabel}</span>
+            <span className="markets-kicker">{searchLabelText}</span>
             <h2 id="markets-search-title">{copy.searchPlaceholder}</h2>
           </div>
           <span className="markets-search-count">{filteredSecurities.length} {copy.results}</span>
@@ -164,7 +186,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
             </button>
           )}
         </div>
-        <p className="markets-search-hint">{copy.searchHint}</p>
+        <p className="markets-search-hint">{searchHintText}</p>
       </section>
 
       {!isLocalMode && (
@@ -204,9 +226,9 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
         <section className="markets-card markets-watchlist-card" aria-labelledby="markets-watchlist-title">
           <div className="markets-section-heading markets-card-heading">
             <div>
-              <span className="markets-kicker">{copy.watchlistKicker}</span>
+              <span className="markets-kicker">{watchlistKickerText}</span>
               <h2 id="markets-watchlist-title">{copy.watchlistTitle}</h2>
-              <p>{copy.watchlistDescription}</p>
+              <p>{watchlistDescriptionText}</p>
             </div>
             <span className="markets-card-count">{filteredSecurities.length} {copy.results}</span>
           </div>
@@ -227,7 +249,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
                 {filteredSecurities.map((security) => {
                   const isPositive = security.changePct >= 0;
                   return (
-                    <tr key={security.symbol} data-testid={`market-row-${security.symbol}`}>
+                    <tr key={`${security.symbol}:${security.currency ?? "USD"}`} data-testid={`market-row-${security.symbol}`}>
                       <td>
                         <button
                           type="button"
@@ -321,10 +343,16 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
             </button>
           </div>
           <div className="markets-movers-list">
-            {movers.map((security, index) => {
+            {movers.length === 0 ? (
+              <p className="markets-movers-note" data-testid="markets-movers-empty">
+                {isLocalMode
+                  ? (chinese ? "当前无日内涨跌数据（可于设置页显式开启公开延迟行情）。" : "No daily movers yet (opt in to delayed public quotes in Settings).")
+                  : copy.noResults}
+              </p>
+            ) : movers.map((security, index) => {
               const isPositive = security.changePct >= 0;
               return (
-                <div className="markets-mover-row" key={security.symbol}>
+                <div className="markets-mover-row" key={`${security.symbol}:${security.currency ?? "USD"}`}>
                   <span className="markets-mover-rank">0{index + 1}</span>
                   <button
                     type="button"
@@ -350,7 +378,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
               );
             })}
           </div>
-          <p className="markets-movers-note">{copy.fictionalDataDescription}</p>
+          <p className="markets-movers-note">{moversNoteText}</p>
         </aside>
       </div>
     </main>

@@ -10,6 +10,8 @@ interface InvestingHeatmapProps {
   activeDays: number;
   ordersFilled: number;
   netChange: number;
+  currency?: string;
+  isMultiCurrency?: boolean;
 }
 
 const legendLevels: HeatLevel[] = [0, 1, 2, 3, 4];
@@ -37,6 +39,8 @@ export function InvestingHeatmap({
   activeDays,
   ordersFilled,
   netChange,
+  currency = "USD",
+  isMultiCurrency = false,
 }: InvestingHeatmapProps) {
   const [mode, setMode] = useState<HeatmapMode>("activity");
   const [returnUnit, setReturnUnit] = useState<ReturnUnit>("percent");
@@ -44,6 +48,13 @@ export function InvestingHeatmap({
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [focusIndex, setFocusIndex] = useState(0);
   const cellRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const multiCurrency = isMultiCurrency || currency === "MULTI";
+  const displayCurrency = multiCurrency ? "USD" : (currency || "USD");
+  const effectiveReturnUnit: ReturnUnit = multiCurrency ? "percent" : returnUnit;
+  const currencyUnitLabel = displayCurrency === "USD" ? copy.usd : displayCurrency;
+  const formattedNetChange = multiCurrency
+    ? (language === "zh" ? "多币种隔离" : "Multi-currency")
+    : formatSignedCurrency(netChange, language, displayCurrency);
 
   const availableEntries = entries.filter((entry) => entry.dataStatus === "available" && entry.dailyReturnPct !== null && Number.isFinite(entry.dailyReturnPct));
   const bestDay = availableEntries.length === 0
@@ -100,21 +111,23 @@ export function InvestingHeatmap({
             <div className="segmented-control unit-control" role="group" aria-label={copy.dailyReturn} data-testid="heatmap-unit-control">
               <button
                 type="button"
-                className={returnUnit === "percent" ? "active" : undefined}
-                aria-pressed={returnUnit === "percent"}
+                className={effectiveReturnUnit === "percent" ? "active" : undefined}
+                aria-pressed={effectiveReturnUnit === "percent"}
                 onClick={() => setReturnUnit("percent")}
               >
                 {copy.percent}
               </button>
-              <button
-                type="button"
-                className={returnUnit === "usd" ? "active" : undefined}
-                aria-pressed={returnUnit === "usd"}
-                data-testid="heatmap-unit-usd"
-                onClick={() => setReturnUnit("usd")}
-              >
-                {copy.usd}
-              </button>
+              {!multiCurrency && (
+                <button
+                  type="button"
+                  className={effectiveReturnUnit === "usd" ? "active" : undefined}
+                  aria-pressed={effectiveReturnUnit === "usd"}
+                  data-testid="heatmap-unit-usd"
+                  onClick={() => setReturnUnit("usd")}
+                >
+                  {currencyUnitLabel}
+                </button>
+              )}
             </div>
           )}
           <span className="year-label" aria-label={copy.year}>{copy.year}</span>
@@ -161,7 +174,7 @@ export function InvestingHeatmap({
                   );
                 }
 
-                const displayValue = returnUnit === "percent" ? entry.dailyReturnPct : entry.dailyReturnUsd;
+                const displayValue = effectiveReturnUnit === "percent" ? entry.dailyReturnPct : entry.dailyReturnUsd;
                 const tone = entry.dataStatus !== "available" || entry.dailyReturnPct === null
                   ? "neutral"
                   : entry.dailyReturnPct > 0 ? "positive" : entry.dailyReturnPct < 0 ? "negative" : "neutral";
@@ -170,7 +183,7 @@ export function InvestingHeatmap({
                 const summary = entry.dataStatus !== "available" || displayValue === null
                   ? `${date}: ${copy.noData}`
                   : isReturnMode
-                    ? `${date}: ${returnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language)}`
+                    ? `${date}: ${effectiveReturnUnit === "percent" ? formatSignedPercent(displayValue, language) : formatSignedCurrency(displayValue, language, displayCurrency)}`
                     : `${date}: ${actionLabel(entry.actions, copy)}, ${copy.portfolioTooltip} ${formatSignedPercent(entry.dailyReturnPct ?? 0, language)}`;
 
                 function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>): void {
@@ -238,15 +251,15 @@ export function InvestingHeatmap({
                 {hoveredEntry.dataStatus !== "available"
                   ? copy.noData
                   : isReturnMode
-                    ? returnUnit === "percent"
+                    ? effectiveReturnUnit === "percent"
                       ? formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)
-                      : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language)
+                      : formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency)
                     : actionLabel(hoveredEntry.actions, copy)}
               </strong>
               <em>
                 {hoveredEntry.dataStatus !== "available"
                   ? copy.noData
-                  : `${copy.portfolioTooltip} ${formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)}${isReturnMode && returnUnit === "percent" ? "" : ` · ${formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language)}`}`}
+                  : `${copy.portfolioTooltip} ${formatSignedPercent(hoveredEntry.dailyReturnPct ?? 0, language)}${(isReturnMode && effectiveReturnUnit === "percent") || multiCurrency ? "" : ` · ${formatSignedCurrency(hoveredEntry.dailyReturnUsd ?? 0, language, displayCurrency)}`}`}
               </em>
             </>
           )}
@@ -258,13 +271,13 @@ export function InvestingHeatmap({
           <div className="year-summary return-summary">
             <strong data-testid="heatmap-best-day">{bestDay === null ? copy.noData : formatSignedPercent(bestDay, language)}</strong><span>{copy.bestDay}</span>
             <strong>{downDays}</strong><span>{copy.downDays}</span>
-            <strong>{formatSignedCurrency(netChange, language)}</strong><span>{copy.netChange}</span>
+            <strong data-testid="heatmap-net-change">{formattedNetChange}</strong><span>{copy.netChange}</span>
           </div>
         ) : (
           <div className="year-summary">
             <strong>{activeDays}</strong><span>{copy.activeDays}</span>
             <strong>{ordersFilled}</strong><span>{copy.ordersFilled}</span>
-            <strong>{formatSignedCurrency(netChange, language)}</strong><span>{copy.netChange}</span>
+            <strong data-testid="heatmap-net-change">{formattedNetChange}</strong><span>{copy.netChange}</span>
           </div>
         )}
         <div className="heatmap-legend" aria-label={isReturnMode ? `${copy.loss} to ${copy.gain}` : `${copy.less} to ${copy.more}`}>
