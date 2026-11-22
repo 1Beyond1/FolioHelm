@@ -667,3 +667,52 @@
     justify-content: flex-start;
   }
 }
+
+.settings-vault-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--settings-line);
+  border-radius: 12px;
+  background: var(--settings-panel-raised);
+  font-size: 12px;
+}
+
+.settings-vault-row span {
+  color: var(--settings-muted);
+}
+
+.settings-quotes-panel {
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid var(--settings-line);
+  border-radius: 14px;
+  background: var(--settings-panel-raised);
+}
+
+.settings-quotes-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.settings-quotes-controls label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--settings-muted);
+}
+
+.settings-quote-status,
+.settings-export-path {
+  display: block;
+  margin: 10px 0 0;
+  color: var(--settings-lime);
+  font-size: 12px;
+}

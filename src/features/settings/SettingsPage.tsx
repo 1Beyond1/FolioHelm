@@ -5,6 +5,13 @@ import type { MockScenario } from "../../domain/contracts";
 import { detectInitialLanguage } from "../../i18n";
 import { clearFolioHelmStored, readStored, writeStored } from "../../platform/storage";
 import { appendEvidence, clearEvidence, exportEvidence, importEvidence, verifyEvidence } from "../../domain/evidenceJournal";
+import { clearPersistedLocalPortfolio } from "../../domain/csvImport";
+import {
+  refreshPublicQuotes,
+  saveJsonWithDialogOrBlob,
+  type PublicQuoteProviderChoice,
+} from "../../domain/publicQuotes";
+import { invokeVaultClearAll, invokeVaultStatus, isTauriRuntime, type TauriVaultStatus } from "../../domain/tauriBridge";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
 import { Modal } from "../../components/Modal";
@@ -106,11 +113,26 @@ const COPY = {
     noWriteRetry: "No write retry",
     unknownReconciliation: "Unknown reconciliation",
     localData: "Local workspace data",
-    localDataBody: "Preferences, Mock automation state and the tamper-evident local journal stay on this device. No credentials are stored by this build.",
+    localDataBody: "Preferences, Mock automation state, imported CSV portfolios and the tamper-evident local journal stay encrypted on this device. No brokerage credentials are stored.",
+    vaultStatusTitle: "Encrypted local vault",
+    vaultUnlocked: (cipher: string, provider: string) => `Unlocked · ${cipher} · ${provider}`,
+    vaultLocked: (reason: string) => `Locked (Fail-Closed) · ${reason}`,
+    vaultBrowserMode: "Browser preview mode · Desktop builds use OS Credential Manager + AES-256-GCM SQLite",
+    publicQuotesTitle: "Public delayed quotes (read-only)",
+    publicQuotesNotice: "Delayed read-only public quotes · Not for live order execution",
+    publicQuotesBody: "Off by default. When enabled, the Rust backend fetches unauthenticated delayed prices exclusively from HTTPS allowlisted public hosts (stooq.com / query1.finance.yahoo.com) with automatic offline cache fallback.",
+    publicQuotesSwitch: "Enable public delayed quotes (read-only, non-execution)",
+    publicQuotesProvider: "Public quote source",
+    publicQuotesRefresh: "Refresh quotes",
+    publicQuotesRefreshing: "Refreshing...",
+    publicQuotesUpdated: (count: number, provider: string, asOf: string) => `Updated ${count} delayed quotes via ${provider} (${asOf})`,
+    publicQuotesFallback: (reason: string) => `Using local cache / CSV baseline · ${reason}`,
     evidence: "Evidence journal",
     verify: "Verify",
     export: "Export",
+    exportDiagnostics: "Export diagnostics",
     import: "Import",
+    savedToPath: (path: string) => `Saved to ${path}`,
     evidenceEmpty: "No local evidence yet",
     evidenceValid: (count: number) => `Verified · ${count} local events`,
     evidenceInvalid: (reason: string) => `Verification failed · ${reason}`,
@@ -195,11 +217,26 @@ const COPY = {
     noWriteRetry: "不重试写入",
     unknownReconciliation: "未知状态对账",
     localData: "本地工作区数据",
-    localDataBody: "偏好、Mock 自动化状态和防篡改本地日志都保存在本机。本版本不会保存凭据。",
+    localDataBody: "偏好设置、模拟自动化状态、本地 CSV 持仓与防篡改证据链均加密保存在本机。本版本不保存任何券商凭据。",
+    vaultStatusTitle: "本地加密金库",
+    vaultUnlocked: (cipher: string, provider: string) => `已解锁 · ${cipher} · ${provider}`,
+    vaultLocked: (reason: string) => `已锁定（Fail-Closed 保护原密文）· ${reason}`,
+    vaultBrowserMode: "浏览器预览模式 · 桌面端默认使用操作系统凭证管理器 + AES-256-GCM 加密 SQLite",
+    publicQuotesTitle: "公开延迟行情（只读）",
+    publicQuotesNotice: "延迟只读公开行情 · 不可用于真实下单",
+    publicQuotesBody: "默认关闭。显式开启后，仅由 Rust 后端经严格 HTTPS 白名单域名（stooq.com / query1.finance.yahoo.com）无凭证只读拉取；离线或限流时自动降级至本地缓存或 CSV 导入价。",
+    publicQuotesSwitch: "启用公开延迟行情（只读，非券商成交价）",
+    publicQuotesProvider: "公开行情源",
+    publicQuotesRefresh: "刷新行情",
+    publicQuotesRefreshing: "刷新中...",
+    publicQuotesUpdated: (count: number, provider: string, asOf: string) => `已通过 ${provider} 更新 ${count} 条延迟行情（${asOf}）`,
+    publicQuotesFallback: (reason: string) => `已自动降级至本地缓存或 CSV 基准价 · ${reason}`,
     evidence: "证据日志",
     verify: "验证",
     export: "导出",
+    exportDiagnostics: "导出安全诊断",
     import: "导入",
+    savedToPath: (path: string) => `已保存至 ${path}`,
     evidenceEmpty: "还没有本地证据",
     evidenceValid: (count: number) => `验证通过 · ${count} 条本地事件`,
     evidenceInvalid: (reason: string) => `验证失败 · ${reason}`,
@@ -296,10 +333,29 @@ export function SettingsPage({
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
   const [clearDataDialogOpen, setClearDataDialogOpen] = useState(false);
   const [evidenceStatus, setEvidenceStatus] = useState<EvidenceState>({ kind: "idle" });
+  const [exportPathNote, setExportPathNote] = useState<string | null>(null);
+  const [vaultStatus, setVaultStatus] = useState<TauriVaultStatus | null>(null);
+  const [publicQuotesEnabled, setPublicQuotesEnabled] = useState<boolean>(() => MOCK_BROKER.isPublicQuotesEnabled());
+  const [quoteProvider, setQuoteProvider] = useState<PublicQuoteProviderChoice>("stooq");
+  const [quoteRefreshing, setQuoteRefreshing] = useState(false);
+  const [quoteStatusMessage, setQuoteStatusMessage] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const riskScrollRef = useRef<HTMLDivElement>(null);
 
   const settingsModalOpen = connectionDialogOpen || pendingKey !== null || clearDataDialogOpen;
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return undefined;
+    let active = true;
+    void invokeVaultStatus()
+      .then((status) => {
+        if (active) setVaultStatus(status);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     writeStored("protections", protections);
@@ -309,16 +365,6 @@ export function SettingsPage({
     onModalStateChange(settingsModalOpen);
     return () => onModalStateChange(false);
   }, [onModalStateChange, settingsModalOpen]);
-
-  function downloadEvidence(serialized: string): void {
-    const blob = new Blob([serialized], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "foliohelm-evidence-mock.json";
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
 
   async function handleVerifyEvidence(): Promise<void> {
     try {
@@ -333,10 +379,83 @@ export function SettingsPage({
 
   async function handleExportEvidence(): Promise<void> {
     try {
-      downloadEvidence(await exportEvidence());
+      const serialized = await exportEvidence();
+      const outcome = await saveJsonWithDialogOrBlob("foliohelm-evidence-mock.json", serialized);
+      if (outcome.kind === "native-saved") {
+        setExportPathNote(copy.savedToPath(outcome.path));
+      } else {
+        setExportPathNote(null);
+      }
       await handleVerifyEvidence();
     } catch {
       setEvidenceStatus({ kind: "invalid" });
+    }
+  }
+
+  async function handleExportDiagnostics(): Promise<void> {
+    try {
+      const verification = await verifyEvidence();
+      const diagnostics = {
+        format: "foliohelm-safety-diagnostics",
+        schemaVersion: 1,
+        exportedAtUtc: new Date().toISOString(),
+        runtime: isTauriRuntime() ? "tauri-desktop" : "browser-preview",
+        workspaceMode: MOCK_BROKER.getWorkspaceMode(),
+        publicQuotes: MOCK_BROKER.getPublicQuoteStatus(),
+        vault: vaultStatus
+          ? {
+              unlocked: vaultStatus.unlocked,
+              cipher: vaultStatus.cipher,
+              schemaVersion: vaultStatus.schemaVersion,
+              keyProvider: vaultStatus.keyProvider,
+              evidenceCount: vaultStatus.evidenceCount,
+              hasLocalPortfolio: vaultStatus.hasLocalPortfolio,
+            }
+          : null,
+        evidenceVerification: verification,
+        protections,
+      };
+      const outcome = await saveJsonWithDialogOrBlob(
+        "foliohelm-safety-diagnostics.json",
+        JSON.stringify(diagnostics, null, 2),
+      );
+      if (outcome.kind === "native-saved") {
+        setExportPathNote(copy.savedToPath(outcome.path));
+      }
+    } catch {
+      setEvidenceStatus({ kind: "invalid" });
+    }
+  }
+
+  function handleTogglePublicQuotes(): void {
+    const next = !publicQuotesEnabled;
+    setPublicQuotesEnabled(next);
+    MOCK_BROKER.setPublicQuotesEnabled(next);
+    setQuoteStatusMessage(null);
+    void appendEvidence("safety_setting_changed", {
+      mode: MOCK_BROKER.getWorkspaceMode(),
+      setting: "publicDelayedQuotes",
+      enabled: String(next),
+      provider: quoteProvider,
+    }).catch(() => undefined);
+  }
+
+  async function handleRefreshPublicQuotes(): Promise<void> {
+    if (!publicQuotesEnabled || quoteRefreshing) return;
+    setQuoteRefreshing(true);
+    try {
+      const result = await refreshPublicQuotes(quoteProvider);
+      if (result.fromCache) {
+        setQuoteStatusMessage(copy.publicQuotesFallback(result.degradedReason ?? result.provider));
+      } else {
+        setQuoteStatusMessage(
+          copy.publicQuotesUpdated(result.updatedCount, result.provider, result.asOfUtc ?? new Date().toISOString()),
+        );
+      }
+    } catch (error) {
+      setQuoteStatusMessage(copy.publicQuotesFallback(error instanceof Error ? error.message : String(error)));
+    } finally {
+      setQuoteRefreshing(false);
     }
   }
 
@@ -366,12 +485,19 @@ export function SettingsPage({
       setEvidenceStatus({ kind: "invalid", clearFailed: true });
       return;
     }
+    if (isTauriRuntime()) {
+      await invokeVaultClearAll().catch(() => undefined);
+    }
+    await clearPersistedLocalPortfolio().catch(() => undefined);
     MOCK_BROKER.reset();
     AUTOMATION_CONTROLLER.replaceState(DEFAULT_AUTOMATION_STATE);
     onLanguageChange(detectInitialLanguage());
     onThemeChange("system");
     onMockScenarioChange?.("healthy");
     setProtections({ ...INITIAL_PROTECTIONS });
+    setPublicQuotesEnabled(false);
+    setQuoteStatusMessage(null);
+    setExportPathNote(null);
     setEvidenceStatus({ kind: "valid", count: 0 });
     setClearDataDialogOpen(false);
   }
@@ -618,14 +744,79 @@ export function SettingsPage({
           <span className="settings-badge settings-badge--lime">{language === "zh" ? "本地" : "Local"}</span>
         </div>
         <p className="settings-card__body">{copy.localDataBody}</p>
+        <div className="settings-vault-row" data-testid="vault-status-row">
+          <strong>{copy.vaultStatusTitle}</strong>
+          <span>
+            {vaultStatus
+              ? vaultStatus.unlocked
+                ? copy.vaultUnlocked(vaultStatus.cipher, vaultStatus.keyProvider)
+                : copy.vaultLocked(vaultStatus.lockedReason ?? "locked")
+              : copy.vaultBrowserMode}
+          </span>
+        </div>
+
+        <div className="settings-quotes-panel" data-testid="public-quotes-panel">
+          <div className="settings-protection">
+            <div className="settings-protection__copy">
+              <div className="settings-protection__title-line">
+                <strong>{copy.publicQuotesTitle}</strong>
+                <span className="settings-badge settings-badge--warning">{copy.publicQuotesNotice}</span>
+              </div>
+              <span>{copy.publicQuotesBody}</span>
+            </div>
+            <button
+              className={`settings-switch ${publicQuotesEnabled ? "is-on" : "is-off"}`}
+              type="button"
+              role="switch"
+              data-testid="public-quotes-switch"
+              aria-checked={publicQuotesEnabled}
+              aria-label={copy.publicQuotesSwitch}
+              onClick={handleTogglePublicQuotes}
+            >
+              <span className="settings-switch__thumb" aria-hidden="true" />
+              <span>{publicQuotesEnabled ? copy.on : copy.off}</span>
+            </button>
+          </div>
+          <div className="settings-quotes-controls">
+            <label>
+              <span>{copy.publicQuotesProvider}</span>
+              <select
+                className="settings-scenario-select"
+                aria-label={copy.publicQuotesProvider}
+                value={quoteProvider}
+                onChange={(event) => setQuoteProvider(event.target.value as PublicQuoteProviderChoice)}
+              >
+                <option value="stooq">Stooq (stooq.com)</option>
+                <option value="yahoo">Yahoo Finance (query1.finance.yahoo.com)</option>
+              </select>
+            </label>
+            <button
+              className="settings-button settings-button--secondary"
+              type="button"
+              data-testid="refresh-public-quotes"
+              disabled={!publicQuotesEnabled || quoteRefreshing}
+              onClick={() => void handleRefreshPublicQuotes()}
+            >
+              {quoteRefreshing ? copy.publicQuotesRefreshing : copy.publicQuotesRefresh}
+            </button>
+          </div>
+          {quoteStatusMessage && (
+            <p className="settings-quote-status" role="status" data-testid="public-quotes-status">{quoteStatusMessage}</p>
+          )}
+        </div>
+
         <div className="settings-evidence-row">
           <div>
             <strong>{copy.evidence}</strong>
             <span className={`settings-evidence-status settings-evidence-status--${evidenceStatus.kind}`} role="status">{evidenceStatusText(evidenceStatus, copy)}</span>
+            {exportPathNote && (
+              <span className="settings-export-path" data-testid="export-path-note">{exportPathNote}</span>
+            )}
           </div>
           <div className="settings-evidence-actions">
             <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleVerifyEvidence()}>{copy.verify}</button>
             <button className="settings-button settings-button--secondary" type="button" onClick={() => void handleExportEvidence()}>{copy.export}</button>
+            <button className="settings-button settings-button--secondary" type="button" data-testid="export-diagnostics" onClick={() => void handleExportDiagnostics()}>{copy.exportDiagnostics}</button>
             <button className="settings-button settings-button--secondary" type="button" onClick={() => importInputRef.current?.click()}>{copy.import}</button>
             <input ref={importInputRef} className="settings-hidden-file" type="file" accept="application/json,.json" onChange={(event) => void handleImportEvidence(event)} />
           </div>

@@ -1,20 +1,33 @@
 pub mod csv_import;
 pub mod evidence;
+pub mod quotes;
 pub mod storage;
 pub mod vault;
 
-use std::{collections::BTreeMap, path::Path, sync::Mutex};
+use std::{collections::BTreeMap, fs, path::Path, sync::Mutex};
 
-use csv_import::{parse_and_preview_csv, CsvCommitResultDto, CsvImportPreviewDto};
+use csv_import::{parse_and_preview_csv, CsvCommitResultDto, CsvImportPreviewDto, MAX_CSV_BYTES};
 use evidence::{
     AppendEvidenceRequest, EvidenceJournal, EvidenceVerificationDto, SignedEvidenceRecordDto,
 };
+use quotes::{fetch_public_quotes, PublicQuoteBatchResponseDto, PublicQuoteProvider};
+use serde::Serialize;
 use storage::{
-    EncryptedVaultDb, PortfolioSaveOutcome, StoredPaperOrder, StoredPortfolioSnapshot,
-    VaultStatusDto, STORAGE_SCHEMA_VERSION,
+    CachedPublicQuote, EncryptedVaultDb, PortfolioSaveOutcome, StoredPaperOrder,
+    StoredPortfolioSnapshot, VaultStatusDto, STORAGE_SCHEMA_VERSION,
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use vault::{KeyStore, OsKeyringStore};
+
+const MAX_EXPORT_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenedTextFileDto {
+    file_name: String,
+    content: String,
+}
 
 enum VaultSession {
     Unlocked {
@@ -322,6 +335,134 @@ fn csv_commit_import(
 }
 
 #[tauri::command]
+async fn quotes_fetch_public(
+    state: State<'_, VaultRuntimeState>,
+    symbols: Vec<String>,
+    provider: Option<String>,
+) -> Result<PublicQuoteBatchResponseDto, String> {
+    let provider_choice = PublicQuoteProvider::parse(provider.as_deref().unwrap_or("stooq"))
+        .map_err(|error| error.to_string())?;
+    let valid_symbols =
+        quotes::validate_quote_symbols(&symbols).map_err(|error| error.to_string())?;
+
+    match fetch_public_quotes(&valid_symbols, provider_choice).await {
+        Ok(fetched) => {
+            // Persist fetched quotes to the encrypted cache best-effort; if vault is locked,
+            // still return the read-only quote payload without failing the view.
+            let _ = state.with_unlocked(|db, _| {
+                db.upsert_quote_cache(&fetched)
+                    .map_err(|error| error.to_string())
+            });
+            Ok(PublicQuoteBatchResponseDto {
+                quotes: fetched,
+                from_cache: false,
+                degraded_reason: None,
+                provider: provider_choice.code().to_string(),
+            })
+        }
+        Err(fetch_error) => {
+            let cached = state
+                .with_unlocked(|db, _| db.load_quote_cache().map_err(|error| error.to_string()))
+                .unwrap_or_default();
+            let filtered: Vec<CachedPublicQuote> = cached
+                .into_iter()
+                .filter(|item| valid_symbols.contains(&item.symbol))
+                .collect();
+            Ok(PublicQuoteBatchResponseDto {
+                quotes: filtered,
+                from_cache: true,
+                degraded_reason: Some(fetch_error.to_string()),
+                provider: provider_choice.code().to_string(),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn quotes_load_cached(
+    state: State<'_, VaultRuntimeState>,
+) -> Result<Vec<CachedPublicQuote>, String> {
+    state.with_unlocked(|db, _| db.load_quote_cache().map_err(|error| error.to_string()))
+}
+
+#[tauri::command]
+async fn dialog_open_csv_file(app: AppHandle) -> Result<Option<OpenedTextFileDto>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .add_filter("Brokerage CSV", &["csv", "txt"])
+            .blocking_pick_file();
+
+        let Some(file_path) = picked else {
+            return Ok(None);
+        };
+        let path = file_path
+            .into_path()
+            .map_err(|_| "selected CSV path is not a local filesystem path".to_string())?;
+        let meta = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if meta.len() as usize > MAX_CSV_BYTES {
+            return Err(format!(
+                "Selected CSV exceeds the 5 MB safety limit ({} bytes)",
+                meta.len()
+            ));
+        }
+        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("imported.csv")
+            .to_string();
+        Ok(Some(OpenedTextFileDto { file_name, content }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn dialog_save_json_file(
+    app: AppHandle,
+    default_file_name: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    if content.len() > MAX_EXPORT_BYTES {
+        return Err("Export payload exceeds the 20 MB safety limit".to_string());
+    }
+    let safe_name: String = default_file_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        .take(80)
+        .collect();
+    let final_name = if safe_name.is_empty() {
+        "foliohelm-export.json".to_string()
+    } else if safe_name.ends_with(".json") {
+        safe_name
+    } else {
+        format!("{safe_name}.json")
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .set_file_name(&final_name)
+            .add_filter("JSON files", &["json"])
+            .blocking_save_file();
+
+        let Some(file_path) = picked else {
+            return Ok(None);
+        };
+        let path = file_path
+            .into_path()
+            .map_err(|_| "selected save destination is not a local filesystem path".to_string())?;
+        fs::write(&path, content.as_bytes()).map_err(|error| error.to_string())?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn vault_clear_all(state: State<'_, VaultRuntimeState>) -> Result<bool, String> {
     state.with_unlocked(|db, journal| {
         db.clear_all_workspace_data()
@@ -333,6 +474,7 @@ fn vault_clear_all(state: State<'_, VaultRuntimeState>) -> Result<bool, String> 
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let key_provider = if cfg!(target_os = "windows") {
                 "Windows Credential Manager"
@@ -372,6 +514,10 @@ pub fn run() {
             vault_load_setting,
             csv_preview_import,
             csv_commit_import,
+            quotes_fetch_public,
+            quotes_load_cached,
+            dialog_open_csv_file,
+            dialog_save_json_file,
             vault_clear_all,
         ])
         .run(tauri::tauri_build_context!())
