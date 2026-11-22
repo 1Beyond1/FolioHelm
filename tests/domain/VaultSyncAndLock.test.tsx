@@ -352,7 +352,7 @@ describe("C1: Full-site local-csv support for arbitrary non-7 imported symbols (
 });
 
 describe("C5: Multi-currency Fail-Safe isolation in PortfolioPage", () => {
-  it("isolates USD and HKD subtotals and blocks cross-currency rebalancing", async () => {
+  it("isolates USD and HKD subtotals and switches allocation & rebalance strictly per currency bucket without FX blending", async () => {
     const mixedCsv = [
       "代码,名称,持有数量,平均成本价,现价,币种",
       "US.AAPL,Apple Inc,10,180.00,200.00,美元",
@@ -373,9 +373,25 @@ describe("C5: Multi-currency Fail-Safe isolation in PortfolioPage", () => {
     expect(screen.getByTestId("multi-currency-notice")).toBeInTheDocument();
     expect(screen.getByTestId("currency-summary-USD")).toBeInTheDocument();
     expect(screen.getByTestId("currency-summary-HKD")).toBeInTheDocument();
-    expect(screen.getByTestId("allocation-multi-currency-notice")).toBeInTheDocument();
-    expect(screen.getByTestId("rebalance-multi-currency-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("allocation-bucket-isolation-badge")).toBeInTheDocument();
+    expect(screen.getByTestId("rebalance-bucket-isolation-badge")).toBeInTheDocument();
     expect(screen.getByTestId("portfolio-local-baseline")).toBeInTheDocument();
+
+    // USD bucket must contain only AAPL (never blended with HKD 00700.HK)
+    fireEvent.click(screen.getByTestId("allocation-bucket-tab-USD"));
+    expect(screen.getByTestId("portfolio-allocation-donut")).toHaveAttribute("data-currency", "USD");
+    expect(screen.getByTestId("portfolio-allocation-list")).toHaveTextContent("AAPL");
+    expect(screen.getByTestId("portfolio-allocation-list")).not.toHaveTextContent("00700.HK");
+    expect(screen.getByTestId("rebalance-row-AAPL")).toBeInTheDocument();
+    expect(screen.queryByTestId("rebalance-row-00700.HK")).not.toBeInTheDocument();
+
+    // HKD bucket must contain only 00700.HK (never blended with USD AAPL)
+    fireEvent.click(screen.getByTestId("rebalance-bucket-tab-HKD"));
+    expect(screen.getByTestId("portfolio-allocation-donut")).toHaveAttribute("data-currency", "HKD");
+    expect(screen.getByTestId("portfolio-allocation-list")).toHaveTextContent("00700.HK");
+    expect(screen.getByTestId("portfolio-allocation-list")).not.toHaveTextContent("AAPL");
+    expect(screen.getByTestId("rebalance-row-00700.HK")).toBeInTheDocument();
+    expect(screen.queryByTestId("rebalance-row-AAPL")).not.toBeInTheDocument();
   });
 });
 

@@ -3,8 +3,28 @@ import type { Copy } from "../i18n";
 import { formatCurrency, formatSignedCurrency, formatSignedPercent } from "../formatters";
 import type { Language, PortfolioMockData } from "../types";
 import type { AppRoute } from "../navigation";
+import type { BrokerAccountProfile } from "../domain/accounts";
+import { ALL_ACCOUNTS_ID } from "../domain/accounts";
+import type { BenchmarkSeriesRecord, NavSnapshotRecord } from "../domain/nav";
 import { Icon } from "./Icons";
 import { PortfolioChart } from "./PortfolioChart";
+import { RealNavChart } from "./RealNavChart";
+
+export interface LocalDashboardNavProps {
+  accounts: readonly BrokerAccountProfile[];
+  selectedAccountId: string;
+  onSelectAccount: (accountId: string) => void;
+  availableCurrencies: readonly string[];
+  activeCurrency: string;
+  onSelectCurrency: (currency: string) => void;
+  snapshots: readonly NavSnapshotRecord[];
+  selectedBenchmark: string | null;
+  benchmarkSeries: BenchmarkSeriesRecord | null;
+  benchmarkLoading: boolean;
+  benchmarkNotice: string | null;
+  onSelectBenchmark: (symbol: string | null) => void;
+  onRefreshBenchmark: (symbol: string) => void;
+}
 
 interface PortfolioHeroProps {
   copy: Copy;
@@ -12,14 +32,21 @@ interface PortfolioHeroProps {
   data: PortfolioMockData;
   onNavigate: (route: AppRoute) => void;
   onSearch: () => void;
+  localNav?: LocalDashboardNavProps;
 }
 
-export function PortfolioHero({ copy, language, data, onNavigate, onSearch }: PortfolioHeroProps) {
+export function PortfolioHero({ copy, language, data, onNavigate, onSearch, localNav }: PortfolioHeroProps) {
   const [valueVisible, setValueVisible] = useState(true);
   const chinese = language === "zh";
   const isLocalMode = data.workspaceMode === "local-csv";
   const isMultiCurrency = Boolean(data.isMultiCurrency);
   const displayCurrency = data.currency && data.currency !== "MULTI" ? data.currency : "USD";
+  const activeNavCurrency = localNav?.activeCurrency ?? displayCurrency;
+  const selectedAccountName = localNav
+    ? (localNav.selectedAccountId === ALL_ACCOUNTS_ID
+      ? (chinese ? "全部账户汇总" : "All Accounts")
+      : (localNav.accounts.find((a) => a.id === localNav.selectedAccountId)?.name ?? localNav.selectedAccountId))
+    : undefined;
 
   return (
     <section className="hero" id="home" aria-labelledby="portfolio-title" data-workspace-mode={data.workspaceMode ?? "mock"}>
@@ -73,9 +100,54 @@ export function PortfolioHero({ copy, language, data, onNavigate, onSearch }: Po
         )}
 
         <div className="account-caption" data-testid="hero-account-caption">
-          <span>{data.accountLabel ?? copy.individualBrokerage}</span>
+          <span>{selectedAccountName ? `${data.accountLabel ?? copy.individualBrokerage} · ${selectedAccountName}` : (data.accountLabel ?? copy.individualBrokerage)}</span>
           <span>{data.asOfLabel ?? copy.updatedJustNow}</span>
         </div>
+
+        {isLocalMode && localNav && (
+          <div className="hero-local-switchers" data-testid="dashboard-account-currency-bar">
+            {localNav.accounts.length > 0 && (
+              <label className="hero-switcher-label">
+                <span>{chinese ? "账户范围" : "Account"}</span>
+                <select
+                  data-testid="dashboard-account-switcher"
+                  value={localNav.selectedAccountId}
+                  onChange={(event) => localNav.onSelectAccount(event.target.value)}
+                >
+                  <option value={ALL_ACCOUNTS_ID}>
+                    {chinese ? `全部账户 (${localNav.accounts.length})` : `All Accounts (${localNav.accounts.length})`}
+                  </option>
+                  {localNav.accounts.map((acct) => (
+                    <option key={acct.id} value={acct.id}>
+                      {acct.name} ({acct.baseCurrency})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {localNav.availableCurrencies.length > 1 && (
+              <div
+                className="hero-currency-tabs"
+                role="group"
+                aria-label={chinese ? "净值币种桶" : "NAV currency bucket"}
+                data-testid="dashboard-currency-tabs"
+              >
+                {localNav.availableCurrencies.map((curr) => (
+                  <button
+                    key={curr}
+                    type="button"
+                    className={curr === activeNavCurrency ? "is-active" : undefined}
+                    aria-pressed={curr === activeNavCurrency}
+                    data-testid={`dashboard-currency-tab-${curr}`}
+                    onClick={() => localNav.onSelectCurrency(curr)}
+                  >
+                    {curr}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="quick-actions" aria-label={copy.quickActions}>
           <button
@@ -102,27 +174,23 @@ export function PortfolioHero({ copy, language, data, onNavigate, onSearch }: Po
       </div>
 
       {isLocalMode ? (
-        <div className="hero-local-baseline" data-testid="hero-local-baseline">
-          <p className="hero-local-kicker">
-            {chinese ? "本地持仓模式 (CSV + 纸上模拟)" : "Local Portfolio (CSV + Paper)"}
-          </p>
-          <h2>
-            {isMultiCurrency
-              ? (chinese ? "按币种隔离净值 · 无跨币种混加" : "Currency-isolated baselines · No FX blending")
-              : (chinese ? "仅展示导入基准净值 · 不虚构历史曲线" : "Baseline equity only · No fabricated history curve")}
-          </h2>
-          <p>
-            {chinese
-              ? "当前展示的净值与未实现盈亏全部基于您本地导入的 CSV 持仓与可选只读延迟行情计算，绝不套用虚构演示走势。"
-              : "Equity and P&L reflect your locally imported CSV snapshot and optional read-only delayed quotes. No fictional historical curve is generated."}
-          </p>
-          {!isMultiCurrency && (
-            <div className="hero-local-stat">
-              <span>{copy.allTime}</span>
-              <strong>{formatSignedCurrency(data.allTimeChange, language, displayCurrency)}</strong>
-            </div>
-          )}
-        </div>
+        <RealNavChart
+          copy={copy}
+          language={language}
+          currency={activeNavCurrency}
+          accountId={localNav?.selectedAccountId ?? ALL_ACCOUNTS_ID}
+          accountLabel={selectedAccountName}
+          snapshots={localNav?.snapshots ?? []}
+          selectedBenchmark={localNav?.selectedBenchmark ?? null}
+          benchmarkSeries={localNav?.benchmarkSeries ?? null}
+          benchmarkLoading={localNav?.benchmarkLoading ?? false}
+          benchmarkNotice={localNav?.benchmarkNotice ?? null}
+          onSelectBenchmark={localNav?.onSelectBenchmark ?? (() => undefined)}
+          onRefreshBenchmark={localNav?.onRefreshBenchmark ?? (() => undefined)}
+          allTimeChange={data.allTimeChange}
+          isMultiCurrency={isMultiCurrency}
+          baselineTestId="hero-local-baseline"
+        />
       ) : (
         <PortfolioChart
           copy={copy}

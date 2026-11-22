@@ -112,6 +112,7 @@ export interface BrokerOrderEvent {
 
 export interface BrokerOrder {
   id: string;
+  accountId?: string;
   symbol: BrokerSymbol;
   side: BrokerOrderSide;
   type: BrokerOrderType;

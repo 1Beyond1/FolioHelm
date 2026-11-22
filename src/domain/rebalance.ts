@@ -22,6 +22,7 @@ import {
   decimalToFixed,
   money,
   percent,
+  price as toPrice,
   quantity,
   type DecimalString,
   type Money,
@@ -29,6 +30,8 @@ import {
   type Price,
   type Quantity,
 } from "./decimal";
+import { decimalToMicros, mulDivRoundBigInt } from "./nav";
+import type { BrokerSnapshot } from "./contracts";
 
 export const REBALANCE_CASH_SYMBOL = "CASH";
 
@@ -483,4 +486,236 @@ export function calculateRebalancePlan(input: RebalanceInput): RebalancePlanResu
     totalSellAmount,
     suggestions,
   };
+}
+
+export interface CurrencyBucketAllocationSlice {
+  key: string;
+  label: string;
+  currency: string;
+  valueMicros: string;
+  /** Exact weight in basis points (10_000n = 100.00%). */
+  weightBps: bigint;
+  /** Exact percentage string (e.g. "42.50"). */
+  weightPct: Percent;
+  isCash: boolean;
+  isOther?: boolean;
+  otherCount?: number;
+}
+
+export interface CurrencyBucketAllocationResult {
+  currency: string;
+  totalValueMicros: string;
+  slices: readonly CurrencyBucketAllocationSlice[];
+}
+
+export interface CurrencyBucketView {
+  currency: string;
+  cash: Money;
+  holdingsValue: Money;
+  totalEquity: Money;
+  holdings: readonly RebalanceHoldingInput[];
+}
+
+const WEIGHT_BPS_SCALE = 10_000n;
+
+function formatBpsPercent(bps: bigint): Percent {
+  const clamped = bps < 0n ? 0n : bps;
+  const whole = clamped / 100n;
+  const frac = clamped % 100n;
+  return percent(`${whole.toString()}.${frac.toString().padStart(2, "0")}`);
+}
+
+/**
+ * Pure BigInt (`i128`-equivalent) asset allocation calculator scoped strictly to a
+ * single currency bucket (`USD` / `HKD` / `CNY` ...).
+ *
+ * Strictly rejects any holding whose currency differs from `currency` (no FX blending!).
+ * Top 6 positions + grouped "Other" + Cash reserve (when > 0.05%).
+ */
+export function computeCurrencyBucketAllocation(
+  holdings: readonly RebalanceHoldingInput[],
+  cash: Money,
+  currency: string,
+  labels: { cashLabel: string; otherLabel: string } = { cashLabel: "Cash", otherLabel: "Other" },
+): CurrencyBucketAllocationResult {
+  const targetCurrency = currency.trim().toUpperCase();
+  if (!targetCurrency || targetCurrency === "MULTI") {
+    throw new Error(`Allocation bucket requires a single currency, got: ${currency}`);
+  }
+
+  for (const h of holdings) {
+    const hCurr = (h.currency || targetCurrency).trim().toUpperCase();
+    if (hCurr !== targetCurrency) {
+      throw new Error(
+        `Cross-currency allocation blocked: holding ${h.symbol} (${hCurr}) cannot enter ${targetCurrency} bucket`,
+      );
+    }
+  }
+
+  const cashMicrosRaw = decimalToMicros(cash);
+  const cashMicros = cashMicrosRaw > 0n ? cashMicrosRaw : 0n;
+
+  const positiveHoldings = holdings
+    .map((h) => {
+      const mv = decimalToMicros(h.marketValue);
+      return { symbol: h.symbol, valueMicros: mv > 0n ? mv : 0n };
+    })
+    .filter((item) => item.valueMicros > 0n)
+    .sort((a, b) => (b.valueMicros > a.valueMicros ? 1 : b.valueMicros < a.valueMicros ? -1 : a.symbol.localeCompare(b.symbol)));
+
+  let holdingsSumMicros = 0n;
+  for (const item of positiveHoldings) holdingsSumMicros += item.valueMicros;
+  const totalMicros = holdingsSumMicros + cashMicros;
+
+  if (totalMicros <= 0n || positiveHoldings.length === 0) {
+    return {
+      currency: targetCurrency,
+      totalValueMicros: totalMicros.toString(),
+      slices: [
+        {
+          key: REBALANCE_CASH_SYMBOL,
+          label: labels.cashLabel,
+          currency: targetCurrency,
+          valueMicros: cashMicros.toString(),
+          weightBps: WEIGHT_BPS_SCALE,
+          weightPct: percent("100.00"),
+          isCash: true,
+        },
+      ],
+    };
+  }
+
+  const slices: CurrencyBucketAllocationSlice[] = [];
+  const top = positiveHoldings.slice(0, 6);
+  const rest = positiveHoldings.slice(6);
+
+  for (const item of top) {
+    const bps = mulDivRoundBigInt(item.valueMicros, WEIGHT_BPS_SCALE, totalMicros);
+    if (bps > 0n) {
+      slices.push({
+        key: item.symbol,
+        label: item.symbol,
+        currency: targetCurrency,
+        valueMicros: item.valueMicros.toString(),
+        weightBps: bps,
+        weightPct: formatBpsPercent(bps),
+        isCash: false,
+      });
+    }
+  }
+
+  if (rest.length > 0) {
+    let restMicros = 0n;
+    for (const item of rest) restMicros += item.valueMicros;
+    const restBps = mulDivRoundBigInt(restMicros, WEIGHT_BPS_SCALE, totalMicros);
+    if (restBps > 0n) {
+      slices.push({
+        key: "OTHER",
+        label: `${labels.otherLabel} (${rest.length})`,
+        currency: targetCurrency,
+        valueMicros: restMicros.toString(),
+        weightBps: restBps,
+        weightPct: formatBpsPercent(restBps),
+        isCash: false,
+        isOther: true,
+        otherCount: rest.length,
+      });
+    }
+  }
+
+  const cashBps = mulDivRoundBigInt(cashMicros, WEIGHT_BPS_SCALE, totalMicros);
+  if (cashBps > 5n) {
+    slices.push({
+      key: REBALANCE_CASH_SYMBOL,
+      label: labels.cashLabel,
+      currency: targetCurrency,
+      valueMicros: cashMicros.toString(),
+      weightBps: cashBps,
+      weightPct: formatBpsPercent(cashBps),
+      isCash: true,
+    });
+  }
+
+  return {
+    currency: targetCurrency,
+    totalValueMicros: totalMicros.toString(),
+    slices: slices.length > 0
+      ? slices
+      : [
+          {
+            key: REBALANCE_CASH_SYMBOL,
+            label: labels.cashLabel,
+            currency: targetCurrency,
+            valueMicros: cashMicros.toString(),
+            weightBps: WEIGHT_BPS_SCALE,
+            weightPct: percent("100.00"),
+            isCash: true,
+          },
+        ],
+  };
+}
+
+/**
+ * Extracts strictly currency-isolated buckets (`USD`, `HKD`, `CNY`, ...) from a `BrokerSnapshot`.
+ * Never blends values across currencies.
+ */
+export function extractCurrencyBuckets(
+  snapshot: BrokerSnapshot,
+  language: "en" | "zh" = "en",
+): CurrencyBucketView[] {
+  const breakdowns = snapshot.account.currencyBreakdowns;
+  const fallbackCurrency = snapshot.account.currency && snapshot.account.currency !== "MULTI"
+    ? snapshot.account.currency.toUpperCase()
+    : "USD";
+
+  const currencyOrder = breakdowns && breakdowns.length > 0
+    ? breakdowns.map((b) => b.currency.toUpperCase())
+    : [
+        ...new Set([
+          ...snapshot.holdings.map((h) => (h.currency ?? fallbackCurrency).toUpperCase()),
+          fallbackCurrency,
+        ]),
+      ].sort();
+
+  const cashByCurr = new Map<string, Money>();
+  if (breakdowns && breakdowns.length > 0) {
+    for (const b of breakdowns) {
+      cashByCurr.set(b.currency.toUpperCase(), b.cash);
+    }
+  } else {
+    cashByCurr.set(fallbackCurrency, snapshot.account.cash);
+  }
+
+  return currencyOrder
+    .filter((c) => c && c !== "MULTI")
+    .map((curr) => {
+      const bucketHoldings: RebalanceHoldingInput[] = snapshot.holdings
+        .filter((h) => (h.currency ?? fallbackCurrency).toUpperCase() === curr)
+        .map((holding) => {
+          const quote = snapshot.quotes.find(
+            (q) => q.symbol === holding.symbol && (q.currency ?? "USD").toUpperCase() === curr,
+          ) ?? snapshot.quotes.find((q) => q.symbol === holding.symbol);
+          return {
+            symbol: holding.symbol,
+            company: language === "zh" ? holding.companyZh : holding.companyEn,
+            shares: holding.quantity,
+            price: quote?.price ?? toPrice(holding.averageCost),
+            marketValue: holding.marketValue,
+            currency: curr,
+          };
+        });
+      const cash = cashByCurr.get(curr) ?? ZERO_MONEY;
+      const holdingsValue = bucketHoldings.reduce<Money>(
+        (acc, item) => decimalAdd(acc, item.marketValue) as Money,
+        ZERO_MONEY,
+      );
+      const totalEquity = decimalAdd(holdingsValue, cash) as Money;
+      return {
+        currency: curr,
+        cash,
+        holdingsValue,
+        totalEquity,
+        holdings: bucketHoldings,
+      };
+    });
 }

@@ -1,9 +1,11 @@
 import { readStored, removeStored, writeStored } from "../platform/storage";
+import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "./accounts";
 import { AUTOMATION_CONTROLLER, normalizeAutomationState } from "./automation";
 import type { BrokerOrder, BrokerOrderEvent, WorkspaceMode } from "./contracts";
-import { loadPersistedLocalPortfolio } from "./csvImport";
+import { loadPersistedAccountPortfolios, recordNavSnapshotsForPortfolio } from "./csvImport";
 import { price, quantity } from "./decimal";
 import { MOCK_BROKER } from "./mockBroker";
+import { NAV_STORE } from "./nav";
 import { hydrateCachedPublicQuotes, type PublicQuoteProviderChoice } from "./publicQuotes";
 import {
   invokeVaultLoadPaperOrders,
@@ -161,6 +163,7 @@ function toStoredPaperOrder(workspaceMode: WorkspaceMode, order: BrokerOrder): T
   return {
     id: order.id,
     workspaceMode,
+    accountId: order.accountId ?? DEFAULT_ACCOUNT_ID,
     symbol: order.symbol,
     side: order.side,
     orderType: order.type,
@@ -188,8 +191,12 @@ function fromStoredPaperOrder(raw: TauriStoredPaperOrder): BrokerOrder | null {
     const normalizedCurrency = typeof raw.currency === "string" && raw.currency.trim()
       ? raw.currency.trim().toUpperCase()
       : "USD";
+    const normalizedAccountId = typeof raw.accountId === "string" && raw.accountId.trim()
+      ? raw.accountId.trim()
+      : DEFAULT_ACCOUNT_ID;
     return {
       id: raw.id,
+      accountId: normalizedAccountId,
       symbol: raw.symbol,
       side: raw.side,
       type: raw.orderType,
@@ -262,25 +269,46 @@ export interface VaultHydrationResult {
 }
 
 /**
+ * Synchronously scrubs all sensitive frontend domain memory (portfolios, quotes,
+ * paper orders, automation rules, accounts, NAV snapshots, and benchmark caches).
+ */
+export function purgeAllFrontendSensitiveMemory(): void {
+  MOCK_BROKER.purgeSensitiveMemory();
+  AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+  ACCOUNT_STORE.purgeSensitiveMemory();
+  NAV_STORE.purgeSensitiveMemory();
+}
+
+/**
  * Hydrate the entire workspace from the encrypted SQLite vault on desktop launch,
  * after unlocking a locked session, or after restoring a `.fhvault` backup.
  *
  * Always performs a complete replacement (never a union-merge) so stale pre-restore
- * or pre-lock holdings, paper orders, quotes, or automation rules cannot survive in RAM.
+ * or pre-lock holdings, paper orders, quotes, accounts, NAV snapshots, benchmarks,
+ * or automation rules cannot survive in RAM.
  */
 export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult> {
   if (!isTauriRuntime()) {
     const preferences = await loadWorkspacePreferences();
     MOCK_BROKER.setPublicQuotesEnabled(preferences.publicQuotesEnabled);
-    const persistedPortfolio = await loadPersistedLocalPortfolio().catch(() => null);
-    if (persistedPortfolio) {
-      MOCK_BROKER.applyLocalPortfolioSnapshot(persistedPortfolio, {
+    await Promise.all([
+      ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => []),
+      NAV_STORE.hydrateFromVault().catch(() => {}),
+    ]);
+    const persistedPortfolios = await loadPersistedAccountPortfolios().catch(() => []);
+    if (persistedPortfolios.length > 0) {
+      ACCOUNT_STORE.replaceAll(ACCOUNT_STORE.getAccounts(), persistedPortfolios);
+      MOCK_BROKER.applyAccountPortfolioSnapshots(persistedPortfolios, {
         switchMode: preferences.workspaceMode === "local-csv",
         resetOrders: true,
       });
       const localOrders = await loadPersistedPaperOrders("local-csv");
       MOCK_BROKER.hydratePaperOrders("local-csv", localOrders, { replace: true });
+      for (const snap of persistedPortfolios) {
+        await recordNavSnapshotsForPortfolio(snap, "portfolio-load").catch(() => {});
+      }
     } else {
+      ACCOUNT_STORE.replaceAll(ACCOUNT_STORE.getAccounts(), []);
       MOCK_BROKER.clearLocalPortfolio();
     }
     const storedAutomation = readStored<unknown>("automation", null);
@@ -298,8 +326,7 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
   const status = await invokeVaultStatus();
   if (!status.unlocked) {
     // Fail-Closed: purge any sensitive user data from the JS heap whenever vault is locked.
-    MOCK_BROKER.purgeSensitiveMemory();
-    AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+    purgeAllFrontendSensitiveMemory();
     return { status, preferences: { ...DEFAULT_WORKSPACE_PREFERENCES } };
   }
 
@@ -312,15 +339,26 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
     return 0;
   });
 
-  // Restore persisted local CSV portfolio (or clear stale portfolio if restored backup has none).
-  const persistedPortfolio = await loadPersistedLocalPortfolio().catch(() => null);
-  if (persistedPortfolio) {
+  // Completely replace accounts, NAV snapshots, and cached benchmarks from encrypted SQLite.
+  const [hydratedAccounts] = await Promise.all([
+    ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => ACCOUNT_STORE.getAccounts()),
+    NAV_STORE.hydrateFromVault().catch(() => {}),
+  ]);
+
+  // Restore persisted local CSV portfolios per account (or clear stale portfolios if absent).
+  const persistedPortfolios = await loadPersistedAccountPortfolios().catch(() => []);
+  if (persistedPortfolios.length > 0) {
+    ACCOUNT_STORE.replaceAll(hydratedAccounts, persistedPortfolios);
     const restoreLocalMode = preferences.workspaceMode === "local-csv";
-    MOCK_BROKER.applyLocalPortfolioSnapshot(persistedPortfolio, {
+    MOCK_BROKER.applyAccountPortfolioSnapshots(persistedPortfolios, {
       switchMode: restoreLocalMode,
       resetOrders: true,
     });
+    for (const snap of persistedPortfolios) {
+      await recordNavSnapshotsForPortfolio(snap, "portfolio-load").catch(() => {});
+    }
   } else {
+    ACCOUNT_STORE.replaceAll(hydratedAccounts, []);
     MOCK_BROKER.clearLocalPortfolio();
   }
 

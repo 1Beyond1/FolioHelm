@@ -12,6 +12,11 @@ interface InvestingHeatmapProps {
   netChange: number;
   currency?: string;
   isMultiCurrency?: boolean;
+  localNavSummary?: {
+    snapshotCount: number;
+    hasEnoughPoints: boolean;
+    currency: string;
+  };
 }
 
 const legendLevels: HeatLevel[] = [0, 1, 2, 3, 4];
@@ -41,6 +46,7 @@ export function InvestingHeatmap({
   netChange,
   currency = "USD",
   isMultiCurrency = false,
+  localNavSummary,
 }: InvestingHeatmapProps) {
   const [mode, setMode] = useState<HeatmapMode>("activity");
   const [returnUnit, setReturnUnit] = useState<ReturnUnit>("percent");
@@ -133,6 +139,14 @@ export function InvestingHeatmap({
           <span className="year-label" aria-label={copy.year}>{copy.year}</span>
         </div>
       </div>
+
+      {localNavSummary && !localNavSummary.hasEnoughPoints && (
+        <p className="heatmap-accumulation-notice" role="status" data-testid="heatmap-accumulation-notice">
+          {language === "zh"
+            ? `${localNavSummary.currency} 币种桶已记录 ${localNavSummary.snapshotCount} / 2 个真实净值快照日：积累满 2 个交易日后自动点亮真实日历收益热力图，绝不伪造模拟点。`
+            : `${localNavSummary.currency} bucket: ${localNavSummary.snapshotCount} / 2 real NAV snapshot day(s) recorded. Daily return cells populate automatically once ≥ 2 dates exist — no simulated days are fabricated.`}
+        </p>
+      )}
 
       <div className={`heatmap-frame ${isReturnMode ? "return-mode" : ""}`} data-mode={mode}>
         <div className="month-labels" aria-hidden="true">

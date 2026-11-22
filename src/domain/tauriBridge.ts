@@ -55,7 +55,96 @@ export interface TauriVaultRestoreSummary {
   paperOrderCount: number;
   quoteCount: number;
   settingCount: number;
+  accountCount?: number;
+  navSnapshotCount?: number;
+  benchmarkCount?: number;
   signerPublicKey: string;
+}
+
+export interface TauriStoredAccount {
+  id: string;
+  name: string;
+  broker: string;
+  accountType: string;
+  baseCurrency: string;
+  createdAt: string;
+}
+
+export interface TauriStoredNavSnapshot {
+  date: string;
+  accountId: string;
+  currency: string;
+  netValueMicros: string;
+  cashMicros: string;
+  positionsMicros: string;
+  externalCashFlowMicros: string;
+  source: string;
+  updatedAt: string;
+}
+
+export interface TauriBenchmarkPricePoint {
+  date: string;
+  closeMicros: string;
+}
+
+export interface TauriStoredBenchmarkSeries {
+  symbol: string;
+  currency: string;
+  provider: string;
+  asOfUtc: string;
+  points: TauriBenchmarkPricePoint[];
+}
+
+export interface TauriBenchmarkFetchResponse {
+  series: TauriStoredBenchmarkSeries | null;
+  fromCache: boolean;
+  degradedReason?: string | null;
+  provider: string;
+}
+
+export interface TauriTwrPoint {
+  date: string;
+  netValueMicros: string;
+  cashMicros: string;
+  positionsMicros: string;
+  externalCashFlowMicros: string;
+  dailyPnlMicros: string | null;
+  dailyReturnPct: string | null;
+  cumulativeTwrPct: string;
+  cumulativeFactor: string;
+}
+
+export interface TauriTwrSeries {
+  currency: string;
+  accountId: string;
+  snapshotCount: number;
+  hasEnoughPoints: boolean;
+  cumulativeTwrPct: string | null;
+  cumulativeFactor: string;
+  periodPnlMicros: string;
+  points: TauriTwrPoint[];
+}
+
+export interface TauriBenchmarkTwrPoint {
+  date: string;
+  closeMicros: string;
+  cumulativeTwrPct: string;
+  cumulativeFactor: string;
+}
+
+export interface TauriBenchmarkTwrSeries {
+  symbol: string;
+  currency: string;
+  provider: string;
+  asOfUtc: string;
+  alignedCount: number;
+  cumulativeTwrPct: string | null;
+  points: TauriBenchmarkTwrPoint[];
+}
+
+export interface TauriNavAnalyticsResponse {
+  portfolio: TauriTwrSeries;
+  benchmark: TauriBenchmarkTwrSeries | null;
 }
 
 export interface TauriStoredPaperOrderEvent {
@@ -68,6 +157,7 @@ export interface TauriStoredPaperOrderEvent {
 export interface TauriStoredPaperOrder {
   id: string;
   workspaceMode: "mock" | "local-csv";
+  accountId?: string;
   symbol: string;
   side: "buy" | "sell";
   orderType: "market" | "limit";
@@ -102,6 +192,7 @@ export interface TauriStoredPortfolioTransaction {
 
 export interface TauriStoredPortfolioSnapshot {
   id: string;
+  accountId?: string;
   fingerprint: string;
   sourceFormat: string;
   sourceLabel: string;
@@ -252,6 +343,22 @@ export function invokeVaultLoadPortfolio(): Promise<TauriStoredPortfolioSnapshot
   return invoke<TauriStoredPortfolioSnapshot | null>("vault_load_portfolio");
 }
 
+export function invokeVaultLoadAccountPortfolios(): Promise<TauriStoredPortfolioSnapshot[] | null> {
+  return invoke<TauriStoredPortfolioSnapshot[] | null>("vault_load_account_portfolios");
+}
+
+export function invokeVaultListAccounts(): Promise<TauriStoredAccount[] | null> {
+  return invoke<TauriStoredAccount[] | null>("vault_list_accounts");
+}
+
+export function invokeVaultSaveAccount(account: TauriStoredAccount): Promise<TauriStoredAccount> {
+  return invoke<TauriStoredAccount>("vault_save_account", { account });
+}
+
+export function invokeVaultDeleteAccount(accountId: string): Promise<boolean> {
+  return invoke<boolean>("vault_delete_account", { accountId });
+}
+
 export function invokeVaultClearPortfolio(): Promise<boolean> {
   return invoke<boolean>("vault_clear_portfolio");
 }
@@ -281,15 +388,57 @@ export function invokeVaultLoadSetting(key: string): Promise<string | null> {
 export function invokeCsvPreviewImport(
   rawCsv: string,
   sourceLabel: string,
+  accountId?: string,
+  accountLabel?: string,
 ): Promise<TauriCsvImportPreview> {
-  return invoke<TauriCsvImportPreview>("csv_preview_import", { rawCsv, sourceLabel });
+  const payload: Record<string, unknown> = { rawCsv, sourceLabel };
+  if (accountId !== undefined) payload.accountId = accountId;
+  if (accountLabel !== undefined) payload.accountLabel = accountLabel;
+  return invoke<TauriCsvImportPreview>("csv_preview_import", payload);
 }
 
 export function invokeCsvCommitImport(
   rawCsv: string,
   sourceLabel: string,
+  accountId?: string,
+  accountLabel?: string,
 ): Promise<TauriCsvCommitResult> {
-  return invoke<TauriCsvCommitResult>("csv_commit_import", { rawCsv, sourceLabel });
+  const payload: Record<string, unknown> = { rawCsv, sourceLabel };
+  if (accountId !== undefined) payload.accountId = accountId;
+  if (accountLabel !== undefined) payload.accountLabel = accountLabel;
+  return invoke<TauriCsvCommitResult>("csv_commit_import", payload);
+}
+
+export function invokeNavUpsertSnapshots(
+  snapshots: TauriStoredNavSnapshot[],
+  preserveExistingCf = true,
+): Promise<TauriStoredNavSnapshot[]> {
+  return invoke<TauriStoredNavSnapshot[]>("nav_upsert_snapshots", {
+    snapshots,
+    preserveExistingCf,
+  });
+}
+
+export function invokeNavListSnapshots(
+  accountId?: string,
+  currency?: string,
+): Promise<TauriStoredNavSnapshot[] | null> {
+  return invoke<TauriStoredNavSnapshot[] | null>("nav_list_snapshots", {
+    accountId: accountId ?? null,
+    currency: currency ?? null,
+  });
+}
+
+export function invokeNavComputeTwr(
+  currency: string,
+  accountId?: string,
+  benchmarkSymbol?: string,
+): Promise<TauriNavAnalyticsResponse> {
+  return invoke<TauriNavAnalyticsResponse>("nav_compute_twr", {
+    accountId: accountId ?? null,
+    currency,
+    benchmarkSymbol: benchmarkSymbol ?? null,
+  });
 }
 
 export function invokeQuotesFetchPublic(
@@ -301,6 +450,21 @@ export function invokeQuotesFetchPublic(
 
 export function invokeQuotesLoadCached(): Promise<TauriPublicQuote[]> {
   return invoke<TauriPublicQuote[]>("quotes_load_cached");
+}
+
+export function invokeBenchmarkFetchHistory(
+  symbol: string,
+  provider: "yahoo" | "stooq" = "stooq",
+): Promise<TauriBenchmarkFetchResponse> {
+  return invoke<TauriBenchmarkFetchResponse>("benchmark_fetch_history", { symbol, provider });
+}
+
+export function invokeBenchmarkLoadCached(
+  symbol?: string,
+): Promise<TauriStoredBenchmarkSeries[] | null> {
+  return invoke<TauriStoredBenchmarkSeries[] | null>("benchmark_load_cached", {
+    symbol: symbol ?? null,
+  });
 }
 
 export function invokeDialogOpenCsvFile(): Promise<TauriOpenedTextFile | null> {

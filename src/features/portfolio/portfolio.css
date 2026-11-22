@@ -1137,3 +1137,146 @@
   font-size: 11px;
   line-height: 1.45;
 }
+
+.fh-account-switcher-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fh-muted);
+}
+
+.fh-account-switcher {
+  padding: 6px 12px;
+  border: 1px solid var(--fh-line-strong);
+  border-radius: 999px;
+  background: var(--fh-surface-raised);
+  color: var(--fh-text);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.fh-bucket-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.fh-bucket-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--fh-line);
+  border-radius: 999px;
+  background: var(--fh-surface-soft);
+}
+
+.fh-bucket-tab {
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fh-muted-strong);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.fh-bucket-tab.is-active {
+  background: var(--fh-lime);
+  color: var(--fh-ink);
+}
+
+.fh-bucket-isolation-note {
+  margin: 10px 0 0;
+  padding: 7px 11px;
+  border: 1px solid var(--fh-line);
+  border-radius: 10px;
+  background: var(--fh-surface-soft);
+  color: var(--fh-muted-strong);
+  font-size: 11px;
+}
+
+.fh-rebalance-panel .fh-bucket-isolation-note {
+  margin: 0 24px 12px;
+}
+
+.fh-csv-account-section {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--fh-line);
+  border-radius: 14px;
+  background: var(--fh-surface-soft);
+}
+
+.fh-csv-account-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.fh-csv-account-select-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fh-muted-strong);
+}
+
+.fh-csv-account-select-wrap select {
+  padding: 6px 10px;
+  border: 1px solid var(--fh-line-strong);
+  border-radius: 8px;
+  background: var(--fh-surface);
+  color: var(--fh-text);
+  font-size: 12px;
+}
+
+.fh-csv-new-account-form {
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--fh-line);
+}
+
+.fh-csv-preset-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fh-csv-preset-chip {
+  padding: 4px 9px;
+  border: 1px solid var(--fh-line-strong);
+  border-radius: 999px;
+  background: var(--fh-surface);
+  color: var(--fh-muted-strong);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.fh-csv-preset-chip:hover {
+  border-color: var(--fh-lime);
+  color: var(--fh-text);
+}
+
+.fh-csv-new-account-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.fh-csv-new-account-grid input,
+.fh-csv-new-account-grid select {
+  padding: 7px 10px;
+  border: 1px solid var(--fh-line-strong);
+  border-radius: 8px;
+  background: var(--fh-surface);
+  color: var(--fh-text);
+  font-size: 12px;
+}
