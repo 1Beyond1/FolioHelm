@@ -259,42 +259,75 @@ export interface VaultHydrationResult {
 /**
  * Hydrate the entire workspace from the encrypted SQLite vault on desktop launch,
  * after unlocking a locked session, or after restoring a `.fhvault` backup.
+ *
+ * Always performs a complete replacement (never a union-merge) so stale pre-restore
+ * or pre-lock holdings, paper orders, quotes, or automation rules cannot survive in RAM.
  */
 export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult> {
   if (!isTauriRuntime()) {
     const preferences = await loadWorkspacePreferences();
+    MOCK_BROKER.setPublicQuotesEnabled(preferences.publicQuotesEnabled);
+    const persistedPortfolio = await loadPersistedLocalPortfolio().catch(() => null);
+    if (persistedPortfolio) {
+      MOCK_BROKER.applyLocalPortfolioSnapshot(persistedPortfolio, {
+        switchMode: preferences.workspaceMode === "local-csv",
+        resetOrders: true,
+      });
+      const localOrders = await loadPersistedPaperOrders("local-csv");
+      MOCK_BROKER.hydratePaperOrders("local-csv", localOrders, { replace: true });
+    } else {
+      MOCK_BROKER.clearLocalPortfolio();
+    }
+    const storedAutomation = readStored<unknown>("automation", null);
+    if (storedAutomation !== null) {
+      AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(storedAutomation));
+    } else {
+      AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(VAULT_HYDRATED_EVENT, { detail: { status: null, preferences } }));
+    }
     return { status: null, preferences };
   }
 
   const status = await invokeVaultStatus();
   if (!status.unlocked) {
+    // Fail-Closed: purge any sensitive user data from the JS heap whenever vault is locked.
+    MOCK_BROKER.purgeSensitiveMemory();
+    AUTOMATION_CONTROLLER.purgeSensitiveMemory();
     return { status, preferences: { ...DEFAULT_WORKSPACE_PREFERENCES } };
   }
 
   const preferences = await loadWorkspacePreferences();
 
-  // Restore public quote opt-in preference and hydrate encrypted quote cache first.
+  // Restore public quote opt-in preference and completely replace encrypted quote cache first.
   MOCK_BROKER.setPublicQuotesEnabled(preferences.publicQuotesEnabled);
-  await hydrateCachedPublicQuotes().catch(() => 0);
+  await hydrateCachedPublicQuotes().catch(() => {
+    MOCK_BROKER.replacePublicQuotes([]);
+    return 0;
+  });
 
-  // Restore persisted local CSV portfolio and honor user's saved workspace mode.
+  // Restore persisted local CSV portfolio (or clear stale portfolio if restored backup has none).
   const persistedPortfolio = await loadPersistedLocalPortfolio().catch(() => null);
   if (persistedPortfolio) {
     const restoreLocalMode = preferences.workspaceMode === "local-csv";
-    MOCK_BROKER.applyLocalPortfolioSnapshot(persistedPortfolio, { switchMode: restoreLocalMode });
-  } else if (preferences.workspaceMode === "mock") {
-    MOCK_BROKER.setWorkspaceMode("mock");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(persistedPortfolio, {
+      switchMode: restoreLocalMode,
+      resetOrders: true,
+    });
+  } else {
+    MOCK_BROKER.clearLocalPortfolio();
   }
 
-  // Hydrate persisted paper orders for both isolated ledgers.
+  // Completely replace persisted paper orders for both isolated ledgers (never union-merge).
   const [localOrders, mockOrders] = await Promise.all([
     loadPersistedPaperOrders("local-csv"),
     loadPersistedPaperOrders("mock"),
   ]);
-  if (localOrders.length > 0) MOCK_BROKER.hydratePaperOrders("local-csv", localOrders);
-  if (mockOrders.length > 0) MOCK_BROKER.hydratePaperOrders("mock", mockOrders);
+  MOCK_BROKER.hydratePaperOrders("local-csv", localOrders, { replace: true });
+  MOCK_BROKER.hydratePaperOrders("mock", mockOrders, { replace: true });
 
-  // Hydrate encrypted automation policy & run logs.
+  // Completely replace encrypted automation policy & run logs (reset to defaults if absent).
   const storedAutomation = await loadEncryptedSetting<unknown>(
     AUTOMATION_SETTING_KEY,
     null,
@@ -302,6 +335,8 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
   );
   if (storedAutomation !== null) {
     AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(storedAutomation));
+  } else {
+    AUTOMATION_CONTROLLER.purgeSensitiveMemory();
   }
 
   if (typeof window !== "undefined") {

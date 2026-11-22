@@ -236,6 +236,15 @@ export class AutomationController {
     this.notify();
   }
 
+  /**
+   * Immediately clears sensitive automation policies, allowlists, and run logs
+   * from the frontend JS heap when the session is locked or reset.
+   */
+  purgeSensitiveMemory(): void {
+    this.state = cloneState(DEFAULT_AUTOMATION_STATE);
+    this.notify();
+  }
+
   updateState(patch: Partial<AutomationState>): AutomationState {
     this.state = normalizeAutomationState({ ...this.state, ...patch });
     this.notify();

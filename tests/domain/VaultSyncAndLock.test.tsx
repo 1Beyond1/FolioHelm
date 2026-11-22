@@ -12,10 +12,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { App } from "../../src/App";
+import { LockScreen } from "../../src/components/LockScreen";
 import { PortfolioHero } from "../../src/components/PortfolioHero";
 import { SearchPalette } from "../../src/components/SearchPalette";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../src/domain/automation";
-import { commitBrokerCsv } from "../../src/domain/csvImport";
+import { commitBrokerCsv, parseCsvLocally } from "../../src/domain/csvImport";
 import {
   clearEvidence,
   importEvidence,
@@ -540,5 +541,236 @@ describe("C4: PortfolioPage target allocation & read-only rebalance calculator U
 
     // Explicitly verify NO batch execution control exists in the rebalance panel
     expect(panel.textContent).not.toMatch(/execute all|batch submit|一键批量下单/i);
+  });
+});
+
+describe("Stage 4 Security Core: Heap purge on lock, sleep/wake idle lock, full restore replacement, and LockScreen/vaultErrorLocked hardening", () => {
+  it("purges MOCK_BROKER & AUTOMATION_CONTROLLER JS heap and sanitizes document.title to 'FolioHelm — Locked' on lock, then rehydrates on unlock", async () => {
+    const committed = await commitBrokerCsv(LOCAL_NON_DEMO_CSV, "secret-holdings.csv");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(committed.snapshot, { switchMode: true });
+    AUTOMATION_CONTROLLER.updateState({ enabled: true, strategyName: "Private Strategy" });
+    writeStored(WORKSPACE_PREFS_KEY, {
+      workspaceMode: "local-csv",
+      publicQuotesEnabled: false,
+      quoteProvider: "stooq",
+      idleLockMinutes: 15,
+    });
+    window.location.hash = "#/instrument/VOO";
+
+    render(<App />);
+    expect(MOCK_BROKER.hasLocalPortfolio()).toBe(true);
+    expect(document.title).toContain("VOO");
+
+    fireEvent.click(screen.getByTestId("topbar-lock-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("app-lock-screen")).toBeInTheDocument();
+    });
+
+    // Heap & window title MUST be completely scrubbed while locked
+    expect(document.title).toBe("FolioHelm — Locked");
+    expect(MOCK_BROKER.hasLocalPortfolio()).toBe(false);
+    expect(MOCK_BROKER.getWorkspaceMode()).toBe("mock");
+    expect(AUTOMATION_CONTROLLER.getState().enabled).toBe(false);
+    expect(AUTOMATION_CONTROLLER.getState().strategyName).toBe(DEFAULT_AUTOMATION_STATE.strategyName);
+
+    // Unlock re-hydrates persisted local portfolio cleanly
+    fireEvent.click(screen.getByTestId("app-lock-unlock-button"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("app-lock-screen")).not.toBeInTheDocument();
+      expect(MOCK_BROKER.hasLocalPortfolio()).toBe(true);
+    });
+    expect(document.title).toContain("VOO");
+  });
+
+  it("enforces wall-clock idle auto-lock across OS sleep/wake (focus/visibilitychange/activity never bypass deadline)", async () => {
+    writeStored(WORKSPACE_PREFS_KEY, {
+      workspaceMode: "mock",
+      publicQuotesEnabled: false,
+      quoteProvider: "stooq",
+      idleLockMinutes: 1,
+    });
+    vi.useFakeTimers();
+    const t0 = new Date("2026-11-22T10:00:00.000Z");
+    vi.setSystemTime(t0);
+
+    render(<App />);
+    expect(screen.getByTestId("home-page")).toBeInTheDocument();
+
+    // Simulate laptop sleeping 5 minutes WITHOUT firing timers, then waking with focus event
+    vi.setSystemTime(new Date(t0.getTime() + 5 * 60_000));
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("app-lock-screen")).toBeInTheDocument();
+    expect(document.title).toBe("FolioHelm — Locked");
+  });
+
+  it("replaces (never union-merges) frontend holdings, orders, quotes, and automation on .fhvault restore and refreshes SettingsPage", async () => {
+    tauriMocks.isTauri.mockReturnValue(true);
+
+    // Seed pre-restore stale state in JS RAM
+    const stalePreview = await parseCsvLocally(LOCAL_NON_DEMO_CSV, "pre-restore.csv");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(stalePreview.snapshot, { switchMode: true });
+    MOCK_BROKER.applyPublicQuotes([
+      {
+        symbol: "VOO",
+        price: "999.00",
+        change: "1.00",
+        changePct: "0.10",
+        currency: "USD",
+        asOfUtc: "2026-11-22T01:00:00.000Z",
+        provider: "stooq.com",
+        delayed: true,
+      },
+    ]);
+    MOCK_BROKER.hydratePaperOrders("local-csv", [
+      {
+        id: "PAPER-STALE-999",
+        symbol: "VOO",
+        side: "buy",
+        type: "market",
+        quantity: "1" as never,
+        filledQuantity: "1" as never,
+        limitPrice: null,
+        status: "filled",
+        submittedAt: "2026-11-22T01:00:00.000Z",
+        events: [],
+      },
+    ]);
+    AUTOMATION_CONTROLLER.updateState({ enabled: true, strategyName: "Pre-restore strategy" });
+
+    // Restored vault has NO local portfolio, NO paper orders, NO cached quotes, NO automation,
+    // and preferences with quoteProvider = "yahoo" & idleLockMinutes = 30.
+    tauriMocks.invoke.mockImplementation(async (cmd, args) => {
+      switch (cmd) {
+        case "vault_status":
+          return {
+            unlocked: true,
+            lockState: "unlocked",
+            hasLockPassphrase: true,
+            retryAfterSeconds: 0,
+            cipher: "AES-256-GCM",
+            schemaVersion: 1,
+            keyProvider: "os-keyring",
+            signerPublicKey: "restored-pub",
+            evidenceCount: 1,
+            hasLocalPortfolio: false,
+            lockedReason: null,
+          };
+        case "vault_load_setting":
+          if (args?.key === "workspace_preferences") {
+            return JSON.stringify({
+              workspaceMode: "mock",
+              publicQuotesEnabled: false,
+              quoteProvider: "yahoo",
+              idleLockMinutes: 30,
+            });
+          }
+          return null;
+        case "quotes_load_cached":
+          return [];
+        case "vault_load_portfolio":
+          return null;
+        case "vault_load_paper_orders":
+          return [];
+        default:
+          return null;
+      }
+    });
+
+    render(<SettingsPage language="en" onLanguageChange={vi.fn()} />);
+
+    await act(async () => {
+      await hydrateWorkspaceFromVault();
+    });
+
+    // All stale pre-restore data MUST be completely wiped, not merged!
+    expect(MOCK_BROKER.hasLocalPortfolio()).toBe(false);
+    expect(MOCK_BROKER.getWorkspaceMode()).toBe("mock");
+    expect(MOCK_BROKER.getPublicQuoteStatus().cachedCount).toBe(0);
+    expect(MOCK_BROKER.getSnapshot().orders.some((o) => o.id === "PAPER-STALE-999")).toBe(false);
+    expect(AUTOMATION_CONTROLLER.getState().enabled).toBe(false);
+    expect(AUTOMATION_CONTROLLER.getState().strategyName).toBe(DEFAULT_AUTOMATION_STATE.strategyName);
+
+    // SettingsPage refreshed via VAULT_HYDRATED_EVENT
+    await waitFor(() => {
+      expect(screen.getByLabelText("Public quote source")).toHaveValue("yahoo");
+    });
+  });
+
+  it("resets LockScreen 300s backoff countdown via retryNonce and creates only one interval per countdown", () => {
+    vi.useFakeTimers();
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+
+    const { rerender } = render(
+      <LockScreen
+        language="en"
+        trigger="manual"
+        hasPassphrase
+        lockedAtUtc="2026-11-22T00:00:00.000Z"
+        retryAfterSeconds={300}
+        retryNonce={1}
+        errorMessage={null}
+        unlocking={false}
+        onUnlock={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.getByTestId("app-lock-backoff")).toHaveTextContent("300s");
+    const callsAfterStart = setIntervalSpy.mock.calls.length;
+
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(screen.getByTestId("app-lock-backoff")).toHaveTextContent("295s");
+    // Single interval reused across ticks (no recreation every second)
+    expect(setIntervalSpy.mock.calls.length).toBe(callsAfterStart);
+
+    // Second failure hitting the same 300s cap with incremented retryNonce resets back to 300s
+    rerender(
+      <LockScreen
+        language="en"
+        trigger="manual"
+        hasPassphrase
+        lockedAtUtc="2026-11-22T00:00:00.000Z"
+        retryAfterSeconds={300}
+        retryNonce={2}
+        errorMessage={null}
+        unlocking={false}
+        onUnlock={vi.fn(async () => {})}
+      />,
+    );
+    expect(screen.getByTestId("app-lock-backoff")).toHaveTextContent("300s");
+    setIntervalSpy.mockRestore();
+  });
+
+  it("never lets dismissing a warning banner hide a Fail-Closed vaultErrorLocked alert", async () => {
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.invoke.mockImplementation(async (cmd) => {
+      if (cmd === "vault_status") {
+        return {
+          unlocked: false,
+          lockState: "locked",
+          hasLockPassphrase: false,
+          retryAfterSeconds: 0,
+          cipher: "AES-256-GCM",
+          schemaVersion: 1,
+          keyProvider: "os-keyring",
+          signerPublicKey: null,
+          evidenceCount: 0,
+          hasLocalPortfolio: false,
+          lockedReason: "OS keyring key missing for existing vault",
+        };
+      }
+      return null;
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/OS keyring key missing/i);
+    });
+    expect(screen.queryByRole("button", { name: /dismiss/i })).not.toBeInTheDocument();
   });
 });

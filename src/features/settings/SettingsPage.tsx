@@ -38,7 +38,9 @@ import {
   PROTECTIONS_SETTING_KEY,
   saveEncryptedSetting,
   saveWorkspacePreferences,
+  VAULT_HYDRATED_EVENT,
   WORKSPACE_PREFS_KEY,
+  type VaultHydrationResult,
 } from "../../domain/vaultStorage";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "../../domain/mockBroker";
 import { AUTOMATION_CONTROLLER, DEFAULT_AUTOMATION_STATE } from "../../domain/automation";
@@ -346,15 +348,23 @@ export function SettingsPage({
   const copy = COPY[language];
   const chinese = language === "zh";
   const definitions = getProtectionDefinitions(language);
+  const [localIdleMinutes, setLocalIdleMinutes] = useState<number>(() =>
+    !isTauriRuntime() && !onIdleLockMinutesChange
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
+      : idleLockMinutes,
+  );
   const [protections, setProtections] = useState<Record<ProtectionKey, boolean>>(() => {
     const rawStored = !isTauriRuntime() ? readStored<unknown>("protections", {}) : {};
     const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
       ? rawStored as Partial<Record<ProtectionKey, boolean>>
       : {};
+    const effectiveIdle = !isTauriRuntime() && !onIdleLockMinutesChange
+      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
+      : idleLockMinutes;
     return {
       maxOrderValue: storedBoolean(stored.maxOrderValue, INITIAL_PROTECTIONS.maxOrderValue),
       priceDeviation: storedBoolean(stored.priceDeviation, INITIAL_PROTECTIONS.priceDeviation),
-      autoLock: storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock),
+      autoLock: effectiveIdle > 0 && storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock),
       accountAllowlist: storedBoolean(stored.accountAllowlist, INITIAL_PROTECTIONS.accountAllowlist),
     };
   });
@@ -378,11 +388,6 @@ export function SettingsPage({
   );
   const [quoteRefreshing, setQuoteRefreshing] = useState(false);
   const [quoteStatusMessage, setQuoteStatusMessage] = useState<string | null>(null);
-  const [localIdleMinutes, setLocalIdleMinutes] = useState<number>(() =>
-    !isTauriRuntime() && !onIdleLockMinutesChange
-      ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
-      : idleLockMinutes,
-  );
 
   // C2: .fhvault encrypted backup & restore modal state
   const [backupModalMode, setBackupModalMode] = useState<"export" | "restore" | null>(null);
@@ -403,7 +408,7 @@ export function SettingsPage({
   const [lockPassMessage, setLockPassMessage] = useState<string | null>(null);
   const [lockPassError, setLockPassError] = useState<string | null>(null);
 
-  const protectionsHydratedRef = useRef(!isTauriRuntime());
+  const lastNonZeroIdleMinutesRef = useRef<number>(localIdleMinutes > 0 ? localIdleMinutes : 15);
   const importInputRef = useRef<HTMLInputElement>(null);
   const fhvaultInputRef = useRef<HTMLInputElement>(null);
   const riskScrollRef = useRef<HTMLDivElement>(null);
@@ -415,54 +420,91 @@ export function SettingsPage({
     || backupModalMode !== null
     || lockPassModalOpen;
 
+  function persistProtections(next: Record<ProtectionKey, boolean>): void {
+    void saveEncryptedSetting(PROTECTIONS_SETTING_KEY, next, "protections");
+  }
+
   useEffect(() => {
     setLocalIdleMinutes(idleLockMinutes);
+    if (idleLockMinutes > 0) {
+      lastNonZeroIdleMinutesRef.current = idleLockMinutes;
+    }
+    setProtections((current) => {
+      const nextAutoLock = idleLockMinutes > 0;
+      return current.autoLock === nextAutoLock ? current : { ...current, autoLock: nextAutoLock };
+    });
   }, [idleLockMinutes]);
 
   useEffect(() => {
-    if (!isTauriRuntime()) return undefined;
     let active = true;
-    void loadWorkspacePreferences()
-      .then((prefs) => {
-        if (!active) return;
-        setQuoteProvider(prefs.quoteProvider);
-        if (!onIdleLockMinutesChange) setLocalIdleMinutes(prefs.idleLockMinutes);
-      })
-      .catch(() => undefined);
 
-    void invokeVaultStatus()
-      .then((status) => {
-        if (active) setVaultStatus(status);
-      })
-      .catch(() => undefined);
-
-    void loadEncryptedSetting<unknown>(PROTECTIONS_SETTING_KEY, {}, "protections")
-      .then((rawStored) => {
+    const loadVaultProtections = async (idleMinutesOverride?: number) => {
+      try {
+        const rawStored = await loadEncryptedSetting<unknown>(PROTECTIONS_SETTING_KEY, {}, "protections");
         if (!active) return;
         const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
           ? rawStored as Partial<Record<ProtectionKey, boolean>>
           : {};
+        const effectiveAutoLock = idleMinutesOverride !== undefined
+          ? idleMinutesOverride > 0
+          : storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock);
         setProtections({
           maxOrderValue: storedBoolean(stored.maxOrderValue, INITIAL_PROTECTIONS.maxOrderValue),
           priceDeviation: storedBoolean(stored.priceDeviation, INITIAL_PROTECTIONS.priceDeviation),
-          autoLock: storedBoolean(stored.autoLock, INITIAL_PROTECTIONS.autoLock),
+          autoLock: effectiveAutoLock,
           accountAllowlist: storedBoolean(stored.accountAllowlist, INITIAL_PROTECTIONS.accountAllowlist),
         });
-        protectionsHydratedRef.current = true;
-      })
-      .catch(() => {
-        if (active) protectionsHydratedRef.current = true;
-      });
+      } catch {
+        // Keep current state cleanly if vault is locked or unavailable.
+      }
+    };
 
+    if (isTauriRuntime()) {
+      void loadWorkspacePreferences()
+        .then((prefs) => {
+          if (!active) return;
+          setQuoteProvider(prefs.quoteProvider);
+          setPublicQuotesEnabled(MOCK_BROKER.isPublicQuotesEnabled());
+          if (prefs.idleLockMinutes > 0) {
+            lastNonZeroIdleMinutesRef.current = prefs.idleLockMinutes;
+          }
+          if (!onIdleLockMinutesChange) setLocalIdleMinutes(prefs.idleLockMinutes);
+          void loadVaultProtections(prefs.idleLockMinutes);
+        })
+        .catch(() => {
+          void loadVaultProtections();
+        });
+
+      void invokeVaultStatus()
+        .then((status) => {
+          if (active) setVaultStatus(status);
+        })
+        .catch(() => undefined);
+    }
+
+    const onVaultHydrated = (event: Event) => {
+      const detail = (event as CustomEvent<VaultHydrationResult>).detail;
+      if (!active || !detail) return;
+      if (detail.status) setVaultStatus(detail.status);
+      setPublicQuotesEnabled(MOCK_BROKER.isPublicQuotesEnabled());
+      if (detail.preferences) {
+        setQuoteProvider(detail.preferences.quoteProvider);
+        if (detail.preferences.idleLockMinutes > 0) {
+          lastNonZeroIdleMinutesRef.current = detail.preferences.idleLockMinutes;
+        }
+        setLocalIdleMinutes(detail.preferences.idleLockMinutes);
+        void loadVaultProtections(detail.preferences.idleLockMinutes);
+      } else {
+        void loadVaultProtections();
+      }
+    };
+
+    window.addEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     return () => {
       active = false;
+      window.removeEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     };
   }, [onIdleLockMinutesChange]);
-
-  useEffect(() => {
-    if (!protectionsHydratedRef.current) return;
-    void saveEncryptedSetting(PROTECTIONS_SETTING_KEY, protections, "protections");
-  }, [protections]);
 
   useEffect(() => {
     onModalStateChange(settingsModalOpen);
@@ -551,6 +593,16 @@ export function SettingsPage({
 
   function handleIdleLockChange(minutes: number): void {
     setLocalIdleMinutes(minutes);
+    if (minutes > 0) {
+      lastNonZeroIdleMinutesRef.current = minutes;
+    }
+    const nextAutoLock = minutes > 0;
+    setProtections((current) => {
+      if (current.autoLock === nextAutoLock) return current;
+      const updated = { ...current, autoLock: nextAutoLock };
+      persistProtections(updated);
+      return updated;
+    });
     onIdleLockMinutesChange?.(minutes);
     void saveWorkspacePreferences({ idleLockMinutes: minutes });
     void appendEvidence("safety_setting_changed", {
@@ -568,9 +620,12 @@ export function SettingsPage({
       if (result.fromCache) {
         setQuoteStatusMessage(copy.publicQuotesFallback(result.degradedReason ?? result.provider));
       } else {
-        setQuoteStatusMessage(
-          copy.publicQuotesUpdated(result.updatedCount, result.provider, result.asOfUtc ?? new Date().toISOString()),
+        const base = copy.publicQuotesUpdated(
+          result.updatedCount,
+          result.provider,
+          result.asOfUtc ?? new Date().toISOString(),
         );
+        setQuoteStatusMessage(result.degradedReason ? `${base} · ${result.degradedReason}` : base);
       }
     } catch (error) {
       setQuoteStatusMessage(copy.publicQuotesFallback(error instanceof Error ? error.message : String(error)));
@@ -804,6 +859,8 @@ export function SettingsPage({
     onThemeChange("system");
     onMockScenarioChange?.("healthy");
     setProtections({ ...INITIAL_PROTECTIONS });
+    setLocalIdleMinutes(DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes);
+    lastNonZeroIdleMinutesRef.current = DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes;
     setPublicQuotesEnabled(false);
     setQuoteStatusMessage(null);
     setExportPathNote(null);
@@ -864,8 +921,18 @@ export function SettingsPage({
       return;
     }
 
-    setProtections((current) => ({ ...current, [key]: true }));
+    const updated = { ...protections, [key]: true };
+    setProtections(updated);
+    persistProtections(updated);
     setWarningKey(null);
+    if (key === "autoLock") {
+      const restoredMinutes = lastNonZeroIdleMinutesRef.current > 0
+        ? lastNonZeroIdleMinutesRef.current
+        : DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes;
+      setLocalIdleMinutes(restoredMinutes);
+      onIdleLockMinutesChange?.(restoredMinutes);
+      void saveWorkspacePreferences({ idleLockMinutes: restoredMinutes });
+    }
     void appendEvidence("safety_setting_changed", {
       mode: MOCK_BROKER.getWorkspaceMode(),
       setting: key,
@@ -887,8 +954,18 @@ export function SettingsPage({
     if (!pendingKey || !canConfirm) return;
 
     const confirmedKey = pendingKey;
-    setProtections((current) => ({ ...current, [confirmedKey]: false }));
+    const updated = { ...protections, [confirmedKey]: false };
+    setProtections(updated);
+    persistProtections(updated);
     setWarningKey(confirmedKey);
+    if (confirmedKey === "autoLock") {
+      if (localIdleMinutes > 0) {
+        lastNonZeroIdleMinutesRef.current = localIdleMinutes;
+      }
+      setLocalIdleMinutes(0);
+      onIdleLockMinutesChange?.(0);
+      void saveWorkspacePreferences({ idleLockMinutes: 0 });
+    }
     handleCancelDisable();
     void appendEvidence("safety_setting_changed", {
       mode: MOCK_BROKER.getWorkspaceMode(),

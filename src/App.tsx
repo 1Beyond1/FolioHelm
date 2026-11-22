@@ -22,6 +22,7 @@ import { TradePage } from "./features/trade";
 import { SettingsPage } from "./features/settings";
 import { AutomationPage } from "./features/automation";
 import { MOCK_BROKER, MOCK_SCENARIOS } from "./domain/mockBroker";
+import { AUTOMATION_CONTROLLER } from "./domain/automation";
 import { appendEvidence } from "./domain/evidenceJournal";
 import {
   DEFAULT_WORKSPACE_PREFERENCES,
@@ -103,6 +104,7 @@ export function App() {
   const [lockedAtUtc, setLockedAtUtc] = useState<string | null>(null);
   const [hasLockPassphrase, setHasLockPassphrase] = useState(false);
   const [retryAfterSeconds, setRetryAfterSeconds] = useState(0);
+  const [retryNonce, setRetryNonce] = useState(0);
   const [lockError, setLockError] = useState<string | null>(null);
   const [unlocking, setUnlocking] = useState(false);
   const [idleLockMinutes, setIdleLockMinutes] = useState<number>(() =>
@@ -112,10 +114,6 @@ export function App() {
   );
   const [, setBrokerRevision] = useState(0);
   const copy = getCopy(language);
-  const mockPortfolio = getMockPortfolio(language);
-  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
-  const publicQuotesEnabled = MOCK_BROKER.isPublicQuotesEnabled();
-  const dataStatus = aggregateDataStatus();
   const navigation: NavigationState = location.route === "trade"
     ? location.background ?? { route: "home" }
     : { route: location.route, symbol: location.symbol };
@@ -169,11 +167,18 @@ export function App() {
             setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
             if (!status.unlocked) {
               if (status.lockState === "user-locked") {
+                MOCK_BROKER.purgeSensitiveMemory();
+                AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+                setTradePrefill(null);
+                setSearchOpen(false);
                 setUserLocked(true);
                 setLockTrigger("manual");
+                setRetryNonce((current) => current + 1);
                 setVaultErrorLocked(false);
                 setVaultLockedReason(null);
               } else {
+                MOCK_BROKER.purgeSensitiveMemory();
+                AUTOMATION_CONTROLLER.purgeSensitiveMemory();
                 setVaultErrorLocked(true);
                 setVaultLockedReason(status.lockedReason ?? null);
               }
@@ -208,25 +213,33 @@ export function App() {
 
   const lockSession = useCallback(async (trigger: "manual" | "idle") => {
     const mode = MOCK_BROKER.getWorkspaceMode();
+    // P0-2 Fail-Closed: immediately wipe all sensitive user portfolio, quote, order,
+    // automation, and draft state from JS memory, sanitize window title, and engage LockScreen
+    // synchronously BEFORE awaiting any IPC or evidence writes.
+    MOCK_BROKER.purgeSensitiveMemory();
+    AUTOMATION_CONTROLLER.purgeSensitiveMemory();
+    setTradePrefill(null);
     setSearchOpen(false);
+    setSettingsModalOpen(false);
     setLockTrigger(trigger);
     setLockedAtUtc(new Date().toISOString());
     setLockError(null);
+    document.title = "FolioHelm — Locked";
+    setUserLocked(true);
     if (isTauriRuntime()) {
       try {
         const status = await invokeVaultLock(trigger, mode);
         setHasLockPassphrase(Boolean(status.hasLockPassphrase));
         setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+        setRetryNonce((current) => current + 1);
       } catch {
-        // Still engage UI lock screen fail-closed if IPC reports already locked.
+        // LockScreen is already engaged fail-closed even if IPC reports already locked or fails.
       }
-      setUserLocked(true);
       return;
     }
-    await appendEvidence("session_locked", { trigger, mode }).catch(() => {});
     setHasLockPassphrase(false);
     setRetryAfterSeconds(0);
-    setUserLocked(true);
+    await appendEvidence("session_locked", { trigger, mode }).catch(() => {});
   }, []);
 
   const lockSessionRef = useRef(lockSession);
@@ -238,6 +251,7 @@ export function App() {
     setUnlocking(true);
     setLockError(null);
     if (!isTauriRuntime()) {
+      await hydrateWorkspaceFromVault().catch(() => {});
       setUserLocked(false);
       setRetryAfterSeconds(0);
       setUnlocking(false);
@@ -249,11 +263,12 @@ export function App() {
       if (status.unlocked) {
         setHasLockPassphrase(Boolean(status.hasLockPassphrase));
         setRetryAfterSeconds(0);
-        setUserLocked(false);
         setLockError(null);
         await hydrateWorkspaceFromVault().catch(() => {});
+        setUserLocked(false);
       } else {
         setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+        setRetryNonce((current) => current + 1);
         setLockError(
           status.lockedReason
             ?? (language === "zh" ? "解锁失败，请重试。" : "Unlock failed. Please try again."),
@@ -272,6 +287,7 @@ export function App() {
         if (match) backoffSeconds = Number(match[1]) || 0;
       }
       setRetryAfterSeconds(backoffSeconds);
+      setRetryNonce((current) => current + 1);
       setLockError(message);
     } finally {
       setUnlocking(false);
@@ -281,26 +297,77 @@ export function App() {
   useEffect(() => {
     if (userLocked || idleLockMinutes <= 0) return undefined;
     const timeoutMs = idleLockMinutes * 60 * 1000;
-    let timer = window.setTimeout(() => {
-      void lockSessionRef.current("idle");
-    }, timeoutMs);
+    let lastActivityAt = Date.now();
+    let locked = false;
 
-    const resetTimer = () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void lockSessionRef.current("idle");
-      }, timeoutMs);
+    const triggerIdleLock = () => {
+      if (locked) return;
+      locked = true;
+      void lockSessionRef.current("idle");
     };
 
-    const events = ["pointerdown", "keydown", "wheel", "focus"] as const;
-    for (const eventName of events) {
-      window.addEventListener(eventName, resetTimer, { passive: true });
-    }
-    return () => {
-      window.clearTimeout(timer);
-      for (const eventName of events) {
-        window.removeEventListener(eventName, resetTimer);
+    const checkIdle = (): boolean => {
+      if (Date.now() - lastActivityAt >= timeoutMs) {
+        triggerIdleLock();
+        return true;
       }
+      return false;
+    };
+
+    let timer = window.setTimeout(() => {
+      if (!checkIdle()) scheduleNext();
+    }, timeoutMs);
+
+    const scheduleNext = () => {
+      window.clearTimeout(timer);
+      if (locked) return;
+      const remaining = Math.max(0, timeoutMs - (Date.now() - lastActivityAt));
+      if (remaining === 0) {
+        triggerIdleLock();
+        return;
+      }
+      timer = window.setTimeout(() => {
+        if (!checkIdle()) scheduleNext();
+      }, remaining);
+    };
+
+    const onActivity = () => {
+      // Check wall-clock elapsed time BEFORE updating lastActivityAt so sleep/wake
+      // or throttled timers can never be bypassed by an immediate click/keypress.
+      if (checkIdle()) return;
+      lastActivityAt = Date.now();
+      scheduleNext();
+    };
+
+    const onFocusOrVisibility = () => {
+      if (document.visibilityState === "hidden") return;
+      // Never reset lastActivityAt on focus or visibilitychange; enforce wall-clock deadline.
+      if (!checkIdle()) {
+        scheduleNext();
+      }
+    };
+
+    const heartbeatMs = Math.min(30_000, Math.max(1_000, Math.floor(timeoutMs / 4)));
+    const heartbeat = window.setInterval(() => {
+      checkIdle();
+    }, heartbeatMs);
+
+    const activityEvents = ["pointerdown", "keydown", "wheel"] as const;
+    for (const eventName of activityEvents) {
+      window.addEventListener(eventName, onActivity, { passive: true });
+    }
+    window.addEventListener("focus", onFocusOrVisibility, { passive: true });
+    document.addEventListener("visibilitychange", onFocusOrVisibility);
+
+    return () => {
+      locked = true;
+      window.clearTimeout(timer);
+      window.clearInterval(heartbeat);
+      for (const eventName of activityEvents) {
+        window.removeEventListener(eventName, onActivity);
+      }
+      window.removeEventListener("focus", onFocusOrVisibility);
+      document.removeEventListener("visibilitychange", onFocusOrVisibility);
     };
   }, [idleLockMinutes, userLocked]);
 
@@ -339,6 +406,10 @@ export function App() {
   }, [navigation.route, navigation.symbol]);
 
   useEffect(() => {
+    if (userLocked) {
+      document.title = "FolioHelm — Locked";
+      return;
+    }
     let pageTitle: string;
     switch (location.route) {
       case "home":
@@ -371,7 +442,7 @@ export function App() {
         pageTitle = copy.home;
     }
     document.title = `FolioHelm — ${pageTitle}`;
-  }, [copy, language, location.route, navigation.symbol]);
+  }, [copy, language, location.route, navigation.symbol, userLocked]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -443,12 +514,18 @@ export function App() {
         hasPassphrase={hasLockPassphrase}
         lockedAtUtc={lockedAtUtc}
         retryAfterSeconds={retryAfterSeconds}
+        retryNonce={retryNonce}
         errorMessage={lockError}
         unlocking={unlocking}
         onUnlock={unlockSession}
       />
     );
   }
+
+  const mockPortfolio = getMockPortfolio(language);
+  const workspaceMode = MOCK_BROKER.getWorkspaceMode();
+  const publicQuotesEnabled = MOCK_BROKER.isPublicQuotesEnabled();
+  const dataStatus = aggregateDataStatus();
 
   const home = (
     <main className="home-page" data-testid="home-page">
@@ -562,11 +639,7 @@ export function App() {
         workspaceMode={workspaceMode}
         publicQuotesEnabled={publicQuotesEnabled}
         persistenceWarning={vaultLockedWarning ?? (storageWarning ? copy.localStorageWarning : undefined)}
-        onDismissPersistenceWarning={() => {
-          setVaultErrorLocked(false);
-          setVaultLockedReason(null);
-          setStorageWarning(false);
-        }}
+        onDismissPersistenceWarning={vaultErrorLocked ? undefined : () => setStorageWarning(false)}
       >
         {dataStatus && <DataStateNotice language={language} status={dataStatus} />}
         {content}

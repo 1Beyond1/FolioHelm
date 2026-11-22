@@ -8,6 +8,7 @@ export interface LockScreenProps {
   hasPassphrase: boolean;
   lockedAtUtc: string | null;
   retryAfterSeconds: number;
+  retryNonce?: number;
   errorMessage: string | null;
   unlocking: boolean;
   onUnlock: (passphrase: string) => Promise<void>;
@@ -50,6 +51,7 @@ export function LockScreen({
   hasPassphrase,
   lockedAtUtc,
   retryAfterSeconds,
+  retryNonce = 0,
   errorMessage,
   unlocking,
   onUnlock,
@@ -60,15 +62,16 @@ export function LockScreen({
 
   useEffect(() => {
     setCountdown(retryAfterSeconds);
-  }, [retryAfterSeconds]);
+  }, [retryAfterSeconds, retryNonce]);
 
+  const isCountingDown = countdown > 0;
   useEffect(() => {
-    if (countdown <= 0) return undefined;
+    if (!isCountingDown) return undefined;
     const timer = window.setInterval(() => {
       setCountdown((current) => (current <= 1 ? 0 : current - 1));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [countdown]);
+  }, [isCountingDown]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();

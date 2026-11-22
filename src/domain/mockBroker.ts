@@ -890,6 +890,31 @@ export class MockBroker implements BrokerAdapter {
     this.notify();
   }
 
+  replacePublicQuotes(updates: readonly PublicQuoteUpdate[], provider?: string): void {
+    this.publicQuotes.clear();
+    let latestTs: string | null = null;
+    for (const item of updates) {
+      this.publicQuotes.set(item.symbol.toUpperCase(), {
+        ...item,
+        symbol: item.symbol.toUpperCase(),
+      });
+      if (!latestTs || item.asOfUtc > latestTs) latestTs = item.asOfUtc;
+    }
+    this.publicQuoteProvider = updates.length > 0
+      ? (provider ?? updates[0]?.provider ?? null)
+      : null;
+    this.publicQuoteLastUpdatedUtc = latestTs;
+
+    if (this.localImported) {
+      this.localSnapshot = buildLocalSnapshotFromCsv(
+        this.localImported,
+        this.localSnapshot?.orders ?? [],
+        this.publicQuotesEnabled && this.publicQuotes.size > 0 ? this.publicQuotes : undefined,
+      );
+    }
+    this.notify();
+  }
+
   setWorkspaceMode(mode: WorkspaceMode): void {
     if (mode === "local-csv" && !this.localSnapshot) return;
     if (this.workspaceMode === mode) return;
@@ -901,7 +926,7 @@ export class MockBroker implements BrokerAdapter {
 
   applyLocalPortfolioSnapshot(
     imported: ImportedPortfolioSnapshot,
-    options: { switchMode?: boolean } = {},
+    options: { switchMode?: boolean; resetOrders?: boolean } = {},
   ): void {
     const currencies = deriveLocalCurrencies(imported);
     const isMultiCurrency = Boolean(imported.isMultiCurrency) || currencies.length > 1;
@@ -919,9 +944,10 @@ export class MockBroker implements BrokerAdapter {
       transactionsCount: imported.transactions.length,
       warnings: [...imported.warnings],
     };
+    const carryOrders = options.resetOrders ? [] : (this.localSnapshot?.orders ?? []);
     this.localSnapshot = buildLocalSnapshotFromCsv(
       imported,
-      this.localSnapshot?.orders ?? [],
+      carryOrders,
       this.publicQuotesEnabled ? this.publicQuotes : undefined,
     );
     if (options.switchMode !== false) {
@@ -932,9 +958,17 @@ export class MockBroker implements BrokerAdapter {
     this.notify();
   }
 
-  hydratePaperOrders(mode: WorkspaceMode, persistedOrders: readonly BrokerOrder[]): void {
-    if (persistedOrders.length === 0) return;
+  hydratePaperOrders(
+    mode: WorkspaceMode,
+    persistedOrders: readonly BrokerOrder[],
+    options: { replace?: boolean } = {},
+  ): void {
+    const replace = options.replace === true;
+    if (!replace && persistedOrders.length === 0) return;
 
+    if (replace) {
+      this.sequence = 0;
+    }
     for (const order of persistedOrders) {
       const match = /^(?:PAPER|MOCK)-ORDER-(\d+)$/.exec(order.id);
       if (match) {
@@ -956,20 +990,53 @@ export class MockBroker implements BrokerAdapter {
 
     if (mode === "local-csv") {
       if (!this.localSnapshot) return;
-      const merged = mergeOrders(this.localSnapshot.orders);
-      this.localSnapshot = {
-        ...this.localSnapshot,
-        orders: merged,
-        ordersFilled: merged.filter((o) => o.status === "filled").length,
-      };
+      const nextOrders = replace
+        ? [...persistedOrders].map(cloneOrder).sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))
+        : mergeOrders(this.localSnapshot.orders);
+      if (this.localImported) {
+        this.localSnapshot = buildLocalSnapshotFromCsv(
+          this.localImported,
+          nextOrders,
+          this.publicQuotesEnabled && this.publicQuotes.size > 0 ? this.publicQuotes : undefined,
+        );
+      } else {
+        this.localSnapshot = {
+          ...this.localSnapshot,
+          orders: nextOrders,
+          ordersFilled: nextOrders.filter((o) => o.status === "filled").length,
+        };
+      }
     } else {
-      const merged = mergeOrders(this.snapshot.orders);
+      // When replacing (e.g. after .fhvault restore), drop all pre-restore mock orders
+      // and keep only the immutable demo baseline plus orders present in the restored vault.
+      const baseOrders = replace ? BASE_SNAPSHOT.orders : this.snapshot.orders;
+      const nextOrders = mergeOrders(baseOrders);
       this.snapshot = {
-        ...this.snapshot,
-        orders: merged,
-        ordersFilled: merged.filter((o) => o.status === "filled").length,
+        ...(replace ? BASE_SNAPSHOT : this.snapshot),
+        orders: nextOrders,
+        ordersFilled: nextOrders.filter((o) => o.status === "filled").length,
       };
     }
+    this.notify();
+  }
+
+  /**
+   * Immediately wipes all sensitive user portfolio, quote cache, order preview, and paper ledger
+   * data from the frontend JavaScript heap (invoked on App Lock and fail-closed vault lock).
+   */
+  purgeSensitiveMemory(): void {
+    this.workspaceMode = "mock";
+    this.snapshot = BASE_SNAPSHOT;
+    this.localImported = null;
+    this.localSnapshot = null;
+    this.localMeta = null;
+    this.publicQuotesEnabled = false;
+    this.publicQuotes.clear();
+    this.publicQuoteProvider = null;
+    this.publicQuoteLastUpdatedUtc = null;
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.sequence = 0;
     this.notify();
   }
 

@@ -390,4 +390,46 @@ describe("SettingsPage", () => {
       clientHeightSpy.mockRestore();
     }
   });
+
+  it("synchronizes the Auto lock switch with idleLockMinutes and never rewrites protections during clearLocalData", async () => {
+    vi.useFakeTimers();
+    const onIdleChange = vi.fn();
+    render(
+      <SettingsPage
+        language="en"
+        onLanguageChange={() => undefined}
+        idleLockMinutes={15}
+        onIdleLockMinutesChange={onIdleChange}
+      />,
+    );
+
+    // Changing idle lock dropdown to 0 (Off) turns Auto lock switch Off
+    const idleSelect = screen.getByTestId("idle-lock-select");
+    fireEvent.change(idleSelect, { target: { value: "0" } });
+    expect(onIdleChange).toHaveBeenLastCalledWith(0);
+    expect(screen.getByRole("switch", { name: /Auto lock: Off/i })).toHaveAttribute("aria-checked", "false");
+
+    // Re-enabling Auto lock switch restores last non-zero timeout (15m)
+    fireEvent.click(screen.getByRole("switch", { name: /Auto lock: Off/i }));
+    expect(onIdleChange).toHaveBeenLastCalledWith(15);
+    expect(screen.getByRole("switch", { name: /Auto lock: On/i })).toHaveAttribute("aria-checked", "true");
+
+    // Disabling Auto lock switch via risk dialog sets idleLockMinutes to 0
+    fireEvent.click(screen.getByRole("switch", { name: /Auto lock: On/i }));
+    fireEvent.click(screen.getByLabelText("I have read the risk details to the bottom."));
+    fireEvent.click(screen.getByTestId("confirm-disable-intent"));
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm disable" }));
+    expect(onIdleChange).toHaveBeenLastCalledWith(0);
+    expect(screen.getByRole("switch", { name: /Auto lock: Off/i })).toHaveAttribute("aria-checked", "false");
+
+    // clearLocalData MUST NOT rewrite protections back to localStorage
+    vi.useRealTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Clear local demo data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear data" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(window.localStorage.getItem(`${STORAGE_PREFIX}protections`)).toBeNull();
+  });
 });

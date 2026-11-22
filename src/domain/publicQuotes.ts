@@ -93,8 +93,7 @@ export async function refreshPublicQuotes(
 export async function hydrateCachedPublicQuotes(): Promise<number> {
   if (!isTauriRuntime()) return 0;
   const cached = await invokeQuotesLoadCached();
-  if (cached.length === 0) return 0;
-  MOCK_BROKER.applyPublicQuotes(
+  MOCK_BROKER.replacePublicQuotes(
     cached.map((item) => ({
       symbol: item.symbol,
       price: item.price,

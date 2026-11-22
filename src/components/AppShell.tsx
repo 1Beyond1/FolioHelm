@@ -61,7 +61,9 @@ export function AppShell({
       {persistenceWarning && (
         <section className="persistence-warning" role="alert">
           <span>{persistenceWarning}</span>
-          <button type="button" onClick={onDismissPersistenceWarning}>{copy.dismiss}</button>
+          {onDismissPersistenceWarning && (
+            <button type="button" onClick={onDismissPersistenceWarning}>{copy.dismiss}</button>
+          )}
         </section>
       )}
       <div className="app-content">{children}</div>
