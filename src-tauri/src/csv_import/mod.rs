@@ -27,7 +27,10 @@ use thiserror::Error;
 
 use crate::{
     evidence::encode_hex,
-    storage::{StoredPortfolioHolding, StoredPortfolioSnapshot, StoredPortfolioTransaction},
+    storage::{
+        StoredPortfolioHolding, StoredPortfolioSnapshot, StoredPortfolioTransaction,
+        DEFAULT_ACCOUNT_ID,
+    },
 };
 
 pub const MAX_CSV_BYTES: usize = 5 * 1024 * 1024;
@@ -413,6 +416,7 @@ pub fn parse_and_preview_csv(
 
     let snapshot = StoredPortfolioSnapshot {
         id: format!("csv-{short_fp}"),
+        account_id: DEFAULT_ACCOUNT_ID.to_string(),
         fingerprint,
         source_format: format.code().to_string(),
         source_label: if safe_source_label.is_empty() {
@@ -444,6 +448,34 @@ pub fn parse_and_preview_csv(
         currency_subtotals,
         snapshot,
     })
+}
+
+/// Scopes a parsed `StoredPortfolioSnapshot` to a specific target account while keeping
+/// the default account's deterministic fingerprint backward-compatible.
+pub fn scope_snapshot_to_account(
+    snapshot: &mut StoredPortfolioSnapshot,
+    account_id: Option<&str>,
+    account_label: Option<&str>,
+) {
+    let target_id = account_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_ACCOUNT_ID);
+    snapshot.account_id = target_id.to_string();
+    if let Some(label) = account_label.map(str::trim).filter(|s| !s.is_empty()) {
+        snapshot.account_label = label.chars().filter(|c| !c.is_control()).take(80).collect();
+    }
+    if target_id != DEFAULT_ACCOUNT_ID {
+        let mut hasher = Sha256::new();
+        hasher.update(b"foliohelm/account-snapshot/v1|");
+        hasher.update(target_id.as_bytes());
+        hasher.update(b"|");
+        hasher.update(snapshot.fingerprint.as_bytes());
+        let scoped_fp = encode_hex(&hasher.finalize());
+        let short_fp = &scoped_fp[..16];
+        snapshot.id = format!("csv-{short_fp}");
+        snapshot.fingerprint = scoped_fp;
+    }
 }
 
 fn compute_currency_subtotals(

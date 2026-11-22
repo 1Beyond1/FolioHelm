@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{NaiveDate, SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ use crate::{
 };
 
 pub const STORAGE_SCHEMA_VERSION: u16 = 1;
+pub const DEFAULT_ACCOUNT_ID: &str = "acct_default";
 const CANARY_PLAINTEXT: &[u8] = b"foliohelm-vault-canary-v1";
 const CANARY_RECORD_ID: &str = "canary";
 const APP_LOCK_VERIFIER_META_KEY: &str = "app_lock_verifier";
@@ -44,6 +45,71 @@ const RESTORE_INTENT_RECORD_ID: &str = "active";
 
 fn default_order_currency() -> String {
     "USD".to_string()
+}
+
+pub fn default_account_id() -> String {
+    DEFAULT_ACCOUNT_ID.to_string()
+}
+
+pub mod i128_string_serde {
+    use std::fmt;
+
+    use serde::{
+        de::{self, Visitor},
+        Deserializer, Serializer,
+    };
+
+    pub fn serialize<S>(value: &i128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct I128Visitor;
+
+        impl Visitor<'_> for I128Visitor {
+            type Value = i128;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a base-10 integer string or integer representing i128")
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(i128::from(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(i128::from(v))
+            }
+
+            fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+
+            fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                i128::try_from(v).map_err(|_| E::custom("u128 out of i128 range"))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                v.trim()
+                    .parse::<i128>()
+                    .map_err(|_| E::custom(format!("invalid i128 string: {v}")))
+            }
+        }
+
+        deserializer.deserialize_any(I128Visitor)
+    }
 }
 
 mod zeroizing_string_serde {
@@ -153,8 +219,71 @@ pub struct StoredPortfolioTransaction {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StoredAccount {
+    pub id: String,
+    pub name: String,
+    pub broker: String,
+    pub account_type: String,
+    pub base_currency: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredNavSnapshot {
+    /// YYYY-MM-DD
+    pub date: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    pub currency: String,
+    #[serde(with = "i128_string_serde")]
+    pub net_value_micros: i128,
+    #[serde(with = "i128_string_serde")]
+    pub cash_micros: i128,
+    #[serde(with = "i128_string_serde")]
+    pub positions_micros: i128,
+    #[serde(default, with = "i128_string_serde")]
+    pub external_cash_flow_micros: i128,
+    pub source: String,
+    pub updated_at: String,
+}
+
+impl StoredNavSnapshot {
+    pub fn record_id(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.date.trim(),
+            self.account_id.trim(),
+            self.currency.trim().to_ascii_uppercase()
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkPricePoint {
+    /// YYYY-MM-DD
+    pub date: String,
+    #[serde(with = "i128_string_serde")]
+    pub close_micros: i128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredBenchmarkSeries {
+    pub symbol: String,
+    pub currency: String,
+    pub provider: String,
+    pub as_of_utc: String,
+    pub points: Vec<BenchmarkPricePoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredPortfolioSnapshot {
     pub id: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
     /// Deterministic SHA-256 hex digest of normalized snapshot content for idempotent imports.
     pub fingerprint: String,
     pub source_format: String,
@@ -199,6 +328,8 @@ pub struct StoredPaperOrderEvent {
 pub struct StoredPaperOrder {
     pub id: String,
     pub workspace_mode: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
     pub symbol: String,
     pub side: String,
     pub order_type: String,
@@ -263,6 +394,12 @@ pub struct VaultBackupPayload {
     pub paper_orders: Vec<StoredPaperOrder>,
     pub quote_cache: Vec<CachedPublicQuote>,
     pub settings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub accounts: Vec<StoredAccount>,
+    #[serde(default)]
+    pub nav_snapshots: Vec<StoredNavSnapshot>,
+    #[serde(default)]
+    pub benchmark_history: Vec<StoredBenchmarkSeries>,
 }
 
 impl fmt::Debug for VaultBackupPayload {
@@ -276,6 +413,9 @@ impl fmt::Debug for VaultBackupPayload {
             .field("paper_orders_len", &self.paper_orders.len())
             .field("quote_cache_len", &self.quote_cache.len())
             .field("settings_len", &self.settings.len())
+            .field("accounts_len", &self.accounts.len())
+            .field("nav_snapshots_len", &self.nav_snapshots.len())
+            .field("benchmark_history_len", &self.benchmark_history.len())
             .finish()
     }
 }
@@ -300,6 +440,12 @@ pub struct VaultRestoreSummaryDto {
     pub paper_order_count: usize,
     pub quote_count: usize,
     pub setting_count: usize,
+    #[serde(default)]
+    pub account_count: usize,
+    #[serde(default)]
+    pub nav_snapshot_count: usize,
+    #[serde(default)]
+    pub benchmark_count: usize,
     pub signer_public_key: String,
 }
 
@@ -471,8 +617,11 @@ impl EncryptedVaultDb {
         if database_exists {
             db.verify_existing_schema_and_canary()?;
             db.migrate_legacy_app_lock_verifier_if_needed()?;
+            ensure_wave2_tables_on_conn(&db.conn)?;
+            db.ensure_default_account_if_missing()?;
         } else {
             db.initialize_schema()?;
+            db.ensure_default_account_if_missing()?;
         }
 
         Ok(db)
@@ -1025,6 +1174,313 @@ impl EncryptedVaultDb {
         Ok(settings)
     }
 
+    /// Ensure at least the default account (`acct_default`) exists so legacy single-account
+    /// snapshots, paper orders, and NAV records smoothly migrate without breaking existing data.
+    pub fn ensure_default_account_if_missing(&mut self) -> Result<(), StorageError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
+        if count > 0 {
+            return Ok(());
+        }
+        let inferred_currency = self
+            .load_latest_portfolio_snapshot()
+            .ok()
+            .flatten()
+            .and_then(|snap| {
+                let c = snap.currency.trim().to_ascii_uppercase();
+                if !c.is_empty() && c != "MULTI" && c.len() >= 3 && c.len() <= 5 {
+                    Some(c)
+                } else {
+                    snap.currencies
+                        .first()
+                        .map(|first| first.trim().to_ascii_uppercase())
+                }
+            })
+            .filter(|c| !c.is_empty() && c != "MULTI")
+            .unwrap_or_else(|| "USD".to_string());
+
+        let default_acct = StoredAccount {
+            id: DEFAULT_ACCOUNT_ID.to_string(),
+            name: "Default Account".to_string(),
+            broker: "Local CSV".to_string(),
+            account_type: "taxable".to_string(),
+            base_currency: inferred_currency,
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        };
+        let _ = self.upsert_account(&default_acct)?;
+        Ok(())
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<StoredAccount>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ciphertext FROM accounts ORDER BY created_at_utc ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            accounts.push(serde_json::from_slice(&plaintext)?);
+        }
+        Ok(accounts)
+    }
+
+    pub fn upsert_account(
+        &mut self,
+        account: &StoredAccount,
+    ) -> Result<StoredAccount, StorageError> {
+        let normalized = validate_and_normalize_account(account)?;
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &normalized.id);
+        let plaintext = serde_json::to_vec(&normalized)?;
+        let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO accounts (id, created_at_utc, ciphertext)
+             VALUES (?1, ?2, ?3)",
+            params![normalized.id, normalized.created_at, ciphertext],
+        )?;
+        tx.commit()?;
+        Ok(normalized)
+    }
+
+    pub fn delete_account(&mut self, account_id: &str) -> Result<bool, StorageError> {
+        let trimmed = account_id.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "account_id must not be empty".to_string(),
+            ));
+        }
+        if trimmed == DEFAULT_ACCOUNT_ID {
+            return Err(StorageError::InvalidInput(
+                "default account cannot be deleted".to_string(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![trimmed])?;
+        tx.execute(
+            "DELETE FROM nav_snapshots WHERE account_id = ?1",
+            params![trimmed],
+        )?;
+        tx.commit()?;
+
+        // Also remove any portfolio snapshots scoped to the deleted account.
+        let all_snaps = self.load_all_portfolio_snapshots()?;
+        let ids_to_remove: Vec<String> = all_snaps
+            .into_iter()
+            .filter(|snap| snap.account_id == trimmed)
+            .map(|snap| snap.id)
+            .collect();
+        if !ids_to_remove.is_empty() {
+            let tx2 = self.conn.transaction()?;
+            for snap_id in ids_to_remove {
+                tx2.execute(
+                    "DELETE FROM portfolio_snapshots WHERE id = ?1",
+                    params![snap_id],
+                )?;
+            }
+            tx2.commit()?;
+        }
+
+        Ok(deleted > 0)
+    }
+
+    /// Returns the most recent `StoredPortfolioSnapshot` for each distinct `account_id`.
+    pub fn load_latest_portfolio_snapshots_per_account(
+        &self,
+    ) -> Result<Vec<StoredPortfolioSnapshot>, StorageError> {
+        let all = self.load_all_portfolio_snapshots()?;
+        let mut latest_by_account: BTreeMap<String, StoredPortfolioSnapshot> = BTreeMap::new();
+        for mut snap in all {
+            if snap.account_id.trim().is_empty() {
+                snap.account_id = DEFAULT_ACCOUNT_ID.to_string();
+            }
+            // `all` is ordered chronologically ASC, so inserting keeps the latest snapshot per account.
+            latest_by_account.insert(snap.account_id.clone(), snap);
+        }
+        Ok(latest_by_account.into_values().collect())
+    }
+
+    pub fn upsert_nav_snapshot(
+        &mut self,
+        snapshot: &StoredNavSnapshot,
+        preserve_existing_cf: bool,
+    ) -> Result<StoredNavSnapshot, StorageError> {
+        let mut normalized = validate_and_normalize_nav_snapshot(snapshot)?;
+        let record_id = normalized.record_id();
+
+        if preserve_existing_cf && normalized.external_cash_flow_micros == 0 {
+            let existing_blob: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT ciphertext FROM nav_snapshots WHERE record_id = ?1",
+                    params![record_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(blob) = existing_blob {
+                let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
+                let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
+                let prev: StoredNavSnapshot = serde_json::from_slice(&plaintext)?;
+                normalized.external_cash_flow_micros = prev.external_cash_flow_micros;
+            }
+        }
+
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
+        let plaintext = serde_json::to_vec(&normalized)?;
+        let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO nav_snapshots
+                (record_id, date, account_id, currency, updated_at_utc, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record_id,
+                normalized.date,
+                normalized.account_id,
+                normalized.currency,
+                normalized.updated_at,
+                ciphertext
+            ],
+        )?;
+        tx.commit()?;
+        Ok(normalized)
+    }
+
+    pub fn load_all_nav_snapshots(&self) -> Result<Vec<StoredNavSnapshot>, StorageError> {
+        self.load_nav_snapshots(None, None)
+    }
+
+    pub fn load_nav_snapshots(
+        &self,
+        account_id: Option<&str>,
+        currency: Option<&str>,
+    ) -> Result<Vec<StoredNavSnapshot>, StorageError> {
+        let acct_filter = account_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("ALL"));
+        let curr_filter = currency
+            .map(|c| c.trim().to_ascii_uppercase())
+            .filter(|c| !c.is_empty() && c != "MULTI");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT record_id, ciphertext FROM nav_snapshots
+             ORDER BY date ASC, account_id ASC, currency ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (record_id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            let item: StoredNavSnapshot = serde_json::from_slice(&plaintext)?;
+            if let Some(target_acct) = acct_filter {
+                if item.account_id != target_acct {
+                    continue;
+                }
+            }
+            if let Some(ref target_curr) = curr_filter {
+                if !item.currency.eq_ignore_ascii_case(target_curr) {
+                    continue;
+                }
+            }
+            out.push(item);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_nav_snapshots(&mut self) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM nav_snapshots", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_benchmark_series(
+        &mut self,
+        series: &StoredBenchmarkSeries,
+    ) -> Result<(), StorageError> {
+        let normalized = validate_and_normalize_benchmark_series(series)?;
+        let aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            "benchmark_history",
+            &normalized.symbol,
+        );
+        let plaintext = serde_json::to_vec(&normalized)?;
+        let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO benchmark_history
+                (symbol, currency, provider, updated_at_utc, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                normalized.symbol,
+                normalized.currency,
+                normalized.provider,
+                normalized.as_of_utc,
+                ciphertext
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_benchmark_series(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<StoredBenchmarkSeries>, StorageError> {
+        let normalized = symbol.trim().to_ascii_uppercase();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let ciphertext: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM benchmark_history WHERE symbol = ?1",
+                params![normalized],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(blob) = ciphertext else {
+            return Ok(None);
+        };
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &normalized);
+        let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
+        Ok(Some(serde_json::from_slice(&plaintext)?))
+    }
+
+    pub fn load_all_benchmark_series(&self) -> Result<Vec<StoredBenchmarkSeries>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT symbol, ciphertext FROM benchmark_history ORDER BY symbol ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (symbol, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &symbol);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            out.push(serde_json::from_slice(&plaintext)?);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_benchmark_series(&mut self) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM benchmark_history", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Export all encrypted tables and the device signing seed into a payload ready for
     /// Argon2id + AES-256-GCM `.fhvault` backup encryption.
     pub fn export_backup_payload(&self) -> Result<VaultBackupPayload, StorageError> {
@@ -1033,6 +1489,9 @@ impl EncryptedVaultDb {
         let paper_orders = self.load_all_paper_orders()?;
         let quote_cache = self.load_quote_cache()?;
         let settings = self.load_all_settings()?;
+        let accounts = self.list_accounts()?;
+        let nav_snapshots = self.load_all_nav_snapshots()?;
+        let benchmark_history = self.load_all_benchmark_series()?;
         let seed_hex = self.keys.device_signing_seed_hex();
 
         Ok(VaultBackupPayload {
@@ -1044,6 +1503,9 @@ impl EncryptedVaultDb {
             paper_orders,
             quote_cache,
             settings,
+            accounts,
+            nav_snapshots,
+            benchmark_history,
         })
     }
 
@@ -1161,6 +1623,45 @@ impl EncryptedVaultDb {
             }
         }
 
+        let mut seen_account_ids = BTreeSet::new();
+        let mut normalized_accounts = Vec::with_capacity(payload.accounts.len());
+        for account in &payload.accounts {
+            let norm = validate_and_normalize_account(account)?;
+            if !seen_account_ids.insert(norm.id.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate account id '{}'",
+                    norm.id
+                )));
+            }
+            normalized_accounts.push(norm);
+        }
+
+        let mut seen_nav_ids = BTreeSet::new();
+        let mut normalized_nav_snapshots = Vec::with_capacity(payload.nav_snapshots.len());
+        for snap in &payload.nav_snapshots {
+            let norm = validate_and_normalize_nav_snapshot(snap)?;
+            let record_id = norm.record_id();
+            if !seen_nav_ids.insert(record_id.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate nav snapshot '{record_id}'"
+                )));
+            }
+            normalized_nav_snapshots.push((record_id, norm));
+        }
+
+        let mut seen_bench_symbols = BTreeSet::new();
+        let mut normalized_benchmarks = Vec::with_capacity(payload.benchmark_history.len());
+        for series in &payload.benchmark_history {
+            let norm = validate_and_normalize_benchmark_series(series)?;
+            if !seen_bench_symbols.insert(norm.symbol.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate benchmark symbol '{}'",
+                    norm.symbol
+                )));
+            }
+            normalized_benchmarks.push(norm);
+        }
+
         // Preserve local device App Lock configuration across backup restore.
         let preserved_verifier = self.load_app_lock_verifier()?;
         let preserved_backoff = self.load_app_lock_backoff()?;
@@ -1233,6 +1734,43 @@ impl EncryptedVaultDb {
             let ciphertext =
                 encrypt_record(self.keys.db_master_key(), &aad, value_json.as_bytes())?;
             encrypted_settings.push((key.clone(), now.clone(), ciphertext));
+        }
+
+        let mut encrypted_accounts = Vec::with_capacity(normalized_accounts.len());
+        for account in &normalized_accounts {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &account.id);
+            let plaintext = serde_json::to_vec(account)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_accounts.push((account.id.clone(), account.created_at.clone(), ciphertext));
+        }
+
+        let mut encrypted_nav_snapshots = Vec::with_capacity(normalized_nav_snapshots.len());
+        for (record_id, snap) in &normalized_nav_snapshots {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", record_id);
+            let plaintext = serde_json::to_vec(snap)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_nav_snapshots.push((
+                record_id.clone(),
+                snap.date.clone(),
+                snap.account_id.clone(),
+                snap.currency.clone(),
+                snap.updated_at.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_benchmarks = Vec::with_capacity(normalized_benchmarks.len());
+        for series in &normalized_benchmarks {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &series.symbol);
+            let plaintext = serde_json::to_vec(series)?;
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_benchmarks.push((
+                series.symbol.clone(),
+                series.currency.clone(),
+                series.provider.clone(),
+                series.as_of_utc.clone(),
+                ciphertext,
+            ));
         }
 
         // Build and verify an independent staging SQLite file in the same directory.
@@ -1321,6 +1859,38 @@ impl EncryptedVaultDb {
                     "INSERT INTO app_settings (setting_key, updated_at_utc, ciphertext)
                      VALUES (?1, ?2, ?3)",
                     params![key, updated_at_utc, ciphertext],
+                )?;
+            }
+            for (id, created_at_utc, ciphertext) in &encrypted_accounts {
+                tx.execute(
+                    "INSERT INTO accounts (id, created_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, created_at_utc, ciphertext],
+                )?;
+            }
+            for (record_id, date, account_id, currency, updated_at_utc, ciphertext) in
+                &encrypted_nav_snapshots
+            {
+                tx.execute(
+                    "INSERT INTO nav_snapshots
+                        (record_id, date, account_id, currency, updated_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        record_id,
+                        date,
+                        account_id,
+                        currency,
+                        updated_at_utc,
+                        ciphertext
+                    ],
+                )?;
+            }
+            for (symbol, currency, provider, updated_at_utc, ciphertext) in &encrypted_benchmarks {
+                tx.execute(
+                    "INSERT INTO benchmark_history
+                        (symbol, currency, provider, updated_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![symbol, currency, provider, updated_at_utc, ciphertext],
                 )?;
             }
             tx.commit()?;
@@ -1467,12 +2037,18 @@ impl EncryptedVaultDb {
         remove_sqlite_files(&staging_path);
         let _ = fs::remove_file(&intent_path);
 
+        // Smoothly guarantee default account exists even when restoring a legacy v1 backup.
+        self.ensure_default_account_if_missing()?;
+
         let summary = VaultRestoreSummaryDto {
             evidence_count: encrypted_evidence.len(),
             portfolio_count: encrypted_portfolios.len(),
             paper_order_count: encrypted_orders.len(),
             quote_count: encrypted_quotes.len(),
             setting_count: encrypted_settings.len(),
+            account_count: encrypted_accounts.len(),
+            nav_snapshot_count: encrypted_nav_snapshots.len(),
+            benchmark_count: encrypted_benchmarks.len(),
             signer_public_key: verified_journal.signer_public_key_hex(),
         };
         Ok((verified_journal, summary))
@@ -1487,9 +2063,236 @@ impl EncryptedVaultDb {
         tx.execute("DELETE FROM paper_orders", [])?;
         tx.execute("DELETE FROM quote_cache", [])?;
         tx.execute("DELETE FROM app_settings", [])?;
+        tx.execute("DELETE FROM accounts", [])?;
+        tx.execute("DELETE FROM nav_snapshots", [])?;
+        tx.execute("DELETE FROM benchmark_history", [])?;
         tx.commit()?;
+        self.ensure_default_account_if_missing()?;
         Ok(())
     }
+}
+
+fn validate_and_normalize_account(account: &StoredAccount) -> Result<StoredAccount, StorageError> {
+    let id = account.id.trim().to_string();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(
+            "account id must be 1..=64 ASCII alphanumeric/underscore/dash characters".to_string(),
+        ));
+    }
+    let name: String = account
+        .name
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect();
+    if name.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "account name must not be empty".to_string(),
+        ));
+    }
+    let broker: String = account
+        .broker
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    let account_type: String = account
+        .account_type
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+    let base_currency = account.base_currency.trim().to_ascii_uppercase();
+    if base_currency.len() < 3
+        || base_currency.len() > 5
+        || base_currency == "MULTI"
+        || !base_currency.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid account base_currency: {}",
+            account.base_currency
+        )));
+    }
+    let created_at = if account.created_at.trim().is_empty() {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    } else {
+        account.created_at.trim().to_string()
+    };
+
+    Ok(StoredAccount {
+        id,
+        name,
+        broker: if broker.is_empty() {
+            "Local CSV".to_string()
+        } else {
+            broker
+        },
+        account_type: if account_type.is_empty() {
+            "taxable".to_string()
+        } else {
+            account_type
+        },
+        base_currency,
+        created_at,
+    })
+}
+
+fn validate_and_normalize_nav_snapshot(
+    snapshot: &StoredNavSnapshot,
+) -> Result<StoredNavSnapshot, StorageError> {
+    let date = snapshot.date.trim().to_string();
+    if date.len() != 10 || NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid nav_snapshot date '{}': expected YYYY-MM-DD",
+            snapshot.date
+        )));
+    }
+    let account_id = if snapshot.account_id.trim().is_empty() {
+        DEFAULT_ACCOUNT_ID.to_string()
+    } else {
+        snapshot.account_id.trim().to_string()
+    };
+    if account_id.len() > 64
+        || !account_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(
+            "invalid nav_snapshot account_id".to_string(),
+        ));
+    }
+    let currency = snapshot.currency.trim().to_ascii_uppercase();
+    if currency.len() < 3
+        || currency.len() > 5
+        || currency == "MULTI"
+        || !currency.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid nav_snapshot currency '{}': cross-currency snapshots are forbidden",
+            snapshot.currency
+        )));
+    }
+    let source = if snapshot.source.trim().is_empty() {
+        "portfolio-load".to_string()
+    } else {
+        snapshot.source.trim().chars().take(32).collect()
+    };
+    let updated_at = if snapshot.updated_at.trim().is_empty() {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    } else {
+        snapshot.updated_at.trim().to_string()
+    };
+
+    Ok(StoredNavSnapshot {
+        date,
+        account_id,
+        currency,
+        net_value_micros: snapshot.net_value_micros,
+        cash_micros: snapshot.cash_micros,
+        positions_micros: snapshot.positions_micros,
+        external_cash_flow_micros: snapshot.external_cash_flow_micros,
+        source,
+        updated_at,
+    })
+}
+
+fn validate_and_normalize_benchmark_series(
+    series: &StoredBenchmarkSeries,
+) -> Result<StoredBenchmarkSeries, StorageError> {
+    let symbol = series.symbol.trim().to_ascii_uppercase();
+    if symbol.is_empty()
+        || symbol.len() > 16
+        || !symbol
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid benchmark symbol '{}'",
+            series.symbol
+        )));
+    }
+    let currency = series.currency.trim().to_ascii_uppercase();
+    if currency.len() < 3
+        || currency.len() > 5
+        || currency == "MULTI"
+        || !currency.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid benchmark currency '{}'",
+            series.currency
+        )));
+    }
+    let mut by_date: BTreeMap<String, i128> = BTreeMap::new();
+    for pt in &series.points {
+        let date = pt.date.trim();
+        if date.len() != 10 || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            return Err(StorageError::InvalidInput(format!(
+                "invalid benchmark point date '{}'",
+                pt.date
+            )));
+        }
+        if pt.close_micros <= 0 {
+            return Err(StorageError::InvalidInput(
+                "benchmark close price must be positive".to_string(),
+            ));
+        }
+        by_date.insert(date.to_string(), pt.close_micros);
+    }
+
+    let points: Vec<BenchmarkPricePoint> = by_date
+        .into_iter()
+        .map(|(date, close_micros)| BenchmarkPricePoint { date, close_micros })
+        .collect();
+
+    Ok(StoredBenchmarkSeries {
+        symbol,
+        currency,
+        provider: series.provider.trim().to_string(),
+        as_of_utc: if series.as_of_utc.trim().is_empty() {
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+        } else {
+            series.as_of_utc.trim().to_string()
+        },
+        points,
+    })
+}
+
+fn ensure_wave2_tables_on_conn(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS accounts (
+            id TEXT PRIMARY KEY,
+            created_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS nav_snapshots (
+            record_id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_nav_snapshots_date
+            ON nav_snapshots (date);
+        CREATE INDEX IF NOT EXISTS idx_nav_snapshots_account_currency
+            ON nav_snapshots (account_id, currency, date);
+        CREATE TABLE IF NOT EXISTS benchmark_history (
+            symbol TEXT PRIMARY KEY,
+            currency TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );",
+    )?;
+    Ok(())
 }
 
 fn initialize_schema_on_conn(
@@ -1529,6 +2332,30 @@ fn initialize_schema_on_conn(
         );
         CREATE TABLE IF NOT EXISTS app_settings (
             setting_key TEXT PRIMARY KEY,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS accounts (
+            id TEXT PRIMARY KEY,
+            created_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS nav_snapshots (
+            record_id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_nav_snapshots_date
+            ON nav_snapshots (date);
+        CREATE INDEX IF NOT EXISTS idx_nav_snapshots_account_currency
+            ON nav_snapshots (account_id, currency, date);
+        CREATE TABLE IF NOT EXISTS benchmark_history (
+            symbol TEXT PRIMARY KEY,
+            currency TEXT NOT NULL,
+            provider TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL,
             ciphertext BLOB NOT NULL
         );",
@@ -1678,6 +2505,7 @@ mod tests {
     fn sample_snapshot(fingerprint: &str) -> StoredPortfolioSnapshot {
         StoredPortfolioSnapshot {
             id: format!("snap-{fingerprint}"),
+            account_id: DEFAULT_ACCOUNT_ID.to_string(),
             fingerprint: fingerprint.to_string(),
             source_format: "schwab_positions".to_string(),
             source_label: "positions.csv".to_string(),
@@ -2204,6 +3032,7 @@ mod tests {
         let invalid_order = StoredPaperOrder {
             id: "ORD-BAD-1".into(),
             workspace_mode: "live-broker".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
             symbol: "AAPL".into(),
             side: "buy".into(),
             order_type: "market".into(),
@@ -2223,6 +3052,7 @@ mod tests {
         let hkd_order = StoredPaperOrder {
             id: "PAPER-HKD-1".into(),
             workspace_mode: "local-csv".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
             symbol: "00700.HK".into(),
             side: "buy".into(),
             order_type: "limit".into(),
@@ -2238,12 +3068,242 @@ mod tests {
         let loaded = db.load_paper_orders("local-csv").expect("load orders");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].currency, "HKD");
+        assert_eq!(loaded[0].account_id, DEFAULT_ACCOUNT_ID);
 
-        // Deserializing a legacy order JSON without `currency` defaults cleanly to "USD".
+        // Deserializing a legacy order JSON without `currency` or `accountId` defaults cleanly.
         let legacy_json = r#"{"id":"OLD-1","workspaceMode":"mock","symbol":"AAPL","side":"buy","orderType":"market","quantity":"1","filledQuantity":"0","limitPrice":null,"status":"working","submittedAt":"2026-11-22T00:00:00Z","events":[]}"#;
         let parsed: StoredPaperOrder = serde_json::from_str(legacy_json).expect("legacy parse");
         assert_eq!(parsed.currency, "USD");
+        assert_eq!(parsed.account_id, DEFAULT_ACCOUNT_ID);
 
         cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn migrates_legacy_v1_database_idempotently_and_encrypts_accounts_nav_and_benchmarks() {
+        let db_path = unique_temp_db("wave2-migration");
+        let key_store = InMemoryKeyStore::new();
+
+        // 1. Create a vault and drop the Wave 2 tables to simulate an existing v1 database on disk.
+        {
+            let mut db =
+                EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").expect("open");
+            db.save_portfolio_snapshot(&sample_snapshot("fp-legacy"))
+                .expect("save legacy snap");
+            db.conn
+                .execute_batch(
+                    "DROP TABLE IF EXISTS accounts;
+                     DROP TABLE IF EXISTS nav_snapshots;
+                     DROP TABLE IF EXISTS benchmark_history;",
+                )
+                .expect("simulate v1 schema");
+        }
+
+        // 2. Reopen smoothly migrates v1 DB: creates new tables, preserves existing snapshot, seeds default account.
+        {
+            let mut db =
+                EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").expect("migrate");
+            let accounts = db.list_accounts().expect("list accounts");
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].id, DEFAULT_ACCOUNT_ID);
+
+            let legacy_snap = db
+                .load_latest_portfolio_snapshot()
+                .expect("load legacy")
+                .expect("preserved");
+            assert_eq!(legacy_snap.account_id, DEFAULT_ACCOUNT_ID);
+            assert_eq!(legacy_snap.cash, "14250.50");
+
+            // Add a second account, NAV snapshots, and benchmark cache.
+            db.upsert_account(&StoredAccount {
+                id: "acct_schwab_ira".into(),
+                name: "Schwab IRA SecretLabel99".into(),
+                broker: "Schwab".into(),
+                account_type: "ira".into(),
+                base_currency: "USD".into(),
+                created_at: "2026-11-22T03:00:00.000Z".into(),
+            })
+            .expect("upsert account");
+
+            db.upsert_nav_snapshot(
+                &StoredNavSnapshot {
+                    date: "2026-11-21".into(),
+                    account_id: "acct_schwab_ira".into(),
+                    currency: "USD".into(),
+                    net_value_micros: 88_776_655_000,
+                    cash_micros: 10_000_000_000,
+                    positions_micros: 78_776_655_000,
+                    external_cash_flow_micros: 5_000_000_000,
+                    source: "csv-import".into(),
+                    updated_at: "2026-11-21T21:00:00.000Z".into(),
+                },
+                false,
+            )
+            .expect("upsert nav");
+
+            // Idempotent re-upsert preserves existing external cash flow when incoming CF == 0.
+            let updated_nav = db
+                .upsert_nav_snapshot(
+                    &StoredNavSnapshot {
+                        date: "2026-11-21".into(),
+                        account_id: "acct_schwab_ira".into(),
+                        currency: "USD".into(),
+                        net_value_micros: 89_000_000_000,
+                        cash_micros: 10_000_000_000,
+                        positions_micros: 79_000_000_000,
+                        external_cash_flow_micros: 0,
+                        source: "portfolio-load".into(),
+                        updated_at: "2026-11-21T22:00:00.000Z".into(),
+                    },
+                    true,
+                )
+                .expect("idempotent nav upsert");
+            assert_eq!(updated_nav.external_cash_flow_micros, 5_000_000_000);
+            assert_eq!(updated_nav.net_value_micros, 89_000_000_000);
+
+            // Rejects MULTI currency nav snapshots Fail-Closed.
+            assert!(db
+                .upsert_nav_snapshot(
+                    &StoredNavSnapshot {
+                        date: "2026-11-22".into(),
+                        account_id: "acct_schwab_ira".into(),
+                        currency: "MULTI".into(),
+                        net_value_micros: 1_000_000,
+                        cash_micros: 1_000_000,
+                        positions_micros: 0,
+                        external_cash_flow_micros: 0,
+                        source: "test".into(),
+                        updated_at: "2026-11-22T00:00:00.000Z".into(),
+                    },
+                    false,
+                )
+                .is_err());
+
+            db.upsert_benchmark_series(&StoredBenchmarkSeries {
+                symbol: "SPY".into(),
+                currency: "USD".into(),
+                provider: "stooq.com".into(),
+                as_of_utc: "2026-11-22T00:00:00.000Z".into(),
+                points: vec![BenchmarkPricePoint {
+                    date: "2026-11-21".into(),
+                    close_micros: 591_230_000,
+                }],
+            })
+            .expect("upsert benchmark");
+        }
+
+        // Verify zero plaintext leakage of account names, NAV micros, or benchmark prices on disk.
+        let raw_bytes = fs::read(&db_path).expect("read db");
+        let raw_text = String::from_utf8_lossy(&raw_bytes);
+        assert!(!raw_text.contains("SecretLabel99"));
+        assert!(!raw_text.contains("89000000000"));
+        assert!(!raw_text.contains("591230000"));
+
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn fhvault_backup_losslessly_restores_wave2_tables_and_stays_v1_backward_compatible() {
+        let src_path = unique_temp_db("wave2-bk-src");
+        let dst_path = unique_temp_db("wave2-bk-dst");
+        let v1_dst_path = unique_temp_db("wave2-bk-v1");
+        let src_keys = InMemoryKeyStore::new();
+        let dst_keys = InMemoryKeyStore::new();
+        let v1_keys = InMemoryKeyStore::new();
+
+        let exported = {
+            let mut db =
+                EncryptedVaultDb::open(&src_path, &src_keys, "in-memory-test").expect("src open");
+            db.upsert_account(&StoredAccount {
+                id: "acct_futu_hk".into(),
+                name: "Futu HK".into(),
+                broker: "Futu".into(),
+                account_type: "taxable".into(),
+                base_currency: "HKD".into(),
+                created_at: "2026-11-22T02:00:00.000Z".into(),
+            })
+            .expect("acct");
+            db.upsert_nav_snapshot(
+                &StoredNavSnapshot {
+                    date: "2026-11-20".into(),
+                    account_id: "acct_futu_hk".into(),
+                    currency: "HKD".into(),
+                    net_value_micros: 53_000_000_000,
+                    cash_micros: 15_000_000_000,
+                    positions_micros: 38_000_000_000,
+                    external_cash_flow_micros: 0,
+                    source: "csv-import".into(),
+                    updated_at: "2026-11-20T08:00:00.000Z".into(),
+                },
+                false,
+            )
+            .expect("nav");
+            db.upsert_benchmark_series(&StoredBenchmarkSeries {
+                symbol: "2800.HK".into(),
+                currency: "HKD".into(),
+                provider: "stooq.com".into(),
+                as_of_utc: "2026-11-22T00:00:00.000Z".into(),
+                points: vec![BenchmarkPricePoint {
+                    date: "2026-11-20".into(),
+                    close_micros: 20_450_000,
+                }],
+            })
+            .expect("bench");
+            db.export_backup_payload().expect("export")
+        };
+
+        // 1. Lossless restore of Wave 2 backup payload (accounts + nav_snapshots + benchmark_history)
+        {
+            let mut dst =
+                EncryptedVaultDb::open(&dst_path, &dst_keys, "in-memory-test").expect("dst open");
+            let (_, summary) = dst
+                .restore_from_backup_payload(exported.clone(), &dst_keys)
+                .expect("restore wave2");
+            assert_eq!(summary.account_count, 2);
+            assert_eq!(summary.nav_snapshot_count, 1);
+            assert_eq!(summary.benchmark_count, 1);
+
+            let restored_accounts = dst.list_accounts().expect("accounts");
+            assert!(restored_accounts.iter().any(|a| a.id == "acct_futu_hk"));
+            let restored_nav = dst
+                .load_nav_snapshots(Some("acct_futu_hk"), Some("HKD"))
+                .expect("nav");
+            assert_eq!(restored_nav.len(), 1);
+            assert_eq!(restored_nav[0].net_value_micros, 53_000_000_000);
+            let restored_bench = dst
+                .load_benchmark_series("2800.HK")
+                .expect("bench")
+                .expect("some");
+            assert_eq!(restored_bench.points[0].close_micros, 20_450_000);
+        }
+
+        // 2. Backward-compatible restore of a legacy v1 JSON payload (NO accounts/navSnapshots/benchmarkHistory fields)
+        {
+            let mut v1_json_val = serde_json::to_value(&exported).expect("to value");
+            let obj = v1_json_val.as_object_mut().expect("object");
+            obj.remove("accounts");
+            obj.remove("navSnapshots");
+            obj.remove("benchmarkHistory");
+            let v1_payload: VaultBackupPayload =
+                serde_json::from_value(v1_json_val).expect("parse v1 backup");
+            assert!(v1_payload.accounts.is_empty());
+            assert!(v1_payload.nav_snapshots.is_empty());
+
+            let mut v1_dst =
+                EncryptedVaultDb::open(&v1_dst_path, &v1_keys, "in-memory-test").expect("v1 open");
+            let (_, summary) = v1_dst
+                .restore_from_backup_payload(v1_payload, &v1_keys)
+                .expect("v1 restore ok");
+            assert_eq!(summary.account_count, 0);
+            assert_eq!(summary.nav_snapshot_count, 0);
+            // Smoothly ensured default account exists after v1 restore!
+            let accounts = v1_dst.list_accounts().expect("default acct");
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].id, DEFAULT_ACCOUNT_ID);
+        }
+
+        cleanup_temp_db(&src_path);
+        cleanup_temp_db(&dst_path);
+        cleanup_temp_db(&v1_dst_path);
     }
 }
