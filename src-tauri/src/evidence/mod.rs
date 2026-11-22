@@ -45,6 +45,7 @@ pub enum EvidenceKind {
     SafetySettingChanged,
     StateChanged,
     AutomationRun,
+    PortfolioImport,
 }
 
 impl EvidenceKind {
@@ -68,6 +69,7 @@ impl EvidenceKind {
             Self::SafetySettingChanged => "safety_setting_changed",
             Self::StateChanged => "state_changed",
             Self::AutomationRun => "automation_run",
+            Self::PortfolioImport => "portfolio_import",
         }
     }
 
@@ -83,6 +85,7 @@ impl EvidenceKind {
             Self::ReconciliationObserved => "reconciliation",
             Self::SafetySettingChanged => "safety_setting_changed",
             Self::AutomationRun => "automation_run",
+            Self::PortfolioImport => "portfolio_import",
             Self::CancelStarted
             | Self::CancelObserved
             | Self::ReplaceStarted
@@ -112,6 +115,7 @@ impl EvidenceKind {
             "safety_setting_changed" => Ok(Self::SafetySettingChanged),
             "state_changed" => Ok(Self::StateChanged),
             "automation_run" => Ok(Self::AutomationRun),
+            "portfolio_import" => Ok(Self::PortfolioImport),
             other => Err(EvidenceError::UnsupportedKind(other.to_string())),
         }
     }
@@ -133,6 +137,7 @@ impl EvidenceKind {
             "automation_run" => Ok(Self::AutomationRun),
             "safety_setting_changed" => Ok(Self::SafetySettingChanged),
             "state_changed" => Ok(Self::StateChanged),
+            "portfolio_import" => Ok(Self::PortfolioImport),
             other => Self::from_canonical(other),
         }
     }
@@ -970,10 +975,7 @@ impl SignedEvidenceRecordDto {
     }
 }
 
-/// In-memory Ed25519-signed evidence journal managed by Tauri state.
-///
-/// Stage 2 will back this journal with encrypted SQLCipher persistence and an
-/// OS-protected device key without changing the signing or verification rules.
+/// Ed25519-signed evidence journal backed by the encrypted SQLite vault at runtime.
 pub struct EvidenceJournal {
     signing_key: SigningKey,
     entries: Vec<SignedEvidenceEntry>,
@@ -993,14 +995,38 @@ impl EvidenceJournal {
         }
     }
 
+    /// Rehydrate a persisted journal after verifying both chain integrity and
+    /// device signer continuity.
+    pub fn from_persisted(
+        signing_key: SigningKey,
+        entries: Vec<SignedEvidenceEntry>,
+    ) -> Result<Self, EvidenceError> {
+        let head = verify_chain(&entries)?;
+        if let Some(persisted_signer) = head.signer_public_key {
+            if persisted_signer != signing_key.verifying_key().to_bytes() {
+                return Err(EvidenceError::SignerChanged);
+            }
+        }
+        Ok(Self {
+            signing_key,
+            entries,
+        })
+    }
+
+    pub fn entries(&self) -> &[SignedEvidenceEntry] {
+        &self.entries
+    }
+
     pub fn signer_public_key_hex(&self) -> String {
         encode_hex(&self.signing_key.verifying_key().to_bytes())
     }
 
-    pub fn append(
-        &mut self,
+    /// Build and sign the next entry without mutating in-memory state yet so a
+    /// caller can persist it atomically before committing.
+    pub fn prepare_append(
+        &self,
         request: AppendEvidenceRequest,
-    ) -> Result<SignedEvidenceRecordDto, EvidenceError> {
+    ) -> Result<(SignedEvidenceEntry, SignedEvidenceRecordDto), EvidenceError> {
         let head = verify_chain(&self.entries)?;
         let sequence = head
             .sequence
@@ -1035,8 +1061,72 @@ impl EvidenceJournal {
         )?;
         let signed = SignedEvidenceEntry::sign(event, head.hash, &self.signing_key)?;
         let dto = SignedEvidenceRecordDto::from_entry(&signed);
+        Ok((signed, dto))
+    }
+
+    pub fn commit_prepared(&mut self, signed: SignedEvidenceEntry) {
         self.entries.push(signed);
+    }
+
+    pub fn append_entry(
+        &mut self,
+        request: AppendEvidenceRequest,
+    ) -> Result<(SignedEvidenceEntry, SignedEvidenceRecordDto), EvidenceError> {
+        let (signed, dto) = self.prepare_append(request)?;
+        self.entries.push(signed.clone());
+        Ok((signed, dto))
+    }
+
+    pub fn append(
+        &mut self,
+        request: AppendEvidenceRequest,
+    ) -> Result<SignedEvidenceRecordDto, EvidenceError> {
+        let (_, dto) = self.append_entry(request)?;
         Ok(dto)
+    }
+
+    /// Validate an imported bundle without mutating the active journal yet.
+    pub fn parse_import_bundle(
+        &self,
+        serialized: &str,
+    ) -> Result<(Vec<SignedEvidenceEntry>, EvidenceVerificationDto), EvidenceError> {
+        let bundle: EvidenceExportBundleDto = serde_json::from_str(serialized)
+            .map_err(|error| EvidenceError::InvalidBundle(error.to_string()))?;
+        if bundle.format != SIGNED_EVIDENCE_BUNDLE_FORMAT
+            || bundle.schema_version != EVIDENCE_SCHEMA_VERSION
+            || !matches!(bundle.mode.as_str(), "mock" | "local-csv")
+        {
+            return Err(EvidenceError::InvalidBundle(
+                "unsupported format, schema version, or mode".to_string(),
+            ));
+        }
+        if normalize_timestamp(&bundle.exported_at_utc)? != bundle.exported_at_utc {
+            return Err(EvidenceError::TimestampNotCanonical);
+        }
+
+        let mut entries = Vec::with_capacity(bundle.records.len());
+        for record in bundle.records {
+            entries.push(record.into_entry()?);
+        }
+        let head = verify_chain(&entries)?;
+        if let Some(imported_signer) = head.signer_public_key {
+            let current_signer = self.signing_key.verifying_key().to_bytes();
+            if imported_signer != current_signer {
+                return Err(EvidenceError::SignerChanged);
+            }
+        }
+        let verification = EvidenceVerificationDto {
+            valid: true,
+            sequence: head.sequence,
+            head_hash: encode_hex(&head.hash),
+            signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
+            reason: None,
+        };
+        Ok((entries, verification))
+    }
+
+    pub fn replace_entries(&mut self, entries: Vec<SignedEvidenceEntry>) {
+        self.entries = entries;
     }
 
     pub fn list(&self) -> Vec<SignedEvidenceRecordDto> {
@@ -1083,39 +1173,9 @@ impl EvidenceJournal {
     }
 
     pub fn import(&mut self, serialized: &str) -> Result<EvidenceVerificationDto, EvidenceError> {
-        let bundle: EvidenceExportBundleDto = serde_json::from_str(serialized)
-            .map_err(|error| EvidenceError::InvalidBundle(error.to_string()))?;
-        if bundle.format != SIGNED_EVIDENCE_BUNDLE_FORMAT
-            || bundle.schema_version != EVIDENCE_SCHEMA_VERSION
-            || bundle.mode != "mock"
-        {
-            return Err(EvidenceError::InvalidBundle(
-                "unsupported format, schema version, or mode".to_string(),
-            ));
-        }
-        if normalize_timestamp(&bundle.exported_at_utc)? != bundle.exported_at_utc {
-            return Err(EvidenceError::TimestampNotCanonical);
-        }
-
-        let mut entries = Vec::with_capacity(bundle.records.len());
-        for record in bundle.records {
-            entries.push(record.into_entry()?);
-        }
-        let head = verify_chain(&entries)?;
-        if let Some(imported_signer) = head.signer_public_key {
-            let current_signer = self.signing_key.verifying_key().to_bytes();
-            if imported_signer != current_signer {
-                return Err(EvidenceError::SignerChanged);
-            }
-        }
+        let (entries, verification) = self.parse_import_bundle(serialized)?;
         self.entries = entries;
-        Ok(EvidenceVerificationDto {
-            valid: true,
-            sequence: head.sequence,
-            head_hash: encode_hex(&head.hash),
-            signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
-            reason: None,
-        })
+        Ok(verification)
     }
 
     pub fn clear(&mut self) -> bool {
