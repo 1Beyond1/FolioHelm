@@ -1021,15 +1021,46 @@ impl EvidenceJournal {
         encode_hex(&self.signing_key.verifying_key().to_bytes())
     }
 
+    /// Verify the chain tail in O(1) time before appending.
+    ///
+    /// Full-chain verification is performed on load (`from_persisted`), explicit
+    /// `verify()`, `export()`, and `parse_import_bundle()`. Verifying only the
+    /// tail entry (its payload hash, entry hash, Ed25519 signature, sequence
+    /// continuity, previous-hash link, and signer match) prevents O(N^2) append
+    /// cost while remaining fail-closed against tail corruption.
+    fn verify_tail_for_append(&self) -> Result<(u64, Hash32), EvidenceError> {
+        let Some(last) = self.entries.last() else {
+            return Ok((0, GENESIS_HASH));
+        };
+        last.verify()?;
+        let expected_sequence =
+            u64::try_from(self.entries.len()).map_err(|_| EvidenceError::SequenceOverflow)?;
+        if last.event.sequence != expected_sequence {
+            return Err(EvidenceError::ChainSequenceMismatch {
+                expected: expected_sequence,
+                actual: last.event.sequence,
+            });
+        }
+        if last.signer_public_key != self.signing_key.verifying_key().to_bytes() {
+            return Err(EvidenceError::SignerChanged);
+        }
+        if self.entries.len() >= 2 {
+            let prev = &self.entries[self.entries.len() - 2];
+            if last.previous_hash != prev.entry_hash {
+                return Err(EvidenceError::PreviousHashMismatch);
+            }
+        }
+        Ok((last.event.sequence, last.entry_hash))
+    }
+
     /// Build and sign the next entry without mutating in-memory state yet so a
     /// caller can persist it atomically before committing.
     pub fn prepare_append(
         &self,
         request: AppendEvidenceRequest,
     ) -> Result<(SignedEvidenceEntry, SignedEvidenceRecordDto), EvidenceError> {
-        let head = verify_chain(&self.entries)?;
-        let sequence = head
-            .sequence
+        let (head_sequence, previous_hash) = self.verify_tail_for_append()?;
+        let sequence = head_sequence
             .checked_add(1)
             .ok_or(EvidenceError::SequenceOverflow)?;
         let kind = EvidenceKind::from_frontend_or_canonical(&request.kind, &request.payload)?;
@@ -1059,7 +1090,7 @@ impl EvidenceJournal {
                 fields: request.payload,
             },
         )?;
-        let signed = SignedEvidenceEntry::sign(event, head.hash, &self.signing_key)?;
+        let signed = SignedEvidenceEntry::sign(event, previous_hash, &self.signing_key)?;
         let dto = SignedEvidenceRecordDto::from_entry(&signed);
         Ok((signed, dto))
     }
@@ -1658,6 +1689,60 @@ mod tests {
         assert_eq!(
             other_journal.import(&exported),
             Err(EvidenceError::SignerChanged)
+        );
+    }
+
+    #[test]
+    fn prepare_append_verifies_tail_in_constant_time_while_from_persisted_verifies_full_chain() {
+        let mut journal = EvidenceJournal::from_signing_key(device_key());
+        for i in 1..=12 {
+            let dto = journal
+                .append(AppendEvidenceRequest {
+                    kind: "state_changed".into(),
+                    payload: BTreeMap::from([("step".into(), i.to_string())]),
+                    app_version: Some("0.1.0".into()),
+                    occurred_at_utc: Some(format!("2026-08-09T14:00:{i:02}Z")),
+                    account_ref: None,
+                    intent_id: None,
+                })
+                .expect("append succeeds");
+            assert_eq!(dto.sequence, i);
+        }
+        assert!(journal.verify().valid);
+
+        // Corrupting the tail entry must be rejected by prepare_append fail-closed.
+        let mut bad_tail_entries = journal.entries().to_vec();
+        bad_tail_entries
+            .last_mut()
+            .expect("last")
+            .event
+            .payload
+            .fields
+            .insert("step".into(), "tampered".into());
+        let mut tampered_tail_journal = EvidenceJournal::from_signing_key(device_key());
+        tampered_tail_journal.replace_entries(bad_tail_entries);
+        assert_eq!(
+            tampered_tail_journal.prepare_append(AppendEvidenceRequest {
+                kind: "state_changed".into(),
+                payload: BTreeMap::from([("step".into(), "13".into())]),
+                app_version: Some("0.1.0".into()),
+                occurred_at_utc: Some("2026-08-09T14:01:00Z".into()),
+                account_ref: None,
+                intent_id: None,
+            }),
+            Err(EvidenceError::PayloadHashMismatch)
+        );
+
+        // Corrupting an earlier entry is always caught by full-chain from_persisted / verify.
+        let mut bad_head_entries = journal.entries().to_vec();
+        bad_head_entries[0]
+            .event
+            .payload
+            .fields
+            .insert("step".into(), "tampered-head".into());
+        assert_eq!(
+            EvidenceJournal::from_persisted(device_key(), bad_head_entries).err(),
+            Some(EvidenceError::PayloadHashMismatch)
         );
     }
 }

@@ -276,6 +276,18 @@ impl VaultKeyMaterial {
         self.device_signing_seed = previous_seed;
         Ok(())
     }
+
+    /// Constant-time check comparing the current device signing seed against a hex candidate.
+    pub fn signing_seed_matches_hex(&self, candidate_hex: &str) -> bool {
+        match decode_key32(candidate_hex) {
+            Ok(decoded) => bool::from(
+                self.device_signing_seed
+                    .as_slice()
+                    .ct_eq(decoded.as_slice()),
+            ),
+            Err(_) => false,
+        }
+    }
 }
 
 pub fn decode_signing_key_hex(seed_hex: &str) -> Result<SigningKey, VaultError> {
@@ -637,19 +649,20 @@ pub fn create_app_lock_verifier_with_params(
     })
 }
 
-/// Constant-time verification of a candidate App Lock passphrase against a stored Argon2id verifier.
-pub fn verify_app_lock_passphrase(
+/// Validate structural integrity and KDF bounds of a persisted App Lock verifier.
+pub fn validate_app_lock_verifier(
     verifier: &AppLockVerifier,
-    candidate_passphrase: &str,
-) -> Result<bool, VaultError> {
+) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
     if verifier.algorithm != "argon2id" || verifier.version != u32::from(Version::V0x13 as u8) {
         return Err(VaultError::CorruptedKeyMaterial(
             "unsupported app lock verifier algorithm",
         ));
     }
-    if candidate_passphrase.is_empty() {
-        return Ok(false);
-    }
+    validate_kdf_bounds(
+        verifier.memory_kib,
+        verifier.iterations,
+        verifier.parallelism,
+    )?;
     let salt = BASE64
         .decode(verifier.salt_b64.as_bytes())
         .map_err(|_| VaultError::CorruptedKeyMaterial("invalid app lock verifier salt"))?;
@@ -660,6 +673,18 @@ pub fn verify_app_lock_passphrase(
         return Err(VaultError::CorruptedKeyMaterial(
             "unexpected app lock verifier field lengths",
         ));
+    }
+    Ok((salt, expected_hash))
+}
+
+/// Constant-time verification of a candidate App Lock passphrase against a stored Argon2id verifier.
+pub fn verify_app_lock_passphrase(
+    verifier: &AppLockVerifier,
+    candidate_passphrase: &str,
+) -> Result<bool, VaultError> {
+    let (salt, expected_hash) = validate_app_lock_verifier(verifier)?;
+    if candidate_passphrase.is_empty() {
+        return Ok(false);
     }
     let candidate = derive_argon2id_key(
         candidate_passphrase,

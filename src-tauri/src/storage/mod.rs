@@ -11,19 +11,26 @@
 //! - Opening an existing DB whose canary or records fail GCM authentication
 //!   fails immediately and preserves the untouched file for forensics/recovery.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt, fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{
     evidence::{encode_hex, EvidenceJournal, SignedEvidenceEntry},
     vault::{
-        build_aad, decode_signing_key_hex, decrypt_record, encrypt_record, AppLockVerifier,
-        KeyStore, VaultError, VaultKeyMaterial, VAULT_CRYPTO_VERSION,
+        build_aad, decode_signing_key_hex, decrypt_record, encrypt_record,
+        validate_app_lock_verifier, AppLockVerifier, KeyStore, VaultError, VaultKeyMaterial,
+        VAULT_CRYPTO_VERSION,
     },
 };
 
@@ -31,6 +38,75 @@ pub const STORAGE_SCHEMA_VERSION: u16 = 1;
 const CANARY_PLAINTEXT: &[u8] = b"foliohelm-vault-canary-v1";
 const CANARY_RECORD_ID: &str = "canary";
 const APP_LOCK_VERIFIER_META_KEY: &str = "app_lock_verifier";
+const APP_LOCK_BACKOFF_META_KEY: &str = "app_lock_backoff";
+const RESTORE_INTENT_AAD_TABLE: &str = "restore_intent";
+const RESTORE_INTENT_RECORD_ID: &str = "active";
+
+fn default_order_currency() -> String {
+    "USD".to_string()
+}
+
+mod zeroizing_string_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S>(value: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Zeroizing::new)
+    }
+}
+
+/// Atomically write bytes to `dest` via a sibling temporary file + `sync_all` + `rename`.
+///
+/// Using the same parent directory guarantees same-filesystem atomic replacement and
+/// prevents partially written `.fhvault` backups or recovery intent files on crash.
+pub fn atomic_write_bytes(dest: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let base_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("foliohelm-file");
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| std::io::Error::other("OS CSPRNG unavailable for temp file"))?;
+    let tmp_path = parent.join(format!(".{base_name}.tmp-{}", encode_hex(&nonce)));
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -129,9 +205,18 @@ pub struct StoredPaperOrder {
     pub quantity: String,
     pub filled_quantity: String,
     pub limit_price: Option<String>,
+    #[serde(default = "default_order_currency")]
+    pub currency: String,
     pub status: String,
     pub submitted_at: String,
     pub events: Vec<StoredPaperOrderEvent>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLockBackoffState {
+    pub failed_attempts: u32,
+    pub locked_until_unix: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,17 +251,45 @@ pub struct VaultStatusDto {
     pub locked_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultBackupPayload {
     pub schema_version: u16,
     pub exported_at_utc: String,
-    pub device_signing_seed_hex: String,
+    #[serde(with = "zeroizing_string_serde")]
+    pub device_signing_seed_hex: Zeroizing<String>,
     pub evidence_entries: Vec<SignedEvidenceEntry>,
     pub portfolio_snapshots: Vec<StoredPortfolioSnapshot>,
     pub paper_orders: Vec<StoredPaperOrder>,
     pub quote_cache: Vec<CachedPublicQuote>,
     pub settings: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for VaultBackupPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultBackupPayload")
+            .field("schema_version", &self.schema_version)
+            .field("exported_at_utc", &self.exported_at_utc)
+            .field("device_signing_seed_hex", &"[REDACTED]")
+            .field("evidence_entries_len", &self.evidence_entries.len())
+            .field("portfolio_snapshots_len", &self.portfolio_snapshots.len())
+            .field("paper_orders_len", &self.paper_orders.len())
+            .field("quote_cache_len", &self.quote_cache.len())
+            .field("settings_len", &self.settings.len())
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreIntentRecord {
+    schema_version: u16,
+    #[serde(with = "zeroizing_string_serde")]
+    previous_seed_hex: Zeroizing<String>,
+    #[serde(with = "zeroizing_string_serde")]
+    target_seed_hex: Zeroizing<String>,
+    staging_file_name: String,
+    backup_file_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,9 +304,130 @@ pub struct VaultRestoreSummaryDto {
 }
 
 pub struct EncryptedVaultDb {
+    db_path: PathBuf,
     conn: Connection,
     keys: VaultKeyMaterial,
     key_provider: String,
+}
+
+fn restore_intent_path(db_path: &Path) -> PathBuf {
+    let base = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("foliohelm-vault.sqlite");
+    db_path.with_file_name(format!("{base}.restore-intent"))
+}
+
+fn sqlite_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
+    let base = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("foliohelm-vault.sqlite");
+    [
+        db_path.with_file_name(format!("{base}-wal")),
+        db_path.with_file_name(format!("{base}-shm")),
+    ]
+}
+
+fn remove_sqlite_files(db_path: &Path) {
+    let _ = fs::remove_file(db_path);
+    for sidecar in sqlite_sidecar_paths(db_path) {
+        let _ = fs::remove_file(sidecar);
+    }
+}
+
+fn is_safe_sibling_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name != "."
+}
+
+fn sibling_file_path(db_path: &Path, file_name: &str) -> Result<PathBuf, StorageError> {
+    if !is_safe_sibling_file_name(file_name) {
+        return Err(StorageError::Integrity(
+            "restore intent contains unsafe file name".to_string(),
+        ));
+    }
+    Ok(db_path.with_file_name(file_name))
+}
+
+fn verify_sqlite_file_with_keys(
+    path: &Path,
+    db_master_key: &[u8; 32],
+    signing_key: SigningKey,
+) -> Result<EvidenceJournal, StorageError> {
+    let conn = Connection::open(path)?;
+    configure_connection(&conn)?;
+    verify_connection_schema_and_canary(&conn, db_master_key)?;
+    let entries = load_evidence_entries_from_conn(&conn, db_master_key)?;
+    EvidenceJournal::from_persisted(signing_key, entries).map_err(|error| {
+        StorageError::Integrity(format!(
+            "vault evidence chain failed cryptographic verification: {error}"
+        ))
+    })
+}
+
+/// Automatically recover from a process crash that occurred mid-`.fhvault` atomic restore.
+///
+/// The `.restore-intent` file is AES-256-GCM encrypted under `db_master_key` (which never
+/// changes across a restore). Depending on whether the OS keyring already switched to
+/// `target_seed_hex` and whether `db_path` cryptographically verifies under it, this
+/// either rolls forward cleanly or rolls back to the untouched pre-restore backup + old seed.
+fn recover_interrupted_restore(
+    db_path: &Path,
+    key_store: &dyn KeyStore,
+    keys: &mut VaultKeyMaterial,
+) -> Result<(), StorageError> {
+    let intent_path = restore_intent_path(db_path);
+    if !intent_path.exists() {
+        return Ok(());
+    }
+
+    let ciphertext = fs::read(&intent_path)?;
+    let aad = build_aad(
+        STORAGE_SCHEMA_VERSION,
+        RESTORE_INTENT_AAD_TABLE,
+        RESTORE_INTENT_RECORD_ID,
+    );
+    let plaintext = decrypt_record(keys.db_master_key(), &aad, &ciphertext)?;
+    let intent: RestoreIntentRecord = serde_json::from_slice(&plaintext).map_err(|error| {
+        StorageError::Integrity(format!("corrupted restore intent record: {error}"))
+    })?;
+    if intent.schema_version != STORAGE_SCHEMA_VERSION {
+        return Err(StorageError::Integrity(format!(
+            "unsupported restore intent schema version {}",
+            intent.schema_version
+        )));
+    }
+
+    let backup_path = sibling_file_path(db_path, &intent.backup_file_name)?;
+    let staging_path = sibling_file_path(db_path, &intent.staging_file_name)?;
+
+    let keyring_on_target = keys.signing_seed_matches_hex(&intent.target_seed_hex);
+    if keyring_on_target
+        && db_path.exists()
+        && verify_sqlite_file_with_keys(db_path, keys.db_master_key(), keys.signing_key()).is_ok()
+    {
+        // Both DB and keyring already committed cleanly; remove recovery leftovers.
+        remove_sqlite_files(&backup_path);
+        remove_sqlite_files(&staging_path);
+        let _ = fs::remove_file(&intent_path);
+        return Ok(());
+    }
+
+    // Roll back to pre-restore backup and ensure OS keyring matches `previous_seed_hex`.
+    if backup_path.exists() {
+        remove_sqlite_files(db_path);
+        fs::rename(&backup_path, db_path)?;
+    }
+    if !keys.signing_seed_matches_hex(&intent.previous_seed_hex) {
+        let _ = keys.replace_signing_seed(key_store, &intent.previous_seed_hex)?;
+    }
+    remove_sqlite_files(&staging_path);
+    let _ = fs::remove_file(&intent_path);
+    Ok(())
 }
 
 impl EncryptedVaultDb {
@@ -209,19 +443,26 @@ impl EncryptedVaultDb {
             }
         }
 
-        let database_exists = match fs::metadata(db_path) {
-            Ok(meta) => meta.len() > 0,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(StorageError::Io(error)),
-        };
+        let has_restore_intent = restore_intent_path(db_path).exists();
+        let database_exists = has_restore_intent
+            || match fs::metadata(db_path) {
+                Ok(meta) => meta.len() > 0,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(StorageError::Io(error)),
+            };
 
         // Load or initialize OS-protected key material before opening/creating SQLite.
-        let keys = VaultKeyMaterial::load_or_initialize(key_store, database_exists)?;
+        let mut keys = VaultKeyMaterial::load_or_initialize(key_store, database_exists)?;
+
+        if has_restore_intent {
+            recover_interrupted_restore(db_path, key_store, &mut keys)?;
+        }
 
         let conn = Connection::open(db_path)?;
         configure_connection(&conn)?;
 
         let mut db = Self {
+            db_path: db_path.to_path_buf(),
             conn,
             keys,
             key_provider: key_provider.into(),
@@ -229,6 +470,7 @@ impl EncryptedVaultDb {
 
         if database_exists {
             db.verify_existing_schema_and_canary()?;
+            db.migrate_legacy_app_lock_verifier_if_needed()?;
         } else {
             db.initialize_schema()?;
         }
@@ -274,146 +516,15 @@ impl EncryptedVaultDb {
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
-        let tx = self.conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS vault_meta (
-                meta_key TEXT PRIMARY KEY,
-                meta_value BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS evidence_entries (
-                sequence INTEGER PRIMARY KEY,
-                event_id TEXT NOT NULL UNIQUE,
-                occurred_at_utc TEXT NOT NULL,
-                ciphertext BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-                id TEXT PRIMARY KEY,
-                fingerprint TEXT NOT NULL UNIQUE,
-                source_format TEXT NOT NULL,
-                imported_at_utc TEXT NOT NULL,
-                ciphertext BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_orders (
-                id TEXT PRIMARY KEY,
-                workspace_mode TEXT NOT NULL,
-                submitted_at_utc TEXT NOT NULL,
-                ciphertext BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS quote_cache (
-                symbol TEXT PRIMARY KEY,
-                provider TEXT NOT NULL,
-                as_of_utc TEXT NOT NULL,
-                ciphertext BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS app_settings (
-                setting_key TEXT PRIMARY KEY,
-                updated_at_utc TEXT NOT NULL,
-                ciphertext BLOB NOT NULL
-            );",
-        )?;
-
-        let aad = build_aad(STORAGE_SCHEMA_VERSION, "vault_meta", CANARY_RECORD_ID);
-        let canary_blob = encrypt_record(self.keys.db_master_key(), &aad, CANARY_PLAINTEXT)?;
-
-        tx.execute(
-            "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-            params![
-                "schema_version",
-                STORAGE_SCHEMA_VERSION.to_string().as_bytes()
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-            params![
-                "crypto_version",
-                VAULT_CRYPTO_VERSION.to_string().as_bytes()
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-            params![CANARY_RECORD_ID, canary_blob],
-        )?;
-
-        tx.commit()?;
-        Ok(())
+        initialize_schema_on_conn(&mut self.conn, self.keys.db_master_key())
     }
 
     fn verify_existing_schema_and_canary(&self) -> Result<(), StorageError> {
-        let schema_bytes: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT meta_value FROM vault_meta WHERE meta_key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(schema_bytes) = schema_bytes else {
-            return Err(StorageError::Integrity(
-                "existing database is missing vault_meta schema_version".to_string(),
-            ));
-        };
-        let schema_str = String::from_utf8(schema_bytes).map_err(|_| {
-            StorageError::Integrity("vault_meta schema_version is not UTF-8".to_string())
-        })?;
-        let version: u16 = schema_str.parse().map_err(|_| {
-            StorageError::Integrity(format!("invalid vault schema version: {schema_str}"))
-        })?;
-        if version != STORAGE_SCHEMA_VERSION {
-            return Err(StorageError::Integrity(format!(
-                "unsupported vault schema version {version}"
-            )));
-        }
-
-        let canary_blob: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
-                params![CANARY_RECORD_ID],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(canary_blob) = canary_blob else {
-            return Err(StorageError::Integrity(
-                "existing database is missing encryption canary".to_string(),
-            ));
-        };
-        let aad = build_aad(STORAGE_SCHEMA_VERSION, "vault_meta", CANARY_RECORD_ID);
-        let decrypted = decrypt_record(self.keys.db_master_key(), &aad, &canary_blob)?;
-        if decrypted.as_slice() != CANARY_PLAINTEXT {
-            return Err(StorageError::Integrity(
-                "vault encryption canary mismatch".to_string(),
-            ));
-        }
-
-        Ok(())
+        verify_connection_schema_and_canary(&self.conn, self.keys.db_master_key())
     }
 
     pub fn load_evidence_entries(&self) -> Result<Vec<SignedEvidenceEntry>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT sequence, ciphertext FROM evidence_entries ORDER BY sequence ASC")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            let (sequence, ciphertext) = row?;
-            let aad = build_aad(
-                STORAGE_SCHEMA_VERSION,
-                "evidence_entries",
-                &sequence.to_string(),
-            );
-            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
-            let entry: SignedEvidenceEntry = serde_json::from_slice(&plaintext)?;
-            if i64::try_from(entry.event.sequence).ok() != Some(sequence) {
-                return Err(StorageError::Integrity(format!(
-                    "evidence sequence mismatch at row {sequence}"
-                )));
-            }
-            entries.push(entry);
-        }
-        Ok(entries)
+        load_evidence_entries_from_conn(&self.conn, self.keys.db_master_key())
     }
 
     pub fn insert_evidence_entry(
@@ -584,6 +695,11 @@ impl EncryptedVaultDb {
                 "paper order id must not be empty".to_string(),
             ));
         }
+        if !matches!(order.workspace_mode.as_str(), "mock" | "local-csv") {
+            return Err(StorageError::InvalidInput(
+                "unsupported workspace_mode".to_string(),
+            ));
+        }
         let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
         let plaintext = serde_json::to_vec(order)?;
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
@@ -710,8 +826,60 @@ impl EncryptedVaultDb {
         let Some(bytes) = raw else {
             return Ok(None);
         };
-        let verifier: AppLockVerifier = serde_json::from_slice(&bytes)?;
+        if bytes.is_empty() {
+            return Err(StorageError::Integrity(
+                "app lock verifier record is empty".to_string(),
+            ));
+        }
+
+        let verifier: AppLockVerifier = if bytes[0] == VAULT_CRYPTO_VERSION {
+            let aad = build_aad(
+                STORAGE_SCHEMA_VERSION,
+                "vault_meta",
+                APP_LOCK_VERIFIER_META_KEY,
+            );
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &bytes)?;
+            serde_json::from_slice(&plaintext).map_err(|error| {
+                StorageError::Integrity(format!(
+                    "decrypted app lock verifier is malformed: {error}"
+                ))
+            })?
+        } else if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
+            // Backward-compatible read of legacy plaintext JSON verifier (migrated on open).
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::Integrity(format!("legacy app lock verifier is malformed: {error}"))
+            })?
+        } else {
+            return Err(StorageError::Integrity(
+                "app lock verifier record has unrecognized encoding".to_string(),
+            ));
+        };
+
+        validate_app_lock_verifier(&verifier)?;
         Ok(Some(verifier))
+    }
+
+    /// Transparently migrate a legacy plaintext `app_lock_verifier` JSON record in
+    /// `vault_meta` to AES-256-GCM ciphertext with AAD on vault open.
+    fn migrate_legacy_app_lock_verifier_if_needed(&mut self) -> Result<(), StorageError> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+                params![APP_LOCK_VERIFIER_META_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = raw else {
+            return Ok(());
+        };
+        if bytes.first() == Some(&VAULT_CRYPTO_VERSION) {
+            // Already encrypted; verify it decrypts cleanly fail-closed.
+            let _ = self.load_app_lock_verifier()?;
+            return Ok(());
+        }
+        let verifier = self.load_app_lock_verifier()?;
+        self.save_app_lock_verifier(verifier.as_ref())
     }
 
     pub fn save_app_lock_verifier(
@@ -721,10 +889,17 @@ impl EncryptedVaultDb {
         let tx = self.conn.transaction()?;
         match verifier {
             Some(v) => {
-                let bytes = serde_json::to_vec(v)?;
+                validate_app_lock_verifier(v)?;
+                let plaintext = Zeroizing::new(serde_json::to_vec(v)?);
+                let aad = build_aad(
+                    STORAGE_SCHEMA_VERSION,
+                    "vault_meta",
+                    APP_LOCK_VERIFIER_META_KEY,
+                );
+                let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
                 tx.execute(
                     "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-                    params![APP_LOCK_VERIFIER_META_KEY, bytes],
+                    params![APP_LOCK_VERIFIER_META_KEY, ciphertext],
                 )?;
             }
             None => {
@@ -732,7 +907,63 @@ impl EncryptedVaultDb {
                     "DELETE FROM vault_meta WHERE meta_key = ?1",
                     params![APP_LOCK_VERIFIER_META_KEY],
                 )?;
+                tx.execute(
+                    "DELETE FROM vault_meta WHERE meta_key = ?1",
+                    params![APP_LOCK_BACKOFF_META_KEY],
+                )?;
             }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_app_lock_backoff(&self) -> Result<AppLockBackoffState, StorageError> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+                params![APP_LOCK_BACKOFF_META_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(ciphertext) = raw else {
+            return Ok(AppLockBackoffState::default());
+        };
+        let aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            "vault_meta",
+            APP_LOCK_BACKOFF_META_KEY,
+        );
+        let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+        serde_json::from_slice(&plaintext).map_err(|error| {
+            StorageError::Integrity(format!(
+                "decrypted app lock backoff state is malformed: {error}"
+            ))
+        })
+    }
+
+    pub fn save_app_lock_backoff(
+        &mut self,
+        state: &AppLockBackoffState,
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        if state.failed_attempts == 0 && state.locked_until_unix.is_none() {
+            tx.execute(
+                "DELETE FROM vault_meta WHERE meta_key = ?1",
+                params![APP_LOCK_BACKOFF_META_KEY],
+            )?;
+        } else {
+            let plaintext = serde_json::to_vec(state)?;
+            let aad = build_aad(
+                STORAGE_SCHEMA_VERSION,
+                "vault_meta",
+                APP_LOCK_BACKOFF_META_KEY,
+            );
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                params![APP_LOCK_BACKOFF_META_KEY, ciphertext],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -807,7 +1038,7 @@ impl EncryptedVaultDb {
         Ok(VaultBackupPayload {
             schema_version: STORAGE_SCHEMA_VERSION,
             exported_at_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            device_signing_seed_hex: seed_hex.to_string(),
+            device_signing_seed_hex: seed_hex,
             evidence_entries,
             portfolio_snapshots,
             paper_orders,
@@ -816,14 +1047,17 @@ impl EncryptedVaultDb {
         })
     }
 
-    /// Fail-closed atomic restore from a decrypted `.fhvault` backup payload.
+    /// Fail-closed, crash-safe atomic restore from a decrypted `.fhvault` backup payload.
     ///
     /// Guarantees:
-    /// - Validates schema version, Ed25519 signing seed, complete evidence signature chain,
-    ///   and all record constraints BEFORE mutating the OS keyring or SQLite database.
-    /// - Replaces all workspace tables inside a single SQLite transaction re-encrypted under
-    ///   this device's OS-managed `db_master_key`.
-    /// - Rolls back the OS keyring signing seed if the SQLite transaction fails.
+    /// - Pre-validates schema version, Ed25519 signing seed, full evidence signature chain,
+    ///   and uniqueness of ALL primary/unique keys BEFORE touching disk or OS keyring.
+    /// - Writes all restored records encrypted under this device's `db_master_key` into an
+    ///   independent sibling staging SQLite database, then re-reads and cryptographically
+    ///   verifies its canary and full Ed25519 chain before switching.
+    /// - Records an AES-256-GCM encrypted `.restore-intent` before swapping files and
+    ///   syncing the OS keyring signing seed so any mid-restore crash recovers cleanly on
+    ///   next startup without permanent bricking.
     pub fn restore_from_backup_payload(
         &mut self,
         payload: VaultBackupPayload,
@@ -837,21 +1071,57 @@ impl EncryptedVaultDb {
         }
 
         let restored_signing_key = decode_signing_key_hex(&payload.device_signing_seed_hex)?;
-        let verified_journal =
-            EvidenceJournal::from_persisted(restored_signing_key, payload.evidence_entries.clone())
-                .map_err(|error| {
-                    StorageError::Integrity(format!(
-                        "backup evidence chain failed cryptographic verification: {error}"
-                    ))
-                })?;
+        let verified_journal = EvidenceJournal::from_persisted(
+            restored_signing_key.clone(),
+            payload.evidence_entries.clone(),
+        )
+        .map_err(|error| {
+            StorageError::Integrity(format!(
+                "backup evidence chain failed cryptographic verification: {error}"
+            ))
+        })?;
 
+        // Pre-validate all record constraints and unique keys before writing anything.
+        let mut seen_evidence_seq = BTreeSet::new();
+        let mut seen_evidence_ids = BTreeSet::new();
+        for entry in &payload.evidence_entries {
+            if !seen_evidence_seq.insert(entry.event.sequence) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate evidence sequence {}",
+                    entry.event.sequence
+                )));
+            }
+            if !seen_evidence_ids.insert(entry.event.event_id.as_str()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate evidence event_id '{}'",
+                    entry.event.event_id
+                )));
+            }
+        }
+
+        let mut seen_portfolio_ids = BTreeSet::new();
+        let mut seen_portfolio_fps = BTreeSet::new();
         for snapshot in &payload.portfolio_snapshots {
             if snapshot.id.trim().is_empty() || snapshot.fingerprint.trim().is_empty() {
                 return Err(StorageError::InvalidInput(
                     "backup contains portfolio snapshot with empty id or fingerprint".to_string(),
                 ));
             }
+            if !seen_portfolio_ids.insert(snapshot.id.as_str()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate portfolio snapshot id '{}'",
+                    snapshot.id
+                )));
+            }
+            if !seen_portfolio_fps.insert(snapshot.fingerprint.as_str()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate portfolio snapshot fingerprint '{}'",
+                    snapshot.fingerprint
+                )));
+            }
         }
+
+        let mut seen_order_ids = BTreeSet::new();
         for order in &payload.paper_orders {
             if order.id.trim().is_empty()
                 || !matches!(order.workspace_mode.as_str(), "mock" | "local-csv")
@@ -860,7 +1130,29 @@ impl EncryptedVaultDb {
                     "backup contains invalid paper order".to_string(),
                 ));
             }
+            if !seen_order_ids.insert(order.id.as_str()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate paper order id '{}'",
+                    order.id
+                )));
+            }
         }
+
+        let mut seen_quote_symbols = BTreeSet::new();
+        for quote in &payload.quote_cache {
+            if quote.symbol.trim().is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "backup contains quote cache entry with empty symbol".to_string(),
+                ));
+            }
+            if !seen_quote_symbols.insert(quote.symbol.as_str()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate quote cache symbol '{}'",
+                    quote.symbol
+                )));
+            }
+        }
+
         for key in payload.settings.keys() {
             if key.trim().is_empty() || key.len() > 128 {
                 return Err(StorageError::InvalidInput(
@@ -869,7 +1161,11 @@ impl EncryptedVaultDb {
             }
         }
 
-        // Pre-encrypt every restored record with this device's db_master_key before mutating DB.
+        // Preserve local device App Lock configuration across backup restore.
+        let preserved_verifier = self.load_app_lock_verifier()?;
+        let preserved_backoff = self.load_app_lock_backoff()?;
+
+        // Pre-encrypt every restored record with this device's db_master_key.
         let mut encrypted_evidence = Vec::with_capacity(payload.evidence_entries.len());
         for entry in &payload.evidence_entries {
             let seq = i64::try_from(entry.event.sequence).map_err(|_| {
@@ -939,17 +1235,56 @@ impl EncryptedVaultDb {
             encrypted_settings.push((key.clone(), now.clone(), ciphertext));
         }
 
-        let previous_seed = self
-            .keys
-            .replace_signing_seed(key_store, &payload.device_signing_seed_hex)?;
+        // Build and verify an independent staging SQLite file in the same directory.
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| StorageError::Vault(VaultError::RandomnessUnavailable))?;
+        let suffix = encode_hex(&nonce);
+        let base_name = self
+            .db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("foliohelm-vault.sqlite");
+        let staging_file_name = format!("{base_name}.restore-staging-{suffix}");
+        let backup_file_name = format!("{base_name}.pre-restore-{suffix}");
+        let staging_path = self.db_path.with_file_name(&staging_file_name);
+        let backup_path = self.db_path.with_file_name(&backup_file_name);
+        let intent_path = restore_intent_path(&self.db_path);
 
-        let db_result: Result<(), StorageError> = (|| {
-            let tx = self.conn.transaction()?;
-            tx.execute("DELETE FROM evidence_entries", [])?;
-            tx.execute("DELETE FROM portfolio_snapshots", [])?;
-            tx.execute("DELETE FROM paper_orders", [])?;
-            tx.execute("DELETE FROM quote_cache", [])?;
-            tx.execute("DELETE FROM app_settings", [])?;
+        let stage_result: Result<(), StorageError> = (|| {
+            let mut staging_conn = Connection::open(&staging_path)?;
+            configure_connection(&staging_conn)?;
+            initialize_schema_on_conn(&mut staging_conn, self.keys.db_master_key())?;
+
+            let tx = staging_conn.transaction()?;
+            if let Some(ref verifier) = preserved_verifier {
+                let plaintext = Zeroizing::new(serde_json::to_vec(verifier)?);
+                let aad = build_aad(
+                    STORAGE_SCHEMA_VERSION,
+                    "vault_meta",
+                    APP_LOCK_VERIFIER_META_KEY,
+                );
+                let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                    params![APP_LOCK_VERIFIER_META_KEY, ciphertext],
+                )?;
+            }
+            if preserved_backoff.failed_attempts > 0
+                || preserved_backoff.locked_until_unix.is_some()
+            {
+                let plaintext = serde_json::to_vec(&preserved_backoff)?;
+                let aad = build_aad(
+                    STORAGE_SCHEMA_VERSION,
+                    "vault_meta",
+                    APP_LOCK_BACKOFF_META_KEY,
+                );
+                let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                    params![APP_LOCK_BACKOFF_META_KEY, ciphertext],
+                )?;
+            }
 
             for (seq, event_id, occurred_at_utc, ciphertext) in &encrypted_evidence {
                 tx.execute(
@@ -989,13 +1324,148 @@ impl EncryptedVaultDb {
                 )?;
             }
             tx.commit()?;
+
+            // Re-read and cryptographically verify staging DB canary + full Ed25519 chain.
+            verify_connection_schema_and_canary(&staging_conn, self.keys.db_master_key())?;
+            let staged_entries =
+                load_evidence_entries_from_conn(&staging_conn, self.keys.db_master_key())?;
+            let _ = EvidenceJournal::from_persisted(restored_signing_key.clone(), staged_entries)
+                .map_err(|error| {
+                StorageError::Integrity(format!(
+                    "staged restore database failed Ed25519 verification: {error}"
+                ))
+            })?;
+
+            // Flush WAL into main staging file before closing so a single atomic rename suffices.
+            staging_conn.execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode = DELETE;",
+            )?;
+            drop(staging_conn);
+            for sidecar in sqlite_sidecar_paths(&staging_path) {
+                let _ = fs::remove_file(sidecar);
+            }
             Ok(())
         })();
 
-        if let Err(error) = db_result {
-            let _ = self.keys.restore_signing_seed(key_store, previous_seed);
+        if let Err(error) = stage_result {
+            remove_sqlite_files(&staging_path);
             return Err(error);
         }
+
+        // Write encrypted crash-recovery intent BEFORE mutating live DB or OS keyring.
+        let previous_seed_hex = self.keys.device_signing_seed_hex();
+        let intent = RestoreIntentRecord {
+            schema_version: STORAGE_SCHEMA_VERSION,
+            previous_seed_hex,
+            target_seed_hex: payload.device_signing_seed_hex.clone(),
+            staging_file_name,
+            backup_file_name,
+        };
+        let intent_plaintext = Zeroizing::new(serde_json::to_vec(&intent)?);
+        let intent_aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            RESTORE_INTENT_AAD_TABLE,
+            RESTORE_INTENT_RECORD_ID,
+        );
+        let intent_ciphertext =
+            encrypt_record(self.keys.db_master_key(), &intent_aad, &intent_plaintext)?;
+        if let Err(error) = atomic_write_bytes(&intent_path, &intent_ciphertext) {
+            remove_sqlite_files(&staging_path);
+            return Err(StorageError::Io(error));
+        }
+
+        // Flush WAL and release live connection lock (required on Windows before rename).
+        let flush_res = self.conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode = DELETE;",
+        );
+        if let Err(error) = flush_res {
+            let _ = configure_connection(&self.conn);
+            remove_sqlite_files(&staging_path);
+            let _ = fs::remove_file(&intent_path);
+            return Err(StorageError::Sqlite(error));
+        }
+
+        let placeholder = Connection::open_in_memory()?;
+        let old_conn = std::mem::replace(&mut self.conn, placeholder);
+        drop(old_conn);
+        for sidecar in sqlite_sidecar_paths(&self.db_path) {
+            let _ = fs::remove_file(sidecar);
+        }
+
+        // Swap live DB -> backup, staging DB -> live DB.
+        let swap_result: Result<(), StorageError> = (|| {
+            fs::rename(&self.db_path, &backup_path)?;
+            if let Err(error) = fs::rename(&staging_path, &self.db_path) {
+                let _ = fs::rename(&backup_path, &self.db_path);
+                return Err(StorageError::Io(error));
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = swap_result {
+            remove_sqlite_files(&staging_path);
+            let _ = fs::remove_file(&intent_path);
+            if let Ok(reopened) = Connection::open(&self.db_path) {
+                let _ = configure_connection(&reopened);
+                self.conn = reopened;
+            }
+            return Err(error);
+        }
+
+        // Synchronize OS keyring Ed25519 signing seed AFTER DB file switch succeeds.
+        let previous_seed = match self
+            .keys
+            .replace_signing_seed(key_store, &payload.device_signing_seed_hex)
+        {
+            Ok(prev) => prev,
+            Err(error) => {
+                remove_sqlite_files(&self.db_path);
+                let _ = fs::rename(&backup_path, &self.db_path);
+                remove_sqlite_files(&staging_path);
+                let _ = fs::remove_file(&intent_path);
+                if let Ok(reopened) = Connection::open(&self.db_path) {
+                    let _ = configure_connection(&reopened);
+                    self.conn = reopened;
+                }
+                return Err(StorageError::Vault(error));
+            }
+        };
+
+        // Reopen live connection on the restored DB and verify canary + Ed25519 chain.
+        let verify_reopened: Result<(), StorageError> = (|| {
+            let reopened = Connection::open(&self.db_path)?;
+            configure_connection(&reopened)?;
+            verify_connection_schema_and_canary(&reopened, self.keys.db_master_key())?;
+            let entries = load_evidence_entries_from_conn(&reopened, self.keys.db_master_key())?;
+            let _ = EvidenceJournal::from_persisted(self.keys.signing_key(), entries).map_err(
+                |error| {
+                    StorageError::Integrity(format!(
+                        "restored database failed post-swap verification: {error}"
+                    ))
+                },
+            )?;
+            self.conn = reopened;
+            Ok(())
+        })();
+
+        if let Err(error) = verify_reopened {
+            let _ = self.keys.restore_signing_seed(key_store, previous_seed);
+            remove_sqlite_files(&self.db_path);
+            let _ = fs::rename(&backup_path, &self.db_path);
+            let _ = fs::remove_file(&intent_path);
+            if let Ok(reopened) = Connection::open(&self.db_path) {
+                let _ = configure_connection(&reopened);
+                self.conn = reopened;
+            }
+            return Err(error);
+        }
+
+        // Clean up backup and crash-recovery intent once both DB and keyring are live & verified.
+        remove_sqlite_files(&backup_path);
+        remove_sqlite_files(&staging_path);
+        let _ = fs::remove_file(&intent_path);
 
         let summary = VaultRestoreSummaryDto {
             evidence_count: encrypted_evidence.len(),
@@ -1020,6 +1490,155 @@ impl EncryptedVaultDb {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn initialize_schema_on_conn(
+    conn: &mut Connection,
+    db_master_key: &[u8; 32],
+) -> Result<(), StorageError> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vault_meta (
+            meta_key TEXT PRIMARY KEY,
+            meta_value BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS evidence_entries (
+            sequence INTEGER PRIMARY KEY,
+            event_id TEXT NOT NULL UNIQUE,
+            occurred_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+            id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL UNIQUE,
+            source_format TEXT NOT NULL,
+            imported_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS paper_orders (
+            id TEXT PRIMARY KEY,
+            workspace_mode TEXT NOT NULL,
+            submitted_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS quote_cache (
+            symbol TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            as_of_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );",
+    )?;
+
+    let aad = build_aad(STORAGE_SCHEMA_VERSION, "vault_meta", CANARY_RECORD_ID);
+    let canary_blob = encrypt_record(db_master_key, &aad, CANARY_PLAINTEXT)?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+        params![
+            "schema_version",
+            STORAGE_SCHEMA_VERSION.to_string().as_bytes()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+        params![
+            "crypto_version",
+            VAULT_CRYPTO_VERSION.to_string().as_bytes()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+        params![CANARY_RECORD_ID, canary_blob],
+    )?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_connection_schema_and_canary(
+    conn: &Connection,
+    db_master_key: &[u8; 32],
+) -> Result<(), StorageError> {
+    let schema_bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT meta_value FROM vault_meta WHERE meta_key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(schema_bytes) = schema_bytes else {
+        return Err(StorageError::Integrity(
+            "existing database is missing vault_meta schema_version".to_string(),
+        ));
+    };
+    let schema_str = String::from_utf8(schema_bytes).map_err(|_| {
+        StorageError::Integrity("vault_meta schema_version is not UTF-8".to_string())
+    })?;
+    let version: u16 = schema_str.parse().map_err(|_| {
+        StorageError::Integrity(format!("invalid vault schema version: {schema_str}"))
+    })?;
+    if version != STORAGE_SCHEMA_VERSION {
+        return Err(StorageError::Integrity(format!(
+            "unsupported vault schema version {version}"
+        )));
+    }
+
+    let canary_blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+            params![CANARY_RECORD_ID],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(canary_blob) = canary_blob else {
+        return Err(StorageError::Integrity(
+            "existing database is missing encryption canary".to_string(),
+        ));
+    };
+    let aad = build_aad(STORAGE_SCHEMA_VERSION, "vault_meta", CANARY_RECORD_ID);
+    let decrypted = decrypt_record(db_master_key, &aad, &canary_blob)?;
+    if decrypted.as_slice() != CANARY_PLAINTEXT {
+        return Err(StorageError::Integrity(
+            "vault encryption canary mismatch".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn load_evidence_entries_from_conn(
+    conn: &Connection,
+    db_master_key: &[u8; 32],
+) -> Result<Vec<SignedEvidenceEntry>, StorageError> {
+    let mut stmt =
+        conn.prepare("SELECT sequence, ciphertext FROM evidence_entries ORDER BY sequence ASC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        let (sequence, ciphertext) = row?;
+        let aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            "evidence_entries",
+            &sequence.to_string(),
+        );
+        let plaintext = decrypt_record(db_master_key, &aad, &ciphertext)?;
+        let entry: SignedEvidenceEntry = serde_json::from_slice(&plaintext)?;
+        if i64::try_from(entry.event.sequence).ok() != Some(sequence) {
+            return Err(StorageError::Integrity(format!(
+                "evidence sequence mismatch at row {sequence}"
+            )));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -1312,5 +1931,319 @@ mod tests {
 
         cleanup_temp_db(&src_path);
         cleanup_temp_db(&dst_path);
+    }
+
+    #[test]
+    fn encrypts_app_lock_verifier_and_backoff_with_aad_and_migrates_legacy_plaintext() {
+        let db_path = unique_temp_db("verifier-aad");
+        let key_store = InMemoryKeyStore::new();
+        let verifier = crate::vault::create_app_lock_verifier_with_params(
+            "Stage4-Strong-Passphrase!",
+            4096,
+            1,
+            1,
+        )
+        .expect("create verifier");
+
+        // 1. Seed a legacy plaintext JSON verifier directly into vault_meta.
+        {
+            let db = EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").expect("open");
+            drop(db);
+            let raw_conn = Connection::open(&db_path).expect("raw");
+            let legacy_json = serde_json::to_vec(&verifier).expect("json");
+            raw_conn
+                .execute(
+                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                    params![APP_LOCK_VERIFIER_META_KEY, legacy_json],
+                )
+                .expect("seed legacy");
+        }
+
+        // 2. Opening migrates legacy plaintext verifier to AES-256-GCM ciphertext with AAD.
+        {
+            let mut db =
+                EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").expect("reopen");
+            let loaded = db
+                .load_app_lock_verifier()
+                .expect("load migrated")
+                .expect("some verifier");
+            assert_eq!(loaded, verifier);
+
+            let raw_blob: Vec<u8> = db
+                .conn
+                .query_row(
+                    "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+                    params![APP_LOCK_VERIFIER_META_KEY],
+                    |row| row.get(0),
+                )
+                .expect("raw meta");
+            assert_eq!(raw_blob[0], VAULT_CRYPTO_VERSION);
+            assert!(!String::from_utf8_lossy(&raw_blob).contains("argon2id"));
+            assert!(!String::from_utf8_lossy(&raw_blob).contains(&verifier.hash_b64));
+
+            // Save encrypted backoff state and verify roundtrip.
+            let backoff = AppLockBackoffState {
+                failed_attempts: 3,
+                locked_until_unix: Some(2_000_000_000),
+            };
+            db.save_app_lock_backoff(&backoff).expect("save backoff");
+            assert_eq!(db.load_app_lock_backoff().expect("load backoff"), backoff);
+        }
+
+        // 3. Cross-row AAD swap (replacing verifier with canary ciphertext) MUST fail closed.
+        {
+            let raw_conn = Connection::open(&db_path).expect("raw");
+            let canary_blob: Vec<u8> = raw_conn
+                .query_row(
+                    "SELECT meta_value FROM vault_meta WHERE meta_key = ?1",
+                    params![CANARY_RECORD_ID],
+                    |row| row.get(0),
+                )
+                .expect("canary");
+            raw_conn
+                .execute(
+                    "UPDATE vault_meta SET meta_value = ?1 WHERE meta_key = ?2",
+                    params![canary_blob, APP_LOCK_VERIFIER_META_KEY],
+                )
+                .expect("swap");
+        }
+        assert!(
+            EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").is_err(),
+            "tampered app_lock_verifier ciphertext must fail closed on open"
+        );
+
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn backup_restore_rejects_duplicates_redacts_seed_and_recovers_from_keyring_or_crash_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ToggleFailKeyStore {
+            inner: InMemoryKeyStore,
+            fail_seed_writes: AtomicBool,
+        }
+        impl KeyStore for ToggleFailKeyStore {
+            fn get_secret(
+                &self,
+                service: &str,
+                account: &str,
+            ) -> Result<Option<Zeroizing<String>>, VaultError> {
+                self.inner.get_secret(service, account)
+            }
+            fn set_secret(
+                &self,
+                service: &str,
+                account: &str,
+                secret: &str,
+            ) -> Result<(), VaultError> {
+                if account == crate::vault::DEVICE_SIGNING_SEED_ACCOUNT
+                    && self.fail_seed_writes.load(Ordering::SeqCst)
+                {
+                    return Err(VaultError::KeyStoreUnavailable(
+                        "simulated keyring write failure".to_string(),
+                    ));
+                }
+                self.inner.set_secret(service, account, secret)
+            }
+            fn delete_secret(&self, service: &str, account: &str) -> Result<(), VaultError> {
+                self.inner.delete_secret(service, account)
+            }
+        }
+
+        let src_path = unique_temp_db("p0-3-src");
+        let dst_path = unique_temp_db("p0-3-dst");
+        let src_keys = InMemoryKeyStore::new();
+        let dst_keys = ToggleFailKeyStore {
+            inner: InMemoryKeyStore::new(),
+            fail_seed_writes: AtomicBool::new(false),
+        };
+
+        let exported = {
+            let mut db =
+                EncryptedVaultDb::open(&src_path, &src_keys, "in-memory-test").expect("src");
+            let mut journal = EvidenceJournal::from_signing_key(db.signing_key());
+            let (entry, _) = journal
+                .append_entry(AppendEvidenceRequest {
+                    kind: "portfolio_import".into(),
+                    payload: BTreeMap::from([("mode".into(), "local-csv".into())]),
+                    app_version: Some("0.1.0".into()),
+                    occurred_at_utc: Some("2026-11-22T02:00:00Z".into()),
+                    account_ref: Some("acct_local_csv".into()),
+                    intent_id: Some("imp-01".into()),
+                })
+                .expect("append");
+            db.insert_evidence_entry(&entry).expect("insert");
+            db.save_portfolio_snapshot(&sample_snapshot("fp-01"))
+                .expect("snap");
+            db.save_setting("restored_key", r#""from-backup""#)
+                .expect("setting");
+            db.export_backup_payload().expect("export")
+        };
+
+        // Debug representation of VaultBackupPayload must redact signing seed hex.
+        let debug_str = format!("{exported:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains(exported.device_signing_seed_hex.as_str()));
+
+        // Open destination vault with existing data and an App Lock verifier.
+        let mut dst_db =
+            EncryptedVaultDb::open(&dst_path, &dst_keys, "in-memory-test").expect("dst");
+        dst_db
+            .save_setting("existing_key", r#""original-data""#)
+            .expect("existing");
+        let mut dst_journal = EvidenceJournal::from_signing_key(dst_db.signing_key());
+        let (dst_entry, _) = dst_journal
+            .append_entry(AppendEvidenceRequest {
+                kind: "state_changed".into(),
+                payload: BTreeMap::from([("phase".into(), "pre-restore".into())]),
+                app_version: Some("0.1.0".into()),
+                occurred_at_utc: Some("2026-11-22T01:00:00Z".into()),
+                account_ref: Some("acct_local_mock".into()),
+                intent_id: Some("pre-01".into()),
+            })
+            .expect("append dst");
+        dst_db
+            .insert_evidence_entry(&dst_entry)
+            .expect("insert dst");
+
+        // 1. Duplicate unique keys inside backup MUST be rejected before touching DB/keyring.
+        let mut dup_payload = exported.clone();
+        dup_payload
+            .portfolio_snapshots
+            .push(sample_snapshot("fp-01"));
+        assert!(dst_db
+            .restore_from_backup_payload(dup_payload, &dst_keys)
+            .is_err());
+        assert_eq!(
+            dst_db.load_setting("existing_key").expect("still intact"),
+            Some(r#""original-data""#.to_string())
+        );
+
+        // 2. Simulated OS keyring write failure during restore MUST roll back DB cleanly.
+        dst_keys.fail_seed_writes.store(true, Ordering::SeqCst);
+        assert!(dst_db
+            .restore_from_backup_payload(exported.clone(), &dst_keys)
+            .is_err());
+        dst_keys.fail_seed_writes.store(false, Ordering::SeqCst);
+        assert_eq!(
+            dst_db.load_setting("existing_key").expect("rolled back"),
+            Some(r#""original-data""#.to_string())
+        );
+        assert!(dst_db
+            .load_setting("restored_key")
+            .expect("no leak")
+            .is_none());
+        assert!(!restore_intent_path(&dst_path).exists());
+
+        // 3. Simulated mid-restore crash (DB swapped, keyring still holds old seed, encrypted
+        //    `.restore-intent` left on disk) MUST auto-recover on reopen without bricking!
+        let old_seed_hex = dst_db.keys.device_signing_seed_hex();
+        let db_master_key = *dst_db.keys.db_master_key();
+        drop(dst_db);
+
+        let backup_name = "vault.sqlite.pre-restore-crashsim".to_string();
+        let staging_name = "vault.sqlite.restore-staging-crashsim".to_string();
+        let backup_path = dst_path.with_file_name(&backup_name);
+        let staging_path = dst_path.with_file_name(&staging_name);
+        // Move intact original DB to backup_path and put an incompatible DB at dst_path.
+        fs::rename(&dst_path, &backup_path).expect("move to backup");
+        for sidecar in sqlite_sidecar_paths(&dst_path) {
+            let _ = fs::remove_file(sidecar);
+        }
+        fs::write(&dst_path, b"corrupted-mid-swap").expect("simulate partial swap");
+        fs::write(&staging_path, b"leftover-staging").expect("simulate staging");
+
+        let intent = RestoreIntentRecord {
+            schema_version: STORAGE_SCHEMA_VERSION,
+            previous_seed_hex: old_seed_hex,
+            target_seed_hex: exported.device_signing_seed_hex.clone(),
+            staging_file_name: staging_name,
+            backup_file_name: backup_name,
+        };
+        let intent_bytes = encrypt_record(
+            &db_master_key,
+            &build_aad(
+                STORAGE_SCHEMA_VERSION,
+                RESTORE_INTENT_AAD_TABLE,
+                RESTORE_INTENT_RECORD_ID,
+            ),
+            &serde_json::to_vec(&intent).expect("intent json"),
+        )
+        .expect("encrypt intent");
+        atomic_write_bytes(&restore_intent_path(&dst_path), &intent_bytes).expect("write intent");
+
+        // Reopen recovers automatically to the intact pre-restore DB and cleans up leftovers!
+        let recovered =
+            EncryptedVaultDb::open(&dst_path, &dst_keys, "in-memory-test").expect("auto-recover");
+        assert_eq!(
+            recovered.load_setting("existing_key").expect("recovered"),
+            Some(r#""original-data""#.to_string())
+        );
+        let recovered_entries = recovered.load_evidence_entries().expect("entries");
+        assert!(
+            EvidenceJournal::from_persisted(recovered.signing_key(), recovered_entries)
+                .expect("verified chain")
+                .verify()
+                .valid
+        );
+        assert!(!restore_intent_path(&dst_path).exists());
+        assert!(!backup_path.exists());
+        assert!(!staging_path.exists());
+
+        cleanup_temp_db(&src_path);
+        cleanup_temp_db(&dst_path);
+    }
+
+    #[test]
+    fn paper_order_validates_workspace_mode_and_persists_currency_with_legacy_default() {
+        let db_path = unique_temp_db("paper-order-currency");
+        let key_store = InMemoryKeyStore::new();
+        let mut db = EncryptedVaultDb::open(&db_path, &key_store, "in-memory-test").expect("open");
+
+        let invalid_order = StoredPaperOrder {
+            id: "ORD-BAD-1".into(),
+            workspace_mode: "live-broker".into(),
+            symbol: "AAPL".into(),
+            side: "buy".into(),
+            order_type: "market".into(),
+            quantity: "1".into(),
+            filled_quantity: "0".into(),
+            limit_price: None,
+            currency: "USD".into(),
+            status: "working".into(),
+            submitted_at: "2026-11-22T05:00:00Z".into(),
+            events: vec![],
+        };
+        assert!(matches!(
+            db.save_paper_order(&invalid_order),
+            Err(StorageError::InvalidInput(_))
+        ));
+
+        let hkd_order = StoredPaperOrder {
+            id: "PAPER-HKD-1".into(),
+            workspace_mode: "local-csv".into(),
+            symbol: "00700.HK".into(),
+            side: "buy".into(),
+            order_type: "limit".into(),
+            quantity: "100".into(),
+            filled_quantity: "0".into(),
+            limit_price: Some("380.00".into()),
+            currency: "HKD".into(),
+            status: "working".into(),
+            submitted_at: "2026-11-22T05:00:00Z".into(),
+            events: vec![],
+        };
+        db.save_paper_order(&hkd_order).expect("save hkd order");
+        let loaded = db.load_paper_orders("local-csv").expect("load orders");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].currency, "HKD");
+
+        // Deserializing a legacy order JSON without `currency` defaults cleanly to "USD".
+        let legacy_json = r#"{"id":"OLD-1","workspaceMode":"mock","symbol":"AAPL","side":"buy","orderType":"market","quantity":"1","filledQuantity":"0","limitPrice":null,"status":"working","submittedAt":"2026-11-22T00:00:00Z","events":[]}"#;
+        let parsed: StoredPaperOrder = serde_json::from_str(legacy_json).expect("legacy parse");
+        assert_eq!(parsed.currency, "USD");
+
+        cleanup_temp_db(&db_path);
     }
 }
