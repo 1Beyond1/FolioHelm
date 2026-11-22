@@ -20,6 +20,7 @@ argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "z
 base64 = { version = "=0.22.1" }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde"] }
 ed25519-dalek = { version = "=3.0.0" }
+encoding_rs = { version = "=0.8.44" }
 getrandom = { version = "=0.3.4" }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "charset", "http2"] }
 rusqlite = { version = "=0.32.1", features = ["bundled"] }

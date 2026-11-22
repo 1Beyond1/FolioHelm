@@ -165,6 +165,35 @@ const CASH_COL_ALIASES = [
   "账户现金",
 ] as const;
 
+const CASH_ROW_VALUE_ALIASES = [
+  "market value",
+  "market_value",
+  "mkt val",
+  "mkt val (market value)",
+  "current value",
+  "total value",
+  "amount",
+  "cash",
+  "price",
+  "value",
+  "市值",
+  "持仓市值",
+  "参考市值",
+  "现金",
+  "可用现金",
+  "账户现金",
+] as const;
+
+const SECURITY_TYPE_ALIASES = [
+  "asset category",
+  "security type",
+  "asset class",
+  "type",
+  "资产类别",
+  "证券类型",
+  "品种",
+] as const;
+
 const FORMAT_LABELS: Record<CsvFormatCode, { en: string; zh: string }> = {
   schwab_positions: { en: "Charles Schwab Positions CSV", zh: "嘉信理财持仓 CSV" },
   schwab_transactions: { en: "Charles Schwab Transactions CSV", zh: "嘉信理财交易流水 CSV" },
@@ -261,19 +290,112 @@ function inferCurrencyFromSymbol(symbol: string): string | undefined {
   return undefined;
 }
 
+function normalizeNumericUnicode(raw: string): string {
+  return raw
+    .replace(/[\u00A0\u202F\u2007\u3000]/g, " ")
+    .replace(/[\u2212\u2013\u2014\uFF0D]/g, "-");
+}
+
 function inferCurrencyFromAmount(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
-  const trimmed = raw.trim().replace(/^[(\-+\s]+/, "");
+  const trimmed = normalizeNumericUnicode(raw).trim().replace(/^[()\-+\s]+|[()\-+\s]+$/g, "");
   const upper = trimmed.toUpperCase();
-  if (upper.startsWith("HK$") || upper.startsWith("HKD")) return "HKD";
-  if (upper.startsWith("US$") || upper.startsWith("USD")) return "USD";
-  if (upper.startsWith("S$") || upper.startsWith("SGD")) return "SGD";
-  if (upper.startsWith("C$") || upper.startsWith("CAD")) return "CAD";
-  if (upper.startsWith("A$") || upper.startsWith("AUD")) return "AUD";
-  if (upper.startsWith("CN¥") || upper.startsWith("CN￥") || upper.startsWith("RMB") || trimmed.startsWith("¥") || trimmed.startsWith("￥")) return "CNY";
-  if (trimmed.startsWith("€")) return "EUR";
-  if (trimmed.startsWith("£")) return "GBP";
+  if (upper.startsWith("HK$") || upper.startsWith("HKD") || upper.endsWith("HK$") || upper.endsWith("HKD") || trimmed.endsWith("港元") || trimmed.endsWith("港币")) return "HKD";
+  if (upper.startsWith("US$") || upper.startsWith("USD") || upper.endsWith("US$") || upper.endsWith("USD") || trimmed.endsWith("美元")) return "USD";
+  if (upper.startsWith("S$") || upper.startsWith("SGD") || upper.endsWith("S$") || upper.endsWith("SGD")) return "SGD";
+  if (upper.startsWith("C$") || upper.startsWith("CAD") || upper.endsWith("C$") || upper.endsWith("CAD")) return "CAD";
+  if (upper.startsWith("A$") || upper.startsWith("AUD") || upper.endsWith("A$") || upper.endsWith("AUD")) return "AUD";
+  if (
+    upper.startsWith("CN¥") || upper.startsWith("CN￥") || upper.startsWith("CNY") || upper.startsWith("RMB")
+    || upper.endsWith("CNY") || upper.endsWith("RMB")
+    || trimmed.startsWith("¥") || trimmed.startsWith("￥")
+    || trimmed.endsWith("¥") || trimmed.endsWith("￥") || trimmed.endsWith("人民币")
+  ) return "CNY";
+  if (trimmed.startsWith("€") || trimmed.endsWith("€") || upper.startsWith("EUR") || upper.endsWith("EUR")) return "EUR";
+  if (trimmed.startsWith("£") || trimmed.endsWith("£") || upper.startsWith("GBP") || upper.endsWith("GBP")) return "GBP";
+  if (upper.startsWith("JPY") || upper.endsWith("JPY")) return "JPY";
+  if (upper.startsWith("CHF") || upper.endsWith("CHF")) return "CHF";
   return undefined;
+}
+
+function isSecondaryTransactionHeader(normalized: readonly string[]): boolean {
+  const hasSymbol = normalized.some((h) => (SYMBOL_ALIASES as readonly string[]).includes(h));
+  const hasAction = normalized.some((h) => h === "action" || h === "side" || h === "transaction type");
+  const hasDate = normalized.some((h) => h === "date" || h === "trade date" || h === "settlement date" || h === "date/time");
+  return hasSymbol && hasAction && hasDate;
+}
+
+function isDisclaimerOrFooterRow(row: readonly string[]): boolean {
+  const nonEmpty = row.map((c) => c.trim()).filter(Boolean);
+  if (nonEmpty.length === 0) return true;
+  const first = nonEmpty[0]!;
+  const firstLower = first.toLowerCase();
+  const prefixes = [
+    "the data and information",
+    "brokerage services",
+    "date downloaded",
+    "disclaimer",
+    "important information",
+    "important notice",
+    "note:",
+    "notes:",
+    "footnotes",
+    "fidelity brokerage",
+    "charles schwab",
+    "vanguard brokerage",
+    "for informational purposes",
+    "past performance",
+    "all rights reserved",
+    "copyright",
+    "免责声明",
+    "注：",
+    "备注：",
+  ];
+  if (prefixes.some((p) => firstLower.startsWith(p))) return true;
+  if ((first.startsWith("*") || first.startsWith("†")) && nonEmpty.length <= 2) return true;
+  if (nonEmpty.length === 1 && first.length > 40 && first.includes(" ")) return true;
+  return false;
+}
+
+function looksLikeOptionSymbol(raw: string): boolean {
+  const trimmed = raw.trim().toUpperCase();
+  if (!trimmed) return false;
+  const stripped = trimmed.replace(/^-/, "").replace(/^(?:US|HK|SG)\./, "");
+  if (!stripped.includes(" ") && stripped.length >= 11) {
+    if (/^[A-Z0-9]{1,6}\d{6}[CP]\d{1,10}(?:\.\d+)?$/.test(stripped)) {
+      return true;
+    }
+  }
+  if (stripped.includes(" ")) {
+    const tokens = stripped.split(/\s+/);
+    if (tokens.length >= 3) {
+      const last = tokens[tokens.length - 1] ?? "";
+      const endsWithCp = last === "C" || last === "P" || last === "CALL" || last === "PUT";
+      const hasDate = tokens.some((t) =>
+        (t.includes("/") && t.length >= 8)
+        || /^\d{2}[A-Z]{3}\d{2}$/.test(t)
+        || /^\d{6}$/.test(t)
+        || /^\d{8}$/.test(t));
+      if (endsWithCp && hasDate) return true;
+    }
+  }
+  return false;
+}
+
+function isOptionRow(headers: readonly string[], row: readonly string[], rawSymbol: string): boolean {
+  const secType = findCell(headers, row, SECURITY_TYPE_ALIASES)?.trim().toLowerCase() ?? "";
+  if (
+    secType.includes("option")
+    || secType.includes("warrant")
+    || secType.includes("future")
+    || secType.includes("期权")
+    || secType.includes("窝轮")
+    || secType.includes("牛熊证")
+    || secType.includes("期货")
+  ) {
+    return true;
+  }
+  return looksLikeOptionSymbol(rawSymbol);
 }
 
 function isSummaryOrBlankSymbol(raw: string): boolean {
@@ -349,6 +471,12 @@ export function validateCsvSymbol(raw: string, rowNum: number): string {
     cleaned = cleaned.slice(3);
   } else if (cleaned.startsWith("HK.") && cleaned.length > 3 && cleaned.length <= 10) {
     cleaned = `${cleaned.slice(3)}.HK`;
+  } else if (cleaned.startsWith("SH.") && cleaned.length > 3 && cleaned.length <= 10) {
+    cleaned = `${cleaned.slice(3)}.SS`;
+  } else if (cleaned.startsWith("SZ.") && cleaned.length > 3 && cleaned.length <= 10) {
+    cleaned = `${cleaned.slice(3)}.SZ`;
+  } else if (cleaned.startsWith("SG.") && cleaned.length > 3 && cleaned.length <= 10) {
+    cleaned = `${cleaned.slice(3)}.SI`;
   }
   if (!SYMBOL_RE.test(cleaned)) {
     throw new Error(`Invalid symbol in row ${rowNum}: ${raw.trim().slice(0, 24)}`);
@@ -356,58 +484,103 @@ export function validateCsvSymbol(raw: string, rowNum: number): string {
   return cleaned;
 }
 
+const CURRENCY_TOKENS = [
+  "HK$",
+  "US$",
+  "S$",
+  "C$",
+  "A$",
+  "CN¥",
+  "CN￥",
+  "RMB",
+  "USD",
+  "HKD",
+  "CNY",
+  "EUR",
+  "GBP",
+  "SGD",
+  "JPY",
+  "CAD",
+  "AUD",
+  "CHF",
+  "港元",
+  "港币",
+  "美元",
+  "人民币",
+  "新元",
+  "欧元",
+  "英镑",
+  "日元",
+  "元",
+  "$",
+  "¥",
+  "￥",
+  "€",
+  "£",
+] as const;
+
 function stripCurrencyPrefix(text: string): string {
-  const prefixes = [
-    "HK$",
-    "US$",
-    "S$",
-    "C$",
-    "A$",
-    "CN¥",
-    "CN￥",
-    "RMB",
-    "USD",
-    "HKD",
-    "CNY",
-    "EUR",
-    "GBP",
-    "SGD",
-    "$",
-    "¥",
-    "￥",
-    "€",
-    "£",
-  ];
-  for (const prefix of prefixes) {
-    if (text.startsWith(prefix)) {
-      return text.slice(prefix.length).trim();
+  const trimmed = text.trim();
+  const upper = trimmed.toUpperCase();
+  for (const token of CURRENCY_TOKENS) {
+    if (upper.startsWith(token.toUpperCase())) {
+      return trimmed.slice(token.length).trim();
     }
   }
-  return text;
+  return trimmed;
+}
+
+function stripCurrencySuffix(text: string): string {
+  const trimmed = text.trim();
+  const upper = trimmed.toUpperCase();
+  for (const token of CURRENCY_TOKENS) {
+    if (upper.endsWith(token.toUpperCase())) {
+      return trimmed.slice(0, trimmed.length - token.length).trim();
+    }
+  }
+  return trimmed;
 }
 
 export function parseCsvDecimal(raw: string, rowNum: number, column: string): DecimalString {
-  let text = raw.trim();
+  let text = normalizeNumericUnicode(raw).trim();
   if (!text) throw new Error(`Invalid decimal value in row ${rowNum}, column '${column}': ${raw}`);
   let negative = false;
+  let hasParens = false;
+  let hasExplicitSign = false;
+
   if (text.startsWith("(") && text.endsWith(")") && text.length > 2) {
+    hasParens = true;
     negative = true;
     text = text.slice(1, -1).trim();
   }
-  if (text.startsWith("-")) {
-    negative = !negative;
-    text = text.slice(1).trim();
-  } else if (text.startsWith("+")) {
-    text = text.slice(1).trim();
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    const before = text;
+    text = stripCurrencyPrefix(text);
+    text = stripCurrencySuffix(text);
+    if (text.startsWith("-")) {
+      if (hasExplicitSign) {
+        throw new Error(`Invalid decimal value in row ${rowNum}, column '${column}': ${raw}`);
+      }
+      hasExplicitSign = true;
+      negative = true;
+      text = text.slice(1).trim();
+    } else if (text.startsWith("+")) {
+      if (hasExplicitSign || hasParens) {
+        throw new Error(`Invalid decimal value in row ${rowNum}, column '${column}': ${raw}`);
+      }
+      hasExplicitSign = true;
+      text = text.slice(1).trim();
+    }
+    text = stripCurrencyPrefix(text);
+    text = stripCurrencySuffix(text);
+    if (text === before) break;
   }
-  text = stripCurrencyPrefix(text);
-  if (text.startsWith("-")) {
-    negative = !negative;
-    text = text.slice(1).trim();
-  } else if (text.startsWith("+")) {
-    text = text.slice(1).trim();
+
+  if (text.startsWith("-") || text.startsWith("+")) {
+    throw new Error(`Invalid decimal value in row ${rowNum}, column '${column}': ${raw}`);
   }
-  text = stripCurrencyPrefix(text);
+
   const compact = text.replace(/[, ]+/g, "");
   if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(compact)) {
     throw new Error(`Invalid decimal value in row ${rowNum}, column '${column}': ${raw}`);
@@ -522,21 +695,120 @@ function accumulateHolding(
   }
 }
 
+function txActionReplayRank(action: string): number {
+  const lower = action.toLowerCase();
+  if (lower.includes("split") || lower.includes("拆股") || lower.includes("合股")) return 0;
+  if (lower.includes("reinvest") || lower.includes("buy") || lower.includes("purchase") || lower.includes("买入")) return 1;
+  if (lower.includes("sell") || lower.includes("sale") || lower.includes("redemption") || lower.includes("卖出")) return 2;
+  if (lower.includes("dividend") || lower.includes("div") || lower.includes("interest") || lower.includes("股息") || lower.includes("分红")) return 3;
+  if (lower.includes("fee") || lower.includes("comm") || lower.includes("tax") || lower.includes("withholding") || lower.includes("费用") || lower.includes("佣金")) return 4;
+  return 5;
+}
+
+function isValidCalendarDate(year: number, month: number, day: number): boolean {
+  if (year < 1900 || year > 2100 || month < 1 || month > 12 || day < 1) return false;
+  const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const maxDay = month === 2 ? (isLeap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  return day <= maxDay;
+}
+
+function parseSingleDateToken(token: string): string | null {
+  const trimmed = token.trim().replace(/^"+|"+$/g, "");
+  if (!trimmed) return null;
+  const datePart = (trimmed.split(/[ ,T]/)[0] ?? "").trim();
+  if (!datePart) return null;
+
+  if (/^\d{8}$/.test(datePart)) {
+    const y = Number(datePart.slice(0, 4));
+    const m = Number(datePart.slice(4, 6));
+    const d = Number(datePart.slice(6, 8));
+    if (isValidCalendarDate(y, m, d)) {
+      return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+    return null;
+  }
+
+  const sep = datePart.includes("/") ? "/" : datePart.includes("-") ? "-" : null;
+  if (!sep) return null;
+  const parts = datePart.split(sep);
+  if (parts.length !== 3 || !parts.every((p) => /^\d+$/.test(p))) return null;
+
+  let y: number;
+  let m: number;
+  let d: number;
+  if (parts[0]!.length === 4) {
+    y = Number(parts[0]);
+    m = Number(parts[1]);
+    d = Number(parts[2]);
+  } else if (parts[2]!.length === 4) {
+    y = Number(parts[2]);
+    m = Number(parts[0]);
+    d = Number(parts[1]);
+  } else {
+    return null;
+  }
+
+  if (!isValidCalendarDate(y, m, d)) return null;
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+export function normalizeTransactionDate(raw: string, rowNum: number, warnings: string[]): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  const lower = trimmed.toLowerCase();
+  const asOfIdx = lower.indexOf(" as of ");
+  if (asOfIdx !== -1) {
+    const effective = trimmed.slice(asOfIdx + 7).trim();
+    const posted = trimmed.slice(0, asOfIdx).trim();
+    const norm = parseSingleDateToken(effective) ?? parseSingleDateToken(posted);
+    if (norm) return norm;
+  }
+
+  const norm = parseSingleDateToken(trimmed);
+  if (norm) return norm;
+
+  warnings.push(`Could not normalize transaction date in row ${rowNum}: '${trimmed.slice(0, 24)}'`);
+  return trimmed;
+}
+
 function replayTransactions(
   transactions: readonly ImportedPortfolioTransaction[],
   map: Map<string, HoldingAccumulator>,
   warnings: string[],
 ): void {
-  const sorted = [...transactions].sort((a, b) => a.date.localeCompare(b.date));
-  for (const tx of sorted) {
-    const actionLower = tx.action.toLowerCase();
+  const indexed = transactions.map((tx, idx) => ({ tx, idx }));
+  indexed.sort((a, b) =>
+    a.tx.date.localeCompare(b.tx.date)
+    || txActionReplayRank(a.tx.action) - txActionReplayRank(b.tx.action)
+    || a.idx - b.idx);
+
+  for (const { tx } of indexed) {
+    const rank = txActionReplayRank(tx.action);
     const qty = decimal(tx.quantity);
     const price = decimal(tx.price);
     if (decimalCompare(qty, ZERO) <= 0) continue;
 
-    if (actionLower.includes("buy") || actionLower.includes("reinvest")) {
+    if (rank === 0) {
+      // SPLIT: add split shares while keeping total cost basis constant.
+      const key = `${tx.symbol}|${tx.currency}`;
+      const existing = map.get(key);
+      if (existing) {
+        const oldQty = existing.quantity;
+        const newQty = decimalAdd(oldQty, qty);
+        existing.quantity = newQty;
+        if (decimalCompare(price, ZERO) > 0) {
+          existing.lastPrice = price;
+        } else if (decimalCompare(existing.lastPrice, ZERO) > 0 && decimalCompare(newQty, ZERO) > 0) {
+          const oldVal = decimalRound(decimalMultiply(existing.lastPrice, oldQty), 8, "half-up");
+          existing.lastPrice = decimalDivide(oldVal, newQty, 8, "half-up");
+        }
+      } else {
+        warnings.push(`Split transaction for ${tx.symbol} had no prior holding lot in CSV; skipped in holding replay`);
+      }
+    } else if (rank === 1) {
       accumulateHolding(map, tx.symbol, tx.symbol, qty, price, price, tx.currency);
-    } else if (actionLower.includes("sell")) {
+    } else if (rank === 2) {
       const key = `${tx.symbol}|${tx.currency}`;
       const existing = map.get(key);
       if (existing) {
@@ -763,8 +1035,17 @@ export async function parseCsvLocally(
           skippedRows += 1;
           continue;
         }
+        if (isOptionRow(posHeaders, rest, rawSymbol)) {
+          warnings.push(`Skipped unsupported option/derivative row ${rowNum} (${rawSymbol.trim().slice(0, 32)})`);
+          skippedRows += 1;
+          continue;
+        }
         const symbol = validateCsvSymbol(rawSymbol, rowNum);
         const qtyRaw = findCell(posHeaders, rest, QUANTITY_ALIASES) ?? "";
+        if (isNaPlaceholder(qtyRaw)) {
+          skippedRows += 1;
+          continue;
+        }
         const qty = parseCsvDecimal(qtyRaw, rowNum, "Quantity");
         if (decimalCompare(qty, ZERO) < 0) {
           throw new Error(`Negative holding quantity is not allowed in row ${rowNum} for ${symbol}`);
@@ -777,12 +1058,24 @@ export async function parseCsvLocally(
         const costPriceRaw = findCell(posHeaders, rest, AVG_COST_ALIASES);
         const costBasisRaw = findCell(posHeaders, rest, COST_BASIS_ALIASES);
 
-        const lastPrice = markRaw && markRaw.trim() ? parseCsvDecimal(markRaw, rowNum, "Close Price") : ZERO;
+        const lastPrice = markRaw && markRaw.trim() && !isNaPlaceholder(markRaw)
+          ? parseCsvDecimal(markRaw, rowNum, "Close Price")
+          : ZERO;
+        if (decimalCompare(lastPrice, ZERO) < 0) {
+          throw new Error(`Negative last_price is not allowed in row ${rowNum} for ${symbol}`);
+        }
         let avgCost = lastPrice;
-        if (costPriceRaw && costPriceRaw.trim()) {
+        if (costPriceRaw && costPriceRaw.trim() && !isNaPlaceholder(costPriceRaw)) {
           avgCost = parseCsvDecimal(costPriceRaw, rowNum, "Cost Price");
-        } else if (costBasisRaw && costBasisRaw.trim()) {
-          avgCost = decimalDivide(parseCsvDecimal(costBasisRaw, rowNum, "Cost Basis"), qty, 8, "half-up");
+          if (decimalCompare(avgCost, ZERO) < 0) {
+            throw new Error(`Negative average_cost is not allowed in row ${rowNum} for ${symbol}`);
+          }
+        } else if (costBasisRaw && costBasisRaw.trim() && !isNaPlaceholder(costBasisRaw)) {
+          const basis = parseCsvDecimal(costBasisRaw, rowNum, "Cost Basis");
+          if (decimalCompare(basis, ZERO) < 0) {
+            throw new Error(`Negative average_cost is not allowed in row ${rowNum} for ${symbol}`);
+          }
+          avgCost = decimalDivide(basis, qty, 8, "half-up");
         }
         const effectiveLast = decimalCompare(lastPrice, ZERO) > 0 ? lastPrice : avgCost;
         const company = sanitizeCsvTextCell(
@@ -798,14 +1091,22 @@ export async function parseCsvLocally(
           skippedRows += 1;
           continue;
         }
+        if (isOptionRow(tradeHeaders, rest, rawSymbol)) {
+          warnings.push(`Skipped unsupported option/derivative row ${rowNum} (${rawSymbol.trim().slice(0, 32)})`);
+          skippedRows += 1;
+          continue;
+        }
         const symbol = validateCsvSymbol(rawSymbol, rowNum);
-        const qty = parseCsvDecimal(findCell(tradeHeaders, rest, QUANTITY_ALIASES) ?? "0", rowNum, "Quantity");
-        const px = parseCsvDecimal(findCell(tradeHeaders, rest, ["t. price", "trade price", "price"]) ?? "0", rowNum, "Price");
+        const qtyRaw = findCell(tradeHeaders, rest, QUANTITY_ALIASES) ?? "0";
+        const pxRaw = findCell(tradeHeaders, rest, ["t. price", "trade price", "price"]) ?? "0";
         const proceedsRaw = findCell(tradeHeaders, rest, ["proceeds", "amount"]) ?? "0";
         const commRaw = findCell(tradeHeaders, rest, ["comm/fee", "commission", "fees"]) ?? "0";
-        const proceeds = proceedsRaw.trim() ? parseCsvDecimal(proceedsRaw, rowNum, "Proceeds") : ZERO;
-        const comm = commRaw.trim() ? parseCsvDecimal(commRaw, rowNum, "Comm/Fee") : ZERO;
-        const date = sanitizeCsvTextCell(findCell(tradeHeaders, rest, ["date/time", "date", "trade date"]) ?? "", "Date/Time", warnings);
+        const qty = qtyRaw.trim() && !isNaPlaceholder(qtyRaw) ? parseCsvDecimal(qtyRaw, rowNum, "Quantity") : ZERO;
+        const px = pxRaw.trim() && !isNaPlaceholder(pxRaw) ? parseCsvDecimal(pxRaw, rowNum, "Price") : ZERO;
+        const proceeds = proceedsRaw.trim() && !isNaPlaceholder(proceedsRaw) ? parseCsvDecimal(proceedsRaw, rowNum, "Proceeds") : ZERO;
+        const comm = commRaw.trim() && !isNaPlaceholder(commRaw) ? parseCsvDecimal(commRaw, rowNum, "Comm/Fee") : ZERO;
+        const dateSanitized = sanitizeCsvTextCell(findCell(tradeHeaders, rest, ["date/time", "date", "trade date"]) ?? "", "Date/Time", warnings);
+        const date = normalizeTransactionDate(dateSanitized, rowNum, warnings);
         const txCurrency = normalizeCurrency(findCell(tradeHeaders, rest, CURRENCY_ALIASES));
         transactions.push({
           date,
@@ -827,7 +1128,7 @@ export async function parseCsvLocally(
           }
           const rowCurrency = normalizeCurrency(rawCurr);
           const totalRaw = findCell(cashHeaders, rest, ["total", "amount"]);
-          if (totalRaw && totalRaw.trim()) {
+          if (totalRaw && totalRaw.trim() && !isNaPlaceholder(totalRaw)) {
             cashByCurrencyMap.set(rowCurrency, parseCsvDecimal(totalRaw, rowNum, "Ending Cash"));
           }
         }
@@ -842,8 +1143,12 @@ export async function parseCsvLocally(
       throw new Error("Could not detect a supported header row (Schwab, IBKR, Fidelity, Vanguard, Futu, Tiger, or standard CSV)");
     }
     format = located.format;
-    const headers = rows[located.index]!.map((h) => h.trim());
-    columnMappings = collectMappings(headers);
+    const initialHeaders = rows[located.index]!.map((h) => h.trim());
+    const initialNormalized = initialHeaders.map(normalizeHeader);
+    let activeHeaders = initialHeaders;
+    let inSecondaryTxSection = false;
+    const mappingMap = new Map<string, { canonicalField: string; sourceHeader: string }>();
+    collectMappings(activeHeaders).forEach((m) => mappingMap.set(m.canonicalField, m));
     skippedRows = located.index;
 
     for (let idx = located.index + 1; idx < rows.length; idx += 1) {
@@ -854,6 +1159,32 @@ export async function parseCsvLocally(
         continue;
       }
 
+      if (isDisclaimerOrFooterRow(row)) {
+        skippedRows += 1;
+        continue;
+      }
+
+      const rowNormalized = row.map(normalizeHeader);
+      if (
+        rowNormalized.length === initialNormalized.length
+        && rowNormalized.every((cell, i) => cell === initialNormalized[i])
+      ) {
+        activeHeaders = row.map((h) => h.trim());
+        inSecondaryTxSection = false;
+        skippedRows += 1;
+        continue;
+      }
+      if (isSecondaryTransactionHeader(rowNormalized)) {
+        activeHeaders = row.map((h) => h.trim());
+        inSecondaryTxSection = true;
+        collectMappings(activeHeaders).forEach((m) => {
+          if (!mappingMap.has(m.canonicalField)) mappingMap.set(m.canonicalField, m);
+        });
+        skippedRows += 1;
+        continue;
+      }
+
+      const headers = activeHeaders;
       const rawSymbol = findCell(headers, row, SYMBOL_ALIASES) ?? "";
       const symbolLower = rawSymbol.trim().toLowerCase();
       const companyRaw = findCell(headers, row, COMPANY_ALIASES) ?? "";
@@ -861,20 +1192,11 @@ export async function parseCsvLocally(
       const explicitCurrency = rawCurrCell && rawCurrCell.trim() ? normalizeCurrency(rawCurrCell) : undefined;
 
       if (isCashRow(symbolLower, companyRaw)) {
-        const valRaw = findCell(headers, row, [
-          "market value",
-          "market_value",
-          "mkt val",
-          "current value",
-          "total value",
-          "amount",
-          "cash",
-          "price",
-          "value",
-          "市值",
-          "持仓市值",
-          "现金",
-        ]);
+        if (inSecondaryTxSection) {
+          skippedRows += 1;
+          continue;
+        }
+        const valRaw = findCell(headers, row, CASH_ROW_VALUE_ALIASES);
         if (valRaw && valRaw.trim() && !isNaPlaceholder(valRaw)) {
           const parsedCash = parseCsvDecimal(valRaw, rowNum, "Cash");
           const cashCurr = explicitCurrency
@@ -886,13 +1208,15 @@ export async function parseCsvLocally(
         continue;
       }
 
-      const cashCol = findCell(headers, row, CASH_COL_ALIASES);
-      if (cashCol && cashCol.trim() && !isNaPlaceholder(cashCol)) {
-        const parsedCash = parseCsvDecimal(cashCol, rowNum, "cash");
-        const cashCurr = explicitCurrency ?? inferCurrencyFromAmount(cashCol) ?? "USD";
-        const existingCash = cashByCurrencyMap.get(cashCurr) ?? ZERO;
-        if (decimalCompare(parsedCash, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
-          cashByCurrencyMap.set(cashCurr, parsedCash);
+      if (!inSecondaryTxSection) {
+        const cashCol = findCell(headers, row, CASH_COL_ALIASES);
+        if (cashCol && cashCol.trim() && !isNaPlaceholder(cashCol)) {
+          const parsedCash = parseCsvDecimal(cashCol, rowNum, "cash");
+          const cashCurr = explicitCurrency ?? inferCurrencyFromAmount(cashCol) ?? "USD";
+          const existingCash = cashByCurrencyMap.get(cashCurr) ?? ZERO;
+          if (decimalCompare(parsedCash, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
+            cashByCurrencyMap.set(cashCurr, parsedCash);
+          }
         }
       }
 
@@ -901,28 +1225,41 @@ export async function parseCsvLocally(
         continue;
       }
 
+      if (isOptionRow(headers, row, rawSymbol)) {
+        warnings.push(`Skipped unsupported option/derivative row ${rowNum} (${rawSymbol.trim().slice(0, 32)})`);
+        skippedRows += 1;
+        continue;
+      }
+
       const actionCell = findCell(headers, row, ["action", "side", "transaction type"]);
-      const isTx = format === "schwab_transactions" || Boolean(actionCell && actionCell.trim());
+      const isTx = inSecondaryTxSection
+        || format === "schwab_transactions"
+        || Boolean(actionCell && actionCell.trim());
 
       if (isTx) {
         const symbol = validateCsvSymbol(rawSymbol, rowNum);
         const action = sanitizeCsvTextCell(actionCell ?? "", "Action", warnings);
-        const date = sanitizeCsvTextCell(
+        const dateSanitized = sanitizeCsvTextCell(
           findCell(headers, row, ["date", "trade date", "settlement date"]) ?? "",
           "Date",
           warnings,
         );
+        const date = normalizeTransactionDate(dateSanitized, rowNum, warnings);
         const qtyRaw = findCell(headers, row, QUANTITY_ALIASES) ?? "0";
-        const pxRaw = findCell(headers, row, ["price", "trade price", "unit price"]) ?? "0";
-        const feesRaw = findCell(headers, row, ["fees & comm", "fees", "commission"]) ?? "0";
-        const amtRaw = findCell(headers, row, ["amount", "net amount", "proceeds"]) ?? "0";
+        const pxRaw = findCell(headers, row, ["price", "trade price", "unit price", "share price"]) ?? "0";
+        const feesRaw = findCell(headers, row, ["fees & comm", "commissions and fees", "fees", "commission"]) ?? "0";
+        const amtRaw = findCell(headers, row, ["amount", "net amount", "principal amount", "proceeds"]) ?? "0";
 
         const qty = qtyRaw.trim() && !isNaPlaceholder(qtyRaw) ? parseCsvDecimal(qtyRaw, rowNum, "Quantity") : ZERO;
         const px = pxRaw.trim() && !isNaPlaceholder(pxRaw) ? parseCsvDecimal(pxRaw, rowNum, "Price") : ZERO;
         const fees = feesRaw.trim() && !isNaPlaceholder(feesRaw) ? parseCsvDecimal(feesRaw, rowNum, "Fees") : ZERO;
         const amt = amtRaw.trim() && !isNaPlaceholder(amtRaw) ? parseCsvDecimal(amtRaw, rowNum, "Amount") : ZERO;
 
-        const txCurr = explicitCurrency ?? inferCurrencyFromAmount(pxRaw) ?? inferCurrencyFromAmount(amtRaw) ?? "USD";
+        const txCurr = explicitCurrency
+          ?? inferCurrencyFromAmount(pxRaw)
+          ?? inferCurrencyFromAmount(amtRaw)
+          ?? inferCurrencyFromSymbol(symbol)
+          ?? "USD";
         transactions.push({
           date,
           action,
@@ -938,6 +1275,10 @@ export async function parseCsvLocally(
 
       const symbol = validateCsvSymbol(rawSymbol, rowNum);
       const qtyRaw = findCell(headers, row, QUANTITY_ALIASES) ?? "";
+      if (isNaPlaceholder(qtyRaw)) {
+        skippedRows += 1;
+        continue;
+      }
       const qty = parseCsvDecimal(qtyRaw, rowNum, "Quantity");
       if (decimalCompare(qty, ZERO) < 0) {
         throw new Error(`Negative holding quantity is not allowed in row ${rowNum} for ${symbol}`);
@@ -955,15 +1296,29 @@ export async function parseCsvLocally(
       let lastPrice = ZERO;
       if (priceRaw && priceRaw.trim() && !isNaPlaceholder(priceRaw)) {
         lastPrice = parseCsvDecimal(priceRaw, rowNum, "Price");
+        if (decimalCompare(lastPrice, ZERO) < 0) {
+          throw new Error(`Negative last_price is not allowed in row ${rowNum} for ${symbol}`);
+        }
       } else if (mktValRaw && mktValRaw.trim() && !isNaPlaceholder(mktValRaw)) {
-        lastPrice = decimalDivide(parseCsvDecimal(mktValRaw, rowNum, "Market Value"), qty, 8, "half-up");
+        const mv = parseCsvDecimal(mktValRaw, rowNum, "Market Value");
+        if (decimalCompare(mv, ZERO) < 0) {
+          throw new Error(`Negative last_price is not allowed in row ${rowNum} for ${symbol}`);
+        }
+        lastPrice = decimalDivide(mv, qty, 8, "half-up");
       }
 
       let avgCost = lastPrice;
       if (avgCostRaw && avgCostRaw.trim() && !isNaPlaceholder(avgCostRaw)) {
         avgCost = parseCsvDecimal(avgCostRaw, rowNum, "Average Cost");
+        if (decimalCompare(avgCost, ZERO) < 0) {
+          throw new Error(`Negative average_cost is not allowed in row ${rowNum} for ${symbol}`);
+        }
       } else if (costBasisRaw && costBasisRaw.trim() && !isNaPlaceholder(costBasisRaw)) {
-        avgCost = decimalDivide(parseCsvDecimal(costBasisRaw, rowNum, "Cost Basis"), qty, 8, "half-up");
+        const basis = parseCsvDecimal(costBasisRaw, rowNum, "Cost Basis");
+        if (decimalCompare(basis, ZERO) < 0) {
+          throw new Error(`Negative average_cost is not allowed in row ${rowNum} for ${symbol}`);
+        }
+        avgCost = decimalDivide(basis, qty, 8, "half-up");
       }
 
       const effectiveLast = decimalCompare(lastPrice, ZERO) > 0 ? lastPrice : avgCost;
@@ -976,6 +1331,7 @@ export async function parseCsvLocally(
       const company = sanitizeCsvTextCell(companyRaw, "Description", warnings);
       accumulateHolding(holdingsMap, symbol, company, qty, avgCost, effectiveLast, rowCurrency);
     }
+    columnMappings = [...mappingMap.values()];
   }
 
   if (holdingsMap.size === 0 && transactions.length > 0) {
@@ -990,6 +1346,7 @@ export async function parseCsvLocally(
 
   const sortedTransactions = [...transactions].sort((a, b) =>
     a.date.localeCompare(b.date)
+    || txActionReplayRank(a.action) - txActionReplayRank(b.action)
     || a.symbol.localeCompare(b.symbol)
     || a.action.localeCompare(b.action)
     || a.quantity.localeCompare(b.quantity));

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   clearPersistedLocalPortfolio,
   commitBrokerCsv,
+  parseCsvDecimal,
   parseCsvLocally,
 } from "../../src/domain/csvImport";
 import { clearEvidence, listEvidence, verifyEvidence } from "../../src/domain/evidenceJournal";
@@ -189,5 +190,104 @@ BRK.B,伯克希尔B,5,410.00,455.00,$2275.00,USD,$1500.00`;
     expect(tiger.snapshot.isMultiCurrency).toBe(false);
     expect(tiger.snapshot.cash).toBe("1500.00");
     expect(tiger.snapshot.holdings[0]).toMatchObject({ symbol: "BRK.B", averageCost: "410.0000", lastPrice: "455.0000" });
+  });
+
+  it("normalizes Schwab cross-year MM/DD/YYYY dates and replays same-day SPLIT -> BUY -> SELL without ghost holdings", async () => {
+    const schwabTx = `"Date","Action","Symbol","Description","Quantity","Price","Fees & Comm","Amount"
+"01/05/2026","Sell","GHOST","GHOST CORP","100","$55.00","$0.00","$5,500.00"
+"12/20/2025","Buy","GHOST","GHOST CORP","100","$50.00","$0.00","-$5,000.00"
+"01/15/2026","Cash Dividend","AAPL","APPLE INC","","","$0.00","$12.00"
+"01/15/2026","Sell","AAPL","APPLE INC","20","$105.00","$0.00","$2,100.00"
+"01/15/2026","Buy","AAPL","APPLE INC","10","$100.00","$0.00","-$1,000.00"
+"01/15/2026","Stock Split","AAPL","APPLE INC","30","$0.00","$0.00","$0.00"
+"01/02/2026 as of 12/31/2025","Buy","AAPL","APPLE INC","10","$400.00","$0.00","-$4,000.00"
+`;
+    const preview = await parseCsvLocally(schwabTx, "schwab-tx.csv");
+    expect(preview.detectedFormat).toBe("schwab_transactions");
+    expect(preview.snapshot.holdings.some((h) => h.symbol === "GHOST")).toBe(false);
+    expect(preview.snapshot.holdings).toHaveLength(1);
+    expect(preview.snapshot.holdings[0]).toMatchObject({
+      symbol: "AAPL",
+      quantity: "30",
+      averageCost: "100.0000",
+      lastPrice: "105.0000",
+    });
+    expect(preview.snapshot.transactions.every((t) => /^\d{4}-\d{2}-\d{2}$/.test(t.date))).toBe(true);
+    expect(preview.snapshot.transactions[0]?.date).toBe("2025-12-20");
+  });
+
+  it("handles (-$100), Unicode minus/NBSP, trailing currencies, negative price rejection, Vanguard dual-table, Fidelity footers, Futu SH/SZ/SG & option skipping, and IBKR N/A", async () => {
+    expect(parseCsvDecimal("(-$100.50)", 1, "Amount")).toBe("-100.5");
+    expect(parseCsvDecimal("($-100.50)", 1, "Amount")).toBe("-100.5");
+    expect(parseCsvDecimal("\u22121\u00a0234.50 HKD", 1, "Amount")).toBe("-1234.5");
+    expect(parseCsvDecimal("250.75€", 1, "Amount")).toBe("250.75");
+    expect(() => parseCsvDecimal("--100", 1, "Amount")).toThrow();
+    expect(() => parseCsvDecimal("(+100)", 1, "Amount")).toThrow();
+
+    await expect(
+      parseCsvLocally("symbol,quantity,average_cost,price\nAAPL,10,150.00,-20.00", "neg-price.csv"),
+    ).rejects.toThrow(/Negative last_price/i);
+    await expect(
+      parseCsvLocally("symbol,quantity,average_cost,price\nAAPL,10,(-$150.00),200.00", "neg-cost.csv"),
+    ).rejects.toThrow(/Negative average_cost/i);
+
+    const vanguardDual = `Account Number,Investment Name,Symbol,Shares,Share Price,Total Value
+123456,Vanguard Total Stock Market ETF,VTI,20,$280.50,$5610.00
+123456,Vanguard Federal Money Market Fund,VMFXX,1200.50,$1.00,$1200.50
+
+Account Number,Trade Date,Settlement Date,Transaction Type,Transaction Description,Investment Name,Symbol,Shares,Share Price,Principal Amount,Commissions and Fees,Net Amount,Accrued Interest,Account Type
+123456,11/15/2026,11/17/2026,Buy,Buy,Vanguard Total Stock Market ETF,VTI,5,$275.00,-$1375.00,$0.00,-$1375.00,$0.00,INDIVIDUAL
+123456,11/15/2026,11/17/2026,Sweep Out,Sweep Out,Vanguard Federal Money Market Fund,VMFXX,-1375,$1.00,$1375.00,$0.00,$1375.00,$0.00,INDIVIDUAL`;
+    const van = await parseCsvLocally(vanguardDual, "vanguard-dual.csv");
+    expect(van.snapshot.holdings).toHaveLength(1);
+    expect(van.snapshot.holdings[0]?.quantity).toBe("20");
+    expect(van.snapshot.cash).toBe("1200.50");
+    expect(van.snapshot.transactions).toHaveLength(1);
+    expect(van.snapshot.transactions[0]?.date).toBe("2026-11-15");
+
+    const fidelityWithFooters = `Account Number,Account Name,Symbol,Description,Quantity,Last Price,Current Value,Cost Basis Total,Average Cost Basis,Percent Of Account
+X123,Individual,VOO,VANGUARD S&P 500 ETF,10,$515.00,$5150.00,$4600.00,$460.00,64%
+X123,Individual,-AAPL261218C250,AAPL CALL,1,$12.00,$1200.00,$1000.00,$10.00,5%
+X123,Individual,SPAXX**,FIDELITY GOVERNMENT MONEY MARKET,--,--,$2850.00,--,--,31%
+
+"The data and information in this spreadsheet is provided to you solely for your use."
+"Brokerage services provided by Fidelity Brokerage Services LLC."
+"Date downloaded Nov-21-2026 4:05 p.m ET"`;
+    const fid = await parseCsvLocally(fidelityWithFooters, "fid.csv");
+    expect(fid.snapshot.holdings).toHaveLength(1);
+    expect(fid.snapshot.cash).toBe("2850.00");
+    expect(fid.warnings.some((w) => w.includes("option"))).toBe(true);
+
+    const schwabMktVal = `"Symbol","Description","Quantity","Price","Mkt Val (Market Value)","Cost Basis","Security Type"
+"AAPL","APPLE INC","10","$200.00","$2,000.00","$1,800.00","Equity"
+"Cash & Cash Investments","--","--","--","$3,456.78","--","Cash and Money Market"`;
+    const sch = await parseCsvLocally(schwabMktVal, "schwab-mkt.csv");
+    expect(sch.snapshot.cash).toBe("3456.78");
+
+    const futuMulti = `股票代码,股票名称,持有数量,稀释成本价,现价,参考市值,币种,资产类别
+SH.600519,贵州茅台,100,1500.00,1600.00,160000.00,人民币,正股
+SZ.000001,平安银行,200,10.00,11.00,2200.00,人民币,正股
+SG.D05,星展集团,100,35.00,40.00,4000.00,新元,正股
+US.AAPL261218C250000,AAPL CALL,2,5.00,6.00,1200.00,美元,期权
+人民币现金,--,--,--,--,5000.00,人民币,现金`;
+    const futu = await parseCsvLocally(futuMulti, "futu-real.csv");
+    expect(futu.snapshot.holdings.map((h) => h.symbol)).toEqual(["000001.SZ", "600519.SS", "D05.SI"]);
+    expect(futu.snapshot.cashByCurrency.CNY).toBe("5000.00");
+    expect(futu.warnings.some((w) => w.includes("option"))).toBe(true);
+
+    const ibkrNa = `Positions,Header,DataDiscriminator,Asset Category,Currency,Symbol,Quantity,Cost Price,Close Price,Description
+Positions,Data,Summary,Stocks,USD,MSFT,10,--,420.00,MICROSOFT CORP
+Positions,Data,Summary,Equity and Index Options,USD,AAPL 18DEC26 250 C,1,5.00,6.00,AAPL CALL
+Trades,Header,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,Proceeds,Comm/Fee
+Trades,Data,Stocks,USD,MSFT,"2026-11-20, 10:15:00",10,410.00,-4100.00,--
+Cash Report,Header,Currency Summary,Currency,Total
+Cash Report,Data,Ending Cash,USD,N/A
+Cash Report,Data,Ending Cash,EUR,1000.00`;
+    const ibkr = await parseCsvLocally(ibkrNa, "ibkr-na.csv");
+    expect(ibkr.snapshot.holdings).toHaveLength(1);
+    expect(ibkr.snapshot.holdings[0]?.averageCost).toBe("420.0000");
+    expect(ibkr.snapshot.transactions[0]?.date).toBe("2026-11-20");
+    expect(ibkr.snapshot.cashByCurrency.EUR).toBe("1000.00");
+    expect(ibkr.warnings.some((w) => w.includes("option"))).toBe(true);
   });
 });

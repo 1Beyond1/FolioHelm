@@ -7,6 +7,8 @@ pub mod vault;
 use std::{
     collections::BTreeMap,
     fs,
+    future::Future,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -20,7 +22,10 @@ use csv_import::{parse_and_preview_csv, CsvCommitResultDto, CsvImportPreviewDto,
 use evidence::{
     AppendEvidenceRequest, EvidenceJournal, EvidenceVerificationDto, SignedEvidenceRecordDto,
 };
-use quotes::{fetch_public_quotes, PublicQuoteBatchResponseDto, PublicQuoteProvider};
+use quotes::{
+    fetch_public_quotes_partial, PublicQuoteBatchOutcome, PublicQuoteBatchResponseDto,
+    PublicQuoteProvider, QuoteError,
+};
 use serde::Serialize;
 use storage::{
     atomic_write_bytes, AppLockBackoffState, CachedPublicQuote, EncryptedVaultDb,
@@ -1104,37 +1109,115 @@ fn csv_commit_import(
     })
 }
 
-#[tauri::command]
-async fn quotes_fetch_public(
-    state: State<'_, VaultRuntimeState>,
+async fn fetch_public_quotes_with_vault_cache<F, Fut>(
+    state: &VaultRuntimeState,
     symbols: Vec<String>,
     provider: Option<String>,
-) -> Result<PublicQuoteBatchResponseDto, String> {
+    fetcher: F,
+) -> Result<PublicQuoteBatchResponseDto, String>
+where
+    F: FnOnce(Vec<String>, PublicQuoteProvider) -> Fut,
+    Fut: Future<Output = Result<PublicQuoteBatchOutcome, QuoteError>>,
+{
+    // Fail-Closed: NEVER perform outbound public quote requests while the vault is locked.
+    state.ensure_unlocked()?;
+
     let provider_choice = PublicQuoteProvider::parse(provider.as_deref().unwrap_or("stooq"))
         .map_err(|error| error.to_string())?;
     let valid_symbols =
         quotes::validate_quote_symbols(&symbols).map_err(|error| error.to_string())?;
 
-    match fetch_public_quotes(&valid_symbols, provider_choice).await {
-        Ok(fetched) => {
-            let _ = state.with_unlocked(|db, _| {
-                db.upsert_quote_cache(&fetched)
-                    .map_err(|error| error.to_string())
-            });
+    let fetch_result = fetcher(valid_symbols.clone(), provider_choice).await;
+
+    // Re-check lock state after awaiting network I/O so locking mid-flight discards any results.
+    state.ensure_unlocked()?;
+
+    match fetch_result {
+        Ok(outcome) => {
+            if !outcome.quotes.is_empty() {
+                state.with_unlocked(|db, _| {
+                    db.upsert_quote_cache(&outcome.quotes)
+                        .map_err(|error| error.to_string())
+                })?;
+            }
+
+            if outcome.failed_symbols.is_empty() {
+                return Ok(PublicQuoteBatchResponseDto {
+                    quotes: outcome.quotes,
+                    from_cache: false,
+                    degraded_reason: None,
+                    provider: provider_choice.code().to_string(),
+                });
+            }
+
+            let cached = state
+                .with_unlocked(|db, _| db.load_quote_cache().map_err(|error| error.to_string()))?;
+            let mut merged_by_symbol: BTreeMap<String, CachedPublicQuote> = outcome
+                .quotes
+                .into_iter()
+                .map(|quote| (quote.symbol.clone(), quote))
+                .collect();
+            let cached_by_symbol: BTreeMap<String, CachedPublicQuote> = cached
+                .into_iter()
+                .map(|quote| (quote.symbol.clone(), quote))
+                .collect();
+
+            let mut fallback_symbols = Vec::new();
+            let mut missing_symbols = Vec::new();
+            for sym in &outcome.failed_symbols {
+                if let Some(cached_quote) = cached_by_symbol.get(sym) {
+                    merged_by_symbol.insert(sym.clone(), cached_quote.clone());
+                    fallback_symbols.push(sym.clone());
+                } else {
+                    missing_symbols.push(sym.clone());
+                }
+            }
+
+            let ordered_quotes: Vec<CachedPublicQuote> = valid_symbols
+                .iter()
+                .filter_map(|sym| merged_by_symbol.remove(sym))
+                .collect();
+
+            let mut reasons = Vec::new();
+            if outcome.timed_out {
+                reasons.push("batch timeout".to_string());
+            } else if let Some(err) = outcome.last_error {
+                reasons.push(err);
+            }
+            if !fallback_symbols.is_empty() {
+                reasons.push(format!(
+                    "fallback to encrypted cache for: {}",
+                    fallback_symbols.join(", ")
+                ));
+            }
+            if !missing_symbols.is_empty() {
+                reasons.push(format!(
+                    "no cached quote available for: {}",
+                    missing_symbols.join(", ")
+                ));
+            }
+
             Ok(PublicQuoteBatchResponseDto {
-                quotes: fetched,
+                quotes: ordered_quotes,
                 from_cache: false,
-                degraded_reason: None,
+                degraded_reason: Some(format!(
+                    "Partial quote fetch failure ({}): {}",
+                    outcome.failed_symbols.join(", "),
+                    reasons.join("; ")
+                )),
                 provider: provider_choice.code().to_string(),
             })
         }
         Err(fetch_error) => {
             let cached = state
-                .with_unlocked(|db, _| db.load_quote_cache().map_err(|error| error.to_string()))
-                .unwrap_or_default();
-            let filtered: Vec<CachedPublicQuote> = cached
+                .with_unlocked(|db, _| db.load_quote_cache().map_err(|error| error.to_string()))?;
+            let mut cached_by_symbol: BTreeMap<String, CachedPublicQuote> = cached
                 .into_iter()
-                .filter(|item| valid_symbols.contains(&item.symbol))
+                .map(|item| (item.symbol.clone(), item))
+                .collect();
+            let filtered: Vec<CachedPublicQuote> = valid_symbols
+                .iter()
+                .filter_map(|sym| cached_by_symbol.remove(sym))
                 .collect();
             Ok(PublicQuoteBatchResponseDto {
                 quotes: filtered,
@@ -1144,6 +1227,101 @@ async fn quotes_fetch_public(
             })
         }
     }
+}
+
+/// Reads at most `max_bytes` from an open file descriptor via `File::take(max_bytes + 1)`,
+/// eliminating TOCTOU races between `fs::metadata` size checks and `fs::read`.
+fn read_bounded_file_bytes(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut limited = file.take((max_bytes as u64).saturating_add(1));
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > max_bytes {
+        let mb = (max_bytes / (1024 * 1024)).max(1);
+        return Err(format!("Selected {label} exceeds the {mb} MB safety limit"));
+    }
+    Ok(bytes)
+}
+
+/// Decodes brokerage CSV bytes supporting UTF-8 (with or without BOM), UTF-16LE/BE (BOM or
+/// NUL-interleaved UTF-16LE), and GBK/GB18030 Chinese brokerage exports.
+pub fn decode_csv_bytes(bytes: &[u8]) -> Result<String, String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(rest.to_vec())
+            .map_err(|_| "Selected UTF-8 BOM CSV contains invalid UTF-8 bytes".to_string());
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return encoding_rs::UTF_16LE
+            .decode_without_bom_handling_and_without_replacement(rest)
+            .map(|cow| cow.into_owned())
+            .ok_or_else(|| "Selected UTF-16LE CSV contains invalid byte sequences".to_string());
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return encoding_rs::UTF_16BE
+            .decode_without_bom_handling_and_without_replacement(rest)
+            .map(|cow| cow.into_owned())
+            .ok_or_else(|| "Selected UTF-16BE CSV contains invalid byte sequences".to_string());
+    }
+
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        return Ok(utf8.strip_prefix('\u{feff}').unwrap_or(utf8).to_string());
+    }
+
+    // Detect BOM-less UTF-16LE (common in some Excel / brokerage exports): even length with NUL high bytes.
+    if bytes.len() >= 4 && bytes.len().is_multiple_of(2) && bytes.contains(&0) {
+        let odd_zeros = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        let even_zeros = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+        if odd_zeros > even_zeros {
+            if let Some(decoded) =
+                encoding_rs::UTF_16LE.decode_without_bom_handling_and_without_replacement(bytes)
+            {
+                return Ok(decoded
+                    .strip_prefix('\u{feff}')
+                    .unwrap_or(&decoded)
+                    .to_string());
+            }
+        } else if even_zeros > odd_zeros {
+            if let Some(decoded) =
+                encoding_rs::UTF_16BE.decode_without_bom_handling_and_without_replacement(bytes)
+            {
+                return Ok(decoded
+                    .strip_prefix('\u{feff}')
+                    .unwrap_or(&decoded)
+                    .to_string());
+            }
+        }
+    }
+
+    // Fallback to GBK / GB18030 for legacy Chinese brokerage CSV exports (e.g. Futu / A-share).
+    if let Some(decoded) =
+        encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes)
+    {
+        return Ok(decoded
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&decoded)
+            .to_string());
+    }
+
+    Err("Selected CSV file is not valid UTF-8, UTF-16, or GBK text".to_string())
+}
+
+#[tauri::command]
+async fn quotes_fetch_public(
+    state: State<'_, VaultRuntimeState>,
+    symbols: Vec<String>,
+    provider: Option<String>,
+) -> Result<PublicQuoteBatchResponseDto, String> {
+    fetch_public_quotes_with_vault_cache(
+        &state,
+        symbols,
+        provider,
+        |valid_symbols, provider_choice| async move {
+            fetch_public_quotes_partial(&valid_symbols, provider_choice).await
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1168,14 +1346,8 @@ async fn dialog_open_csv_file(app: AppHandle) -> Result<Option<OpenedTextFileDto
         let path = file_path
             .into_path()
             .map_err(|_| "selected CSV path is not a local filesystem path".to_string())?;
-        let meta = fs::metadata(&path).map_err(|error| error.to_string())?;
-        if meta.len() as usize > MAX_CSV_BYTES {
-            return Err(format!(
-                "Selected CSV exceeds the 5 MB safety limit ({} bytes)",
-                meta.len()
-            ));
-        }
-        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let raw_bytes = read_bounded_file_bytes(&path, MAX_CSV_BYTES, "CSV")?;
+        let content = decode_csv_bytes(&raw_bytes)?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1288,14 +1460,13 @@ async fn dialog_open_fhvault_file(app: AppHandle) -> Result<Option<OpenedTextFil
         let path = file_path
             .into_path()
             .map_err(|_| "selected backup path is not a local filesystem path".to_string())?;
-        let meta = fs::metadata(&path).map_err(|error| error.to_string())?;
-        if meta.len() as usize > MAX_FHVAULT_BYTES {
-            return Err(format!(
-                "Selected .fhvault backup exceeds the 20 MB safety limit ({} bytes)",
-                meta.len()
-            ));
-        }
-        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let raw_bytes = read_bounded_file_bytes(&path, MAX_FHVAULT_BYTES, ".fhvault backup")?;
+        let content_raw = String::from_utf8(raw_bytes)
+            .map_err(|_| "Selected .fhvault backup is not valid UTF-8".to_string())?;
+        let content = content_raw
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&content_raw)
+            .to_string();
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1785,5 +1956,135 @@ mod tests {
         if let Some(parent) = dst_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[tokio::test]
+    async fn quotes_fetch_blocks_network_when_locked_and_falls_back_to_cache_on_partial_failure() {
+        let db_path = temp_vault_path("quotes-lock-partial");
+        let key_store: Arc<dyn KeyStore> = Arc::new(InMemoryKeyStore::new());
+        let state = VaultRuntimeState::open_with_store(&db_path, key_store, "in-memory-test");
+
+        // Pre-populate encrypted cache for 00700.HK so partial failure can fall back to it.
+        state
+            .with_unlocked(|db, _| {
+                db.upsert_quote_cache(&[CachedPublicQuote {
+                    symbol: "00700.HK".into(),
+                    price: "380.0000".into(),
+                    change: "2.0000".into(),
+                    change_pct: "0.53".into(),
+                    currency: "HKD".into(),
+                    provider: "stooq.com".into(),
+                    as_of_utc: "2026-11-21T08:00:00.000Z".into(),
+                    delayed: true,
+                }])
+                .map_err(|e| e.to_string())
+            })
+            .expect("seed cache");
+
+        // Partial failure: AAPL succeeds, 00700.HK fails -> AAPL fresh, 00700.HK from cache, degraded_reason populated.
+        let partial_resp = fetch_public_quotes_with_vault_cache(
+            &state,
+            vec!["AAPL".into(), "00700.HK".into()],
+            Some("stooq".into()),
+            |_syms, _prov| async {
+                Ok(PublicQuoteBatchOutcome {
+                    quotes: vec![CachedPublicQuote {
+                        symbol: "AAPL".into(),
+                        price: "230.0000".into(),
+                        change: "0.0000".into(),
+                        change_pct: "0.00".into(),
+                        currency: "USD".into(),
+                        provider: "stooq.com".into(),
+                        as_of_utc: "2026-11-21T21:00:00.000Z".into(),
+                        delayed: true,
+                    }],
+                    failed_symbols: vec!["00700.HK".into()],
+                    last_error: Some("upstream timeout".into()),
+                    timed_out: false,
+                })
+            },
+        )
+        .await
+        .expect("partial fallback succeeds");
+
+        assert!(!partial_resp.from_cache);
+        assert_eq!(partial_resp.quotes.len(), 2);
+        assert_eq!(partial_resp.quotes[0].symbol, "AAPL");
+        assert_eq!(partial_resp.quotes[0].price, "230.0000");
+        assert_eq!(partial_resp.quotes[1].symbol, "00700.HK");
+        assert_eq!(partial_resp.quotes[1].price, "380.0000");
+        assert!(partial_resp
+            .degraded_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("00700.HK"));
+
+        // Lock vault -> outbound quote fetcher MUST NOT be called at all.
+        state
+            .lock_session("manual", Some("local-csv"))
+            .expect("lock");
+        let fetcher_called = Arc::new(AtomicBool::new(false));
+        let called_flag = Arc::clone(&fetcher_called);
+        let locked_err = fetch_public_quotes_with_vault_cache(
+            &state,
+            vec!["AAPL".into()],
+            Some("stooq".into()),
+            move |_syms, _prov| async move {
+                called_flag.store(true, Ordering::SeqCst);
+                Err(QuoteError::Network("should not be reached".into()))
+            },
+        )
+        .await
+        .expect_err("locked vault must reject outbound quotes");
+        assert!(!fetcher_called.load(Ordering::SeqCst));
+        assert!(locked_err.to_ascii_lowercase().contains("lock"));
+
+        if let Some(parent) = db_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn bounded_file_read_enforces_limit_without_toctou_and_decodes_utf8_bom_utf16le_and_gbk() {
+        let dir = temp_vault_path("bounded-read")
+            .parent()
+            .expect("parent")
+            .to_path_buf();
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        // Enforce strict byte cap via File::take(limit + 1)
+        let cap_file = dir.join("capped.csv");
+        fs::write(&cap_file, vec![b'A'; 65]).expect("write");
+        assert!(read_bounded_file_bytes(&cap_file, 64, "CSV").is_err());
+        assert_eq!(
+            read_bounded_file_bytes(&cap_file, 65, "CSV")
+                .expect("exact limit")
+                .len(),
+            65
+        );
+
+        // UTF-8 BOM
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend_from_slice("股票代码,持有数量\nHK.00700,100\n".as_bytes());
+        let decoded_utf8 = decode_csv_bytes(&utf8_bom).expect("utf8 bom");
+        assert!(decoded_utf8.starts_with("股票代码"));
+
+        // UTF-16LE with BOM
+        let sample = "Symbol,Quantity\nAAPL,10\n";
+        let mut utf16le = vec![0xFF, 0xFE];
+        for unit in sample.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded_utf16 = decode_csv_bytes(&utf16le).expect("utf16le");
+        assert_eq!(decoded_utf16, sample);
+
+        // GBK Chinese brokerage CSV
+        let gbk_source = "股票代码,股票名称,持有数量,稀释成本价,现价,市值,币种\nHK.00700,腾讯控股,100,320,380,38000,港元\n";
+        let (gbk_bytes, _, had_errors) = encoding_rs::GBK.encode(gbk_source);
+        assert!(!had_errors);
+        let decoded_gbk = decode_csv_bytes(&gbk_bytes).expect("gbk");
+        assert_eq!(decoded_gbk, gbk_source);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

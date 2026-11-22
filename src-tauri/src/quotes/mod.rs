@@ -18,7 +18,9 @@ use std::{
     time::Duration,
 };
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{
+    Datelike, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeDelta, Utc, Weekday,
+};
 use reqwest::{redirect::Policy, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -36,6 +38,149 @@ pub const MAX_CONCURRENT_QUOTE_REQUESTS: usize = 4;
 
 const FIXED_SCALE: u32 = 8;
 const FIXED_FACTOR: i128 = 100_000_000;
+
+const KNOWN_EXCHANGE_SUFFIXES: &[&str] = &[
+    ".HK", ".SS", ".SZ", ".SI", ".T", ".L", ".TO", ".V", ".AX", ".DE", ".PA", ".SW", ".AS", ".MI",
+    ".MC", ".BR", ".CO", ".ST", ".HE", ".OL", ".TW", ".TWO", ".KS", ".KQ", ".BO", ".NS", ".NZ",
+    ".SA", ".MX", ".JK", ".BK", ".KL", ".TA", ".JO",
+];
+
+fn split_exchange_suffix(symbol: &str) -> Option<(&str, &str)> {
+    let dot_idx = symbol.rfind('.')?;
+    let suffix = &symbol[dot_idx..];
+    if KNOWN_EXCHANGE_SUFFIXES.contains(&suffix) && dot_idx > 0 {
+        Some((&symbol[..dot_idx], suffix))
+    } else {
+        None
+    }
+}
+
+pub fn infer_currency_from_symbol(symbol: &str) -> &'static str {
+    match split_exchange_suffix(symbol).map(|(_, suffix)| suffix) {
+        Some(".HK") => "HKD",
+        Some(".SS" | ".SZ") => "CNY",
+        Some(".SI") => "SGD",
+        Some(".T") => "JPY",
+        Some(".L") => "GBP",
+        Some(".TO" | ".V") => "CAD",
+        Some(".AX") => "AUD",
+        Some(".DE" | ".PA" | ".AS" | ".MI" | ".MC" | ".BR" | ".HE") => "EUR",
+        Some(".SW") => "CHF",
+        Some(".CO") => "DKK",
+        Some(".ST") => "SEK",
+        Some(".OL") => "NOK",
+        Some(".TW" | ".TWO") => "TWD",
+        Some(".KS" | ".KQ") => "KRW",
+        Some(".BO" | ".NS") => "INR",
+        Some(".NZ") => "NZD",
+        Some(".SA") => "BRL",
+        Some(".MX") => "MXN",
+        Some(".JK") => "IDR",
+        Some(".BK") => "THB",
+        Some(".KL") => "MYR",
+        Some(".TA") => "ILS",
+        Some(".JO") => "ZAR",
+        _ => "USD",
+    }
+}
+
+/// Maps a normalized FolioHelm ticker to a Yahoo Finance chart symbol.
+/// Preserves exchange suffixes (`.HK`, `.SS`, `.SZ`, `.SI`, etc.) and only converts
+/// US share-class dots (e.g. `BRK.B` -> `BRK-B`). 5-digit leading-zero HK tickers
+/// (e.g. `00700.HK`) are normalized to Yahoo's 4-digit HK convention (`0700.HK`).
+pub fn map_yahoo_symbol(symbol: &str) -> String {
+    if let Some((code, suffix)) = split_exchange_suffix(symbol) {
+        let yahoo_code = if suffix == ".HK" && code.bytes().all(|b| b.is_ascii_digit()) {
+            let stripped = code.trim_start_matches('0');
+            if stripped.is_empty() {
+                "0000".to_string()
+            } else if stripped.len() >= 4 {
+                stripped.to_string()
+            } else {
+                format!("{stripped:0>4}")
+            }
+        } else {
+            code.replace('.', "-")
+        };
+        format!("{yahoo_code}{suffix}")
+    } else {
+        symbol.replace('.', "-")
+    }
+}
+
+/// Maps a normalized FolioHelm ticker to a Stooq ticker and its native market currency.
+pub fn map_stooq_symbol(symbol: &str) -> (String, &'static str) {
+    let currency = infer_currency_from_symbol(symbol);
+    if let Some((code, suffix)) = split_exchange_suffix(symbol) {
+        let code_lower = code.to_ascii_lowercase().replace('.', "-");
+        let stooq_ticker = match suffix {
+            ".HK" => {
+                let trimmed = code_lower.trim_start_matches('0');
+                let hk_code = if trimmed.is_empty() { "0" } else { trimmed };
+                format!("{hk_code}.hk")
+            }
+            ".SS" => format!("{code_lower}.ss"),
+            ".SZ" => format!("{code_lower}.sz"),
+            ".SI" => format!("{code_lower}.si"),
+            ".T" => format!("{code_lower}.jp"),
+            ".L" => format!("{code_lower}.uk"),
+            ".DE" => format!("{code_lower}.de"),
+            ".PA" => format!("{code_lower}.fr"),
+            ".SW" => format!("{code_lower}.ch"),
+            ".TO" | ".V" => format!("{code_lower}.ca"),
+            ".AX" => format!("{code_lower}.au"),
+            ".TW" | ".TWO" => format!("{code_lower}.tw"),
+            ".KS" | ".KQ" => format!("{code_lower}.kr"),
+            other => format!("{code_lower}{}", other.to_ascii_lowercase()),
+        };
+        (stooq_ticker, currency)
+    } else {
+        (
+            format!("{}.us", symbol.to_ascii_lowercase().replace('.', "-")),
+            "USD",
+        )
+    }
+}
+
+fn last_sunday_of_month(year: i32, month: u32) -> Option<NaiveDate> {
+    let last_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => 28,
+        _ => return None,
+    };
+    let mut date = NaiveDate::from_ymd_opt(year, month, last_day)?;
+    while date.weekday() != Weekday::Sun {
+        date = date.pred_opt()?;
+    }
+    Some(date)
+}
+
+/// Converts a Stooq Warsaw local timestamp (`YYYY-MM-DD`, `HH:MM:SS`) in CET (UTC+1) /
+/// CEST (UTC+2) to an RFC 3339 UTC timestamp using standard EU DST transition rules.
+pub fn stooq_warsaw_to_utc(date_col: &str, time_col: &str) -> Option<String> {
+    let date = NaiveDate::parse_from_str(date_col.trim(), "%Y-%m-%d").ok()?;
+    let time = NaiveTime::parse_from_str(time_col.trim(), "%H:%M:%S").ok()?;
+    let local = NaiveDateTime::new(date, time);
+    let year = date.year();
+    let march_sun = last_sunday_of_month(year, 3)?;
+    let oct_sun = last_sunday_of_month(year, 10)?;
+
+    let dst_start_cest = NaiveDateTime::new(march_sun, NaiveTime::from_hms_opt(3, 0, 0)?);
+    let dst_end_cest = NaiveDateTime::new(oct_sun, NaiveTime::from_hms_opt(2, 0, 0)?);
+
+    let offset_hours = if local >= dst_start_cest && local < dst_end_cest {
+        2
+    } else {
+        1
+    };
+    let utc_naive = local.checked_sub_signed(TimeDelta::hours(offset_hours))?;
+    Some(
+        utc_naive
+            .and_utc()
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+}
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum QuoteError {
@@ -91,6 +236,14 @@ pub struct PublicQuoteBatchResponseDto {
     pub from_cache: bool,
     pub degraded_reason: Option<String>,
     pub provider: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicQuoteBatchOutcome {
+    pub quotes: Vec<CachedPublicQuote>,
+    pub failed_symbols: Vec<String>,
+    pub last_error: Option<String>,
+    pub timed_out: bool,
 }
 
 pub fn validate_quote_symbols(raw_symbols: &[String]) -> Result<Vec<String>, QuoteError> {
@@ -171,11 +324,20 @@ pub async fn fetch_public_quotes(
     symbols: &[String],
     provider: PublicQuoteProvider,
 ) -> Result<Vec<CachedPublicQuote>, QuoteError> {
+    fetch_public_quotes_partial(symbols, provider)
+        .await
+        .map(|outcome| outcome.quotes)
+}
+
+pub async fn fetch_public_quotes_partial(
+    symbols: &[String],
+    provider: PublicQuoteProvider,
+) -> Result<PublicQuoteBatchOutcome, QuoteError> {
     let valid_symbols = validate_quote_symbols(symbols)?;
     let client = build_read_only_client()?;
     let now_utc = Arc::new(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
 
-    run_bounded_batch(
+    run_bounded_batch_outcome(
         valid_symbols,
         MAX_CONCURRENT_QUOTE_REQUESTS,
         Duration::from_secs(BATCH_QUOTE_TIMEOUT_SECS),
@@ -197,12 +359,12 @@ pub async fn fetch_public_quotes(
     .await
 }
 
-async fn run_bounded_batch<F, Fut>(
+async fn run_bounded_batch_outcome<F, Fut>(
     symbols: Vec<String>,
     max_concurrency: usize,
     total_timeout: Duration,
     fetcher: F,
-) -> Result<Vec<CachedPublicQuote>, QuoteError>
+) -> Result<PublicQuoteBatchOutcome, QuoteError>
 where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<CachedPublicQuote, QuoteError>> + Send + 'static,
@@ -211,15 +373,16 @@ where
     let fetcher = Arc::new(fetcher);
     let mut join_set = JoinSet::new();
 
-    for (index, symbol) in symbols.into_iter().enumerate() {
+    for (index, symbol) in symbols.iter().enumerate() {
         let permit_pool = Arc::clone(&semaphore);
         let fetcher = Arc::clone(&fetcher);
+        let sym = symbol.clone();
         join_set.spawn(async move {
             let _permit = permit_pool
                 .acquire_owned()
                 .await
                 .map_err(|_| QuoteError::Network("quote concurrency limiter closed".to_string()))?;
-            let result = fetcher(symbol).await;
+            let result = fetcher(sym).await;
             Ok::<(usize, Result<CachedPublicQuote, QuoteError>), QuoteError>((index, result))
         });
     }
@@ -260,7 +423,19 @@ where
         }));
     }
 
-    Ok(ordered_results.into_values().collect())
+    let mut failed_symbols = Vec::new();
+    for (index, symbol) in symbols.into_iter().enumerate() {
+        if !ordered_results.contains_key(&index) {
+            failed_symbols.push(symbol);
+        }
+    }
+
+    Ok(PublicQuoteBatchOutcome {
+        quotes: ordered_results.into_values().collect(),
+        failed_symbols,
+        last_error: last_error.map(|e| e.to_string()),
+        timed_out,
+    })
 }
 
 async fn read_bounded_response_utf8(
@@ -318,8 +493,7 @@ async fn fetch_stooq_symbol(
     symbol: &str,
     fetched_at_utc: &str,
 ) -> Result<CachedPublicQuote, QuoteError> {
-    // Stooq uses lowercase ticker with `.us` suffix for US equities and `-` for dots (e.g. brk-b.us).
-    let stooq_ticker = format!("{}.us", symbol.to_ascii_lowercase().replace('.', "-"));
+    let (stooq_ticker, _currency) = map_stooq_symbol(symbol);
     let url_str = format!("https://stooq.com/q/l/?s={stooq_ticker}&f=sd2t2ohlcv&h&e=csv");
     let url = validate_allowlisted_https_url(&url_str)?;
 
@@ -351,49 +525,109 @@ pub fn parse_stooq_csv_response(
         });
     }
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    let _header = lines
+    let header_line = lines
         .next()
         .ok_or_else(|| QuoteError::Parse("empty stooq CSV response".to_string()))?;
-    let data_line = lines
-        .next()
-        .ok_or_else(|| QuoteError::Parse("missing stooq data row".to_string()))?;
-    let cols: Vec<&str> = data_line.split(',').map(str::trim).collect();
-    if cols.len() < 7 {
-        return Err(QuoteError::Parse(
-            "unexpected stooq CSV columns".to_string(),
-        ));
+    let headers: Vec<String> = header_line
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+
+    let find_col = |names: &[&str]| -> Option<usize> {
+        headers
+            .iter()
+            .position(|h| names.iter().any(|name| h == name))
+    };
+
+    let date_idx = find_col(&["date"]).unwrap_or(1);
+    let time_idx = find_col(&["time"]);
+    let close_idx = find_col(&["close"]).ok_or_else(|| {
+        QuoteError::Parse("missing Close column in stooq CSV response".to_string())
+    })?;
+    let prev_idx = find_col(&["prev", "previous", "prev close", "previous close"]);
+
+    struct ParsedStooqRow<'a> {
+        date: &'a str,
+        time: Option<&'a str>,
+        close: i128,
+        prev_close: Option<i128>,
     }
 
-    let date_col = cols[1];
-    let time_col = cols[2];
-    let open_col = cols[3];
-    let close_col = cols[6];
+    let mut parsed_rows: Vec<ParsedStooqRow<'_>> = Vec::new();
+    for line in lines {
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        if cols.len() <= close_idx {
+            continue;
+        }
+        let close_col = cols[close_idx];
+        if close_col.eq_ignore_ascii_case("N/D") || close_col.is_empty() {
+            continue;
+        }
+        let close_fixed = parse_positive_fixed_decimal(close_col)?;
+        let prev_close = prev_idx
+            .and_then(|idx| cols.get(idx).copied())
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("N/D"))
+            .and_then(|v| parse_positive_fixed_decimal(v).ok());
+        let date = cols.get(date_idx).copied().unwrap_or("");
+        let time = time_idx.and_then(|idx| cols.get(idx).copied());
+        parsed_rows.push(ParsedStooqRow {
+            date,
+            time,
+            close: close_fixed,
+            prev_close,
+        });
+    }
 
-    if close_col.eq_ignore_ascii_case("N/D") || close_col.is_empty() {
+    if parsed_rows.is_empty() {
         return Err(QuoteError::Parse(format!(
             "no delayed quote available on stooq for {requested_symbol}"
         )));
     }
 
-    let close_fixed = parse_positive_fixed_decimal(close_col)?;
-    let open_fixed = parse_positive_fixed_decimal(open_col).unwrap_or(close_fixed);
-    let change_fixed = close_fixed
-        .checked_sub(open_fixed)
-        .ok_or_else(|| QuoteError::Parse("quote change overflow".to_string()))?;
-    let change_pct_fixed = compute_change_pct_fixed(change_fixed, open_fixed)?;
+    // Order chronologically when multiple daily rows are returned so the latest bar is last.
+    parsed_rows.sort_by(|a, b| {
+        a.date
+            .cmp(b.date)
+            .then_with(|| a.time.unwrap_or("").cmp(b.time.unwrap_or("")))
+    });
 
-    let as_of_utc = if date_col.len() == 10 && time_col.len() >= 8 && date_col != "N/D" {
-        format!("{date_col}T{time_col}Z")
+    let latest = parsed_rows
+        .last()
+        .ok_or_else(|| QuoteError::Parse("missing stooq data row".to_string()))?;
+    let prior_row_close = if parsed_rows.len() >= 2 {
+        Some(parsed_rows[parsed_rows.len() - 2].close)
     } else {
-        fallback_as_of_utc.to_string()
+        None
     };
+
+    // Never fabricate daily change from intraday (Close - Open): only compute daily change
+    // when an explicit Previous Close column or a prior trading day's Close is available.
+    let (change_fixed, change_pct_fixed) = match latest.prev_close.or(prior_row_close) {
+        Some(prev_close_fixed) => {
+            let change = latest
+                .close
+                .checked_sub(prev_close_fixed)
+                .ok_or_else(|| QuoteError::Parse("quote change overflow".to_string()))?;
+            let change_pct = compute_change_pct_fixed(change, prev_close_fixed)?;
+            (change, change_pct)
+        }
+        None => (0, 0),
+    };
+
+    let as_of_utc = latest
+        .time
+        .filter(|t| !t.eq_ignore_ascii_case("N/D") && !t.is_empty())
+        .and_then(|t| stooq_warsaw_to_utc(latest.date, t))
+        .unwrap_or_else(|| fallback_as_of_utc.to_string());
+
+    let (_, currency) = map_stooq_symbol(requested_symbol);
 
     Ok(CachedPublicQuote {
         symbol: requested_symbol.to_string(),
-        price: format_fixed(close_fixed, 4),
+        price: format_fixed(latest.close, 4),
         change: format_fixed(change_fixed, 4),
         change_pct: format_fixed(change_pct_fixed, 2),
-        currency: "USD".to_string(),
+        currency: currency.to_string(),
         provider: PublicQuoteProvider::Stooq.code().to_string(),
         as_of_utc,
         delayed: true,
@@ -405,7 +639,7 @@ async fn fetch_yahoo_symbol(
     symbol: &str,
     fetched_at_utc: &str,
 ) -> Result<CachedPublicQuote, QuoteError> {
-    let yahoo_ticker = symbol.replace('.', "-");
+    let yahoo_ticker = map_yahoo_symbol(symbol);
     let url_str = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval=1d&range=2d"
     );
@@ -519,7 +753,7 @@ pub fn parse_yahoo_chart_response(
             .currency
             .filter(|c| !c.trim().is_empty())
             .map(|c| c.trim().to_ascii_uppercase())
-            .unwrap_or_else(|| "USD".to_string()),
+            .unwrap_or_else(|| infer_currency_from_symbol(requested_symbol).to_string()),
         provider: PublicQuoteProvider::Yahoo.code().to_string(),
         as_of_utc,
         delayed: true,
@@ -637,14 +871,17 @@ fn fixed_div(numerator: i128, denominator: i128) -> Result<i128, QuoteError> {
     let scaled = numerator
         .checked_mul(FIXED_FACTOR)
         .ok_or_else(|| QuoteError::Parse("fixed-point division overflow".to_string()))?;
-    let half = denominator.abs() / 2;
+    let half = i128::try_from(denominator.unsigned_abs() / 2)
+        .map_err(|_| QuoteError::Parse("fixed-point rounding overflow".to_string()))?;
     let adjusted = if (scaled >= 0) == (denominator > 0) {
         scaled.checked_add(if scaled >= 0 { half } else { -half })
     } else {
         scaled.checked_sub(if scaled >= 0 { half } else { -half })
     }
     .ok_or_else(|| QuoteError::Parse("fixed-point rounding overflow".to_string()))?;
-    Ok(adjusted / denominator)
+    adjusted
+        .checked_div(denominator)
+        .ok_or_else(|| QuoteError::Parse("fixed-point division overflow".to_string()))
 }
 
 fn compute_change_pct_fixed(change_fixed: i128, base_fixed: i128) -> Result<i128, QuoteError> {
@@ -721,26 +958,70 @@ mod tests {
     }
 
     #[test]
+    fn maps_non_us_and_us_symbols_accurately_for_yahoo_and_stooq() {
+        assert_eq!(map_yahoo_symbol("AAPL"), "AAPL");
+        assert_eq!(map_yahoo_symbol("BRK.B"), "BRK-B");
+        assert_eq!(map_yahoo_symbol("00700.HK"), "0700.HK");
+        assert_eq!(map_yahoo_symbol("09988.HK"), "9988.HK");
+        assert_eq!(map_yahoo_symbol("600519.SS"), "600519.SS");
+        assert_eq!(map_yahoo_symbol("000001.SZ"), "000001.SZ");
+        assert_eq!(map_yahoo_symbol("D05.SI"), "D05.SI");
+        assert_eq!(map_yahoo_symbol("7203.T"), "7203.T");
+        assert_eq!(map_yahoo_symbol("HSBA.L"), "HSBA.L");
+
+        assert_eq!(map_stooq_symbol("AAPL"), ("aapl.us".to_string(), "USD"));
+        assert_eq!(map_stooq_symbol("BRK.B"), ("brk-b.us".to_string(), "USD"));
+        assert_eq!(map_stooq_symbol("00700.HK"), ("700.hk".to_string(), "HKD"));
+        assert_eq!(
+            map_stooq_symbol("600519.SS"),
+            ("600519.ss".to_string(), "CNY")
+        );
+        assert_eq!(
+            map_stooq_symbol("000001.SZ"),
+            ("000001.sz".to_string(), "CNY")
+        );
+        assert_eq!(map_stooq_symbol("D05.SI"), ("d05.si".to_string(), "SGD"));
+        assert_eq!(map_stooq_symbol("7203.T"), ("7203.jp".to_string(), "JPY"));
+        assert_eq!(map_stooq_symbol("HSBA.L"), ("hsba.uk".to_string(), "GBP"));
+    }
+
+    #[test]
     fn parses_stooq_csv_and_yahoo_chart_responses_with_exact_fixed_point_math() {
+        // Single-row Stooq without Previous Close MUST NOT fabricate daily change from (Close - Open),
+        // and converts Warsaw CET (UTC+1 in Nov) to real UTC.
         let stooq_csv = "Symbol,Date,Time,Open,High,Low,Close,Volume\nAAPL.US,2026-11-21,22:00:00,225.00,229.00,224.50,228.50,42100000\n";
         let quote =
             parse_stooq_csv_response("AAPL", stooq_csv, "2026-11-22T00:00:00.000Z").expect("parse");
         assert_eq!(quote.symbol, "AAPL");
         assert_eq!(quote.price, "228.5000");
-        assert_eq!(quote.change, "3.5000");
-        assert_eq!(quote.change_pct, "1.56");
+        assert_eq!(quote.change, "0.0000");
+        assert_eq!(quote.change_pct, "0.00");
+        assert_eq!(quote.currency, "USD");
+        assert_eq!(quote.as_of_utc, "2026-11-21T21:00:00.000Z");
         assert_eq!(quote.provider, "stooq.com");
         assert!(quote.delayed);
 
-        // Exact decimal test without IEEE-754 drift (0.30 - 0.10 == 0.20 exactly, not 0.19999999999999998)
-        let exact_csv = "Symbol,Date,Time,Open,High,Low,Close,Volume\nPENNY.US,2026-11-21,22:00:00,0.10,0.30,0.10,0.30,100\n";
-        let exact = parse_stooq_csv_response("PENNY", exact_csv, "2026-11-22T00:00:00.000Z")
+        // Non-US HK stock in summer CEST (UTC+2 in July) with Prev column uses HKD and exact baseline
+        let hk_csv = "Symbol,Date,Time,Open,High,Low,Close,Volume,Prev\n700.HK,2026-07-15,10:08:00,382.00,386.00,379.00,384.00,1200000,380.00\n";
+        let hk_quote =
+            parse_stooq_csv_response("00700.HK", hk_csv, "2026-07-15T12:00:00.000Z").expect("hk");
+        assert_eq!(hk_quote.symbol, "00700.HK");
+        assert_eq!(hk_quote.currency, "HKD");
+        assert_eq!(hk_quote.price, "384.0000");
+        assert_eq!(hk_quote.change, "4.0000");
+        assert_eq!(hk_quote.change_pct, "1.05");
+        assert_eq!(hk_quote.as_of_utc, "2026-07-15T08:08:00.000Z");
+
+        // Multi-row exact decimal test without IEEE-754 drift (0.30 - 0.10 == 0.20 exactly, not 0.19999999999999998)
+        let exact_csv = "Date,Open,High,Low,Close,Volume\n2026-11-20,0.09,0.12,0.08,0.10,50\n2026-11-21,0.15,0.30,0.15,0.30,100\n";
+        let exact = parse_stooq_csv_response("600519.SS", exact_csv, "2026-11-22T00:00:00.000Z")
             .expect("exact parse");
+        assert_eq!(exact.currency, "CNY");
         assert_eq!(exact.price, "0.3000");
         assert_eq!(exact.change, "0.2000");
         assert_eq!(exact.change_pct, "200.00");
 
-        // Yahoo JSON including scientific notation number token
+        // Yahoo JSON including scientific notation number token + currency fallback for non-US symbols
         let yahoo_json = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":4.1525e2,"chartPreviousClose":410.0,"currency":"USD","regularMarketTime":1763760000}}]}}"#;
         let y_quote =
             parse_yahoo_chart_response("MSFT", yahoo_json, "2026-11-22T00:00:00.000Z").expect("y");
@@ -750,6 +1031,16 @@ mod tests {
         assert_eq!(y_quote.change_pct, "1.28");
         assert_eq!(y_quote.provider, "query1.finance.yahoo.com");
         assert!(y_quote.delayed);
+
+        let yahoo_sg_no_curr = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":42.50,"chartPreviousClose":41.00,"regularMarketTime":1763760000}}]}}"#;
+        let sg_quote =
+            parse_yahoo_chart_response("D05.SI", yahoo_sg_no_curr, "2026-11-22T00:00:00.000Z")
+                .expect("sg");
+        assert_eq!(sg_quote.symbol, "D05.SI");
+        assert_eq!(sg_quote.currency, "SGD");
+
+        // fixed_div handles i128::MIN denominator without panicking
+        assert!(fixed_div(1, i128::MIN).is_ok());
     }
 
     #[test]
@@ -779,14 +1070,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforces_bounded_concurrency_and_total_batch_timeout() {
+    async fn enforces_bounded_concurrency_partial_failures_and_total_batch_timeout() {
         let symbols: Vec<String> = (1..=12).map(|i| format!("SYM{i}")).collect();
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
 
         let active_clone = Arc::clone(&active);
         let max_clone = Arc::clone(&max_seen);
-        let results = run_bounded_batch(
+        let outcome = run_bounded_batch_outcome(
             symbols.clone(),
             MAX_CONCURRENT_QUOTE_REQUESTS,
             Duration::from_secs(5),
@@ -814,13 +1105,45 @@ mod tests {
         .await
         .expect("batch succeeds");
 
-        assert_eq!(results.len(), 12);
-        assert_eq!(results[0].symbol, "SYM1");
-        assert_eq!(results[11].symbol, "SYM12");
+        assert_eq!(outcome.quotes.len(), 12);
+        assert!(outcome.failed_symbols.is_empty());
+        assert_eq!(outcome.quotes[0].symbol, "SYM1");
+        assert_eq!(outcome.quotes[11].symbol, "SYM12");
         assert!(max_seen.load(Ordering::SeqCst) <= MAX_CONCURRENT_QUOTE_REQUESTS);
 
+        // Partial failure returns succeeded quotes AND accurately lists failed symbols.
+        let partial = run_bounded_batch_outcome(
+            vec!["AAPL".into(), "00700.HK".into(), "MSFT".into()],
+            2,
+            Duration::from_secs(2),
+            |symbol| async move {
+                if symbol == "00700.HK" {
+                    return Err(QuoteError::Network("upstream 503".into()));
+                }
+                Ok(CachedPublicQuote {
+                    symbol,
+                    price: "200.0000".into(),
+                    change: "0.0000".into(),
+                    change_pct: "0.00".into(),
+                    currency: "USD".into(),
+                    provider: "stooq.com".into(),
+                    as_of_utc: "2026-11-22T00:00:00.000Z".into(),
+                    delayed: true,
+                })
+            },
+        )
+        .await
+        .expect("partial batch succeeds");
+        assert_eq!(partial.quotes.len(), 2);
+        assert_eq!(partial.failed_symbols, vec!["00700.HK"]);
+        assert!(partial
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("upstream 503"));
+
         // Total batch timeout aborts hung requests cleanly.
-        let timed_out = run_bounded_batch(
+        let timed_out = run_bounded_batch_outcome(
             vec!["AAPL".to_string(), "MSFT".to_string()],
             2,
             Duration::from_millis(40),
