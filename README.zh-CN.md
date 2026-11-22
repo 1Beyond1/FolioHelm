@@ -8,18 +8,24 @@ FolioHelm 是一款本地优先、安全优先的 Windows 桌面端投资组合�
 
 ## 已实现能力
 
-- **本地加密持久化（Fail-Closed 安全优先）**：
-  - 使用内置 SQLite（`rusqlite` `bundled`，启用 `WAL` 与 `PRAGMA secure_delete = ON`）结合 **AES-256-GCM** 认证加密落盘保存导入持仓、现金快照、纸上订单、证据链、行情缓存与安全设置；每条密文均使用随机 96-bit Nonce 并通过 AEAD AAD 严格绑定 `schema_version|table|record_id`，防止跨行/跨表密文替换。
+- **本地加密持久化、`.fhvault` 离线备份与真实锁屏（Fail-Closed 安全优先）**：
+  - 使用内置 SQLite（`rusqlite` `bundled`，启用 `WAL` 与 `PRAGMA secure_delete = ON`）结合 **AES-256-GCM** 认证加密落盘保存导入持仓、现金快照、纸上订单、证据链、行情缓存、自动化策略、安全设置与再平衡目标权重；每条密文均使用随机 96-bit Nonce 并通过 AEAD AAD 严格绑定 `schema_version|table|record_id`，支持旧浏览器配置无损迁移，重启桌面端后自动恢复用户的 `local-csv` 工作区与加密行情缓存。
   - 256-bit 数据库主密钥与 **Ed25519** 设备签名种子托管于操作系统凭证管理器（**Windows Credential Manager** / OS Keyring），内存密钥缓冲区使用 `zeroize` 在释放时自动擦除。
+  - **`.fhvault` 口令加密离线迁移备份**：采用 **Argon2id** + 随机 128-bit 盐 + **AES-256-GCM** + 格式/版本 AAD 导出全库加密快照；恢复时先完成认证解密与整条 Ed25519 证据链验签再原子替换现有金库（Fail-Closed：任何校验失败绝不破坏现有数据库）。证据与备份导入统一强制 20 MB 硬上限。
+  - **真实手动与空闲自动锁屏（App Lock）**：锁定前写入 Ed25519 签名 `SessionLocked` 证据，随即释放并 `Zeroizing` 擦除内存会话密钥，前端卸载持仓 DOM 弹出锁屏遮罩；解锁支持可选 Argon2id 常量时间口令校验与指数退避防爆破（口令绝不落盘或入日志）。
   - **严格 Fail-Closed**：当磁盘已存在加密库但操作系统密钥缺失，或解密/Canary 完整性校验失败时，应用明确锁死并原样保留密文，绝不静默降级为明文或覆盖清空已有数据。
 - **Rust Ed25519 防篡改证据链**：
-  - 将交易预览、用户确认、Unknown 订单对账、安全保护开关变更及 CSV 持仓导入自动写入带哈希链与 Ed25519 签名的本地证据日志，应用重启后完整恢复并自动验签；入库前主动拦截 API Key、Token、账号等敏感字段。
-- **券商 CSV 持仓/交易安全导入与模式隔离**：
-  - 自动识别 **Charles Schwab 持仓/交易 CSV**、**Interactive Brokers (IBKR) 活动报表/持仓 CSV** 以及 **通用标准 CSV**。
-  - 强制执行 5 MB 文件体积上限与 10,000 行上限，清洗表格公式注入前缀（`=`, `+`, `-`, `@`），严格校验股票代码与非负数量，全链路使用**精确 `Decimal` / 整数定点数**核算成本均价、市值与盈亏（绝不用 IEEE-754 浮点），并通过确定性 SHA-256 指纹实现**幂等去重**（重复导入不会把持仓翻倍）。
-  - 顶栏、系统状态栏与组合页清晰区分 **Mock 演示模式** 与 **本地持仓模式 (CSV + 纸上模拟)**，两套账本完全隔离、绝不混淆。
-- **可选公开只读延迟行情源（默认关闭）**：
-  - 严格本地优先，默认关闭所有联网请求。在「设置」页由用户显式开启后，仅经 Rust 后端（`reqwest` `rustls-tls`）向严格 HTTPS 白名单域名（`stooq.com`、`query1.finance.yahoo.com`）发起无 Cookie、无凭证头的只读拉取，禁止跨域名重定向，超时 ≤ 7 秒，结果加密缓存；离线或限流时自动平滑降级至本地缓存或 CSV 导入价。
+  - 将交易预览、用户确认、Unknown 订单对账、安全保护开关变更、锁屏事件（`SessionLocked`）及 CSV 持仓导入（准确标注 `mock` / `local-csv` 模式）自动写入带哈希链与 Ed25519 签名的本地证据日志，应用重启后完整恢复并自动验签；入库前主动拦截 API Key、Token、账号等敏感字段。
+- **多券商 CSV 安全导入、多币种 Fail-Safe 隔离与全站本地持仓联动**：
+  - 自动识别 **嘉信理财 (Schwab)**、**盈透证券 (IBKR)**、**Fidelity**、**Vanguard**、**富途 (Futu)**、**老虎 (Tiger)** 与 **通用标准 CSV**。
+  - 强制执行 5 MB 文件体积上限与 10,000 行上限，清洗表格公式注入前缀（`=`, `+`, `-`, `@`），严格校验股票代码与非负数量，全链路使用**精确 `Decimal` / 整数定点数**核算成本均价、市值与盈亏（绝不用 IEEE-754 浮点），并通过确定性 SHA-256 指纹实现**幂等去重**。
+  - **多币种 Fail-Safe 隔离**：检测到多结算币种（如 USD + HKD）时按币种分项小计并在界面明确提示，未接入权威汇率前绝不跨币种盲目相加。
+  - **全站任意标的联动**：导入的任意非演示标的（如 `VOO`、`QQQ`、`BRK.B`、`00700.HK`）在首页、全局搜索（`Ctrl+K`）、市场、个股详情、组合、纸上交易与订单页均可正常浏览与演练，绝不伪造历史走势曲线、虚假指标或假新闻。
+- **目标仓位配置与只读再平衡计算器（纯 Decimal）**：
+  - 组合页内置多标的持仓分配环形图与纯 Decimal 再平衡规划器，严格校验持仓 + 现金目标权重合计等于 **100%**，支持 **「存量调仓」** 与 **「仅新增现金买入」** 双模式，配置经加密设置持久化。
+  - 单条调仓建议支持一键预填至四步纸上模拟交易单进行人工复核演练（**架构层面永久禁止自动批量下单**）。
+- **加固的可选公开只读延迟行情源（默认关闭）**：
+  - 严格本地优先，默认关闭所有联网请求。在「设置」页由用户显式开启后，仅经 Rust 后端（`reqwest` `rustls-tls`）向严格 HTTPS 白名单域名（`stooq.com`、`query1.finance.yahoo.com`，强制 `url.port().is_none()` 与禁止重定向）发起只读拉取；全链路**零 `f64`**（`i128` 定点解析），强制 512 KiB 响应体流式上限、4 并发受限批量拉取与 20 秒总超时保护，结果加密缓存；离线或限流时自动平滑降级至本地缓存或 CSV 导入价。
   - 界面醒目标注 **「延迟只读公开行情 · 不可用于真实下单」**。
 - **Tauri 原生文件对话框与严格 CSP**：
   - 桌面端导入 CSV 与导出证据包/安全诊断时优先调用受控的 Rust `tauri-plugin-dialog` 原生文件对话框（并在浏览器预览/测试环境自动降级为 `<input type="file">` 与延迟释放 Blob 下载），前端不授予任意文件系统权限。
@@ -57,7 +63,7 @@ FolioHelm 是一款本地优先、安全优先的 Windows 桌面端投资组合�
 
 ## 技术栈
 
-- **桌面壳与安全内核**：Tauri 2（`2.11.x`）、Rust（`rusqlite` `bundled`、`aes-gcm`、`ed25519-dalek`、`zeroize`、`keyring`、`reqwest` `rustls-tls`、`tauri-plugin-dialog`）
+- **桌面壳与安全内核**：Tauri 2（`2.11.x`）、Rust（`rusqlite` `bundled`、`aes-gcm`、`argon2`、`ed25519-dalek`、`subtle`、`zeroize`、`keyring`、`reqwest` `rustls-tls`、`tauri-plugin-dialog`）
 - **前端界面**：React 19、TypeScript、Vite、Vitest、React Testing Library
 
 ## 安全边界

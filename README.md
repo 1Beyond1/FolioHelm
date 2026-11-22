@@ -8,18 +8,24 @@ FolioHelm is a local-first, security-first Windows desktop portfolio and paper-t
 
 ## What's Implemented
 
-- **Encrypted Local Persistence (Fail-Closed)**:
-  - Stores your imported portfolios, cash snapshots, paper orders, evidence journal, cached quotes, and safety preferences in a bundled SQLite database (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + per-record AAD binding `schema_version|table|record_id`).
+- **Encrypted Local Persistence & `.fhvault` Offline Backup (Fail-Closed)**:
+  - Stores your imported portfolios, cash snapshots, paper orders, evidence journal, cached quotes, safety preferences, automation policies, and rebalance targets in a bundled SQLite database (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + per-record AAD binding `schema_version|table|record_id`), with lossless migration from legacy browser storage and automatic restoration of your `local-csv` workspace & cached quotes on relaunch.
   - Protects the 256-bit database master key and **Ed25519** device signing seed inside the operating system credential manager (**Windows Credential Manager** / OS Keyring) and scrubs key buffers from memory with `zeroize`.
+  - **`.fhvault` Passphrase-Encrypted Offline Migration**: exports the entire encrypted vault + signing identity using **Argon2id** + random 128-bit salt + **AES-256-GCM** + format/version AAD; restore verifies AEAD authentication and the full Ed25519 evidence chain before atomically swapping the database (Fail-Closed: failures never touch your existing vault). Evidence and backup imports enforce a 20 MB hard cap.
+  - **Real Manual & Idle App Lock**: locking writes an Ed25519-signed `SessionLocked` evidence event, immediately drops and `Zeroizing`-wipes in-memory session keys, and unmounts portfolio data behind a lock screen; unlocking supports an optional Argon2id lock passphrase verified in constant time with exponential anti-bruteforce backoff (passphrases are never persisted or logged).
   - **Fail-Closed by design**: if an existing encrypted vault cannot be decrypted or its OS keyring key is missing, FolioHelm locks the vault, preserves the untouched ciphertext, and never silently resets or downgrades to plaintext.
 - **Tamper-Evident Ed25519 Evidence Journal**:
-  - Records trade previews, confirmations, reconciliations, safety setting changes, and CSV portfolio imports into a hash-chained, Ed25519-signed local evidence journal that persists across restarts and rejects credentials or sensitive fields before writing.
-- **Safe Brokerage CSV Import & Mode Isolation**:
-  - Supports **Charles Schwab Positions / Transactions CSV**, **Interactive Brokers (IBKR) Activity / Positions CSV**, and **Standard Portfolio CSV**.
+  - Records trade previews, confirmations, reconciliations, safety setting changes, App Lock events (`SessionLocked`), and CSV portfolio imports (tagged with exact `mock` / `local-csv` mode) into a hash-chained, Ed25519-signed local evidence journal that persists across restarts and rejects credentials or sensitive fields before writing.
+- **Safe Multi-Broker CSV Import, Multi-Currency Fail-Safe Isolation & Full-Site Local Portfolio**:
+  - Supports **Charles Schwab**, **Interactive Brokers (IBKR)**, **Fidelity**, **Vanguard**, **Futu (富途)**, **Tiger (老虎)**, and **Standard Portfolio CSV**.
   - Enforces a 5 MB / 10,000-row safety limit, neutralizes spreadsheet formula injection (`=`, `+`, `-`, `@` prefixes), validates ticker format and non-negative share quantities, calculates cost basis and P&L with **exact `Decimal` / fixed-point arithmetic** (never IEEE-754 floats), and computes deterministic SHA-256 fingerprints for **idempotent deduplication**.
-  - Keeps **Mock Demo** and **Local Portfolio (CSV + Paper)** strictly separated in the top bar, status bar, and portfolio ledger.
-- **Optional Delayed Public Quotes (Off by Default)**:
-  - Disabled by default for local-first operation. When explicitly enabled in **Settings**, the Rust backend fetches unauthenticated, delayed read-only quotes exclusively from HTTPS-allowlisted hosts (`stooq.com` and `query1.finance.yahoo.com`) with redirects disabled, short timeouts, encrypted cache persistence, and automatic offline fallback to cached or CSV baseline prices.
+  - **Multi-Currency Fail-Safe Isolation**: when a CSV spans multiple settlement currencies (e.g., USD + HKD), FolioHelm isolates per-currency subtotals and explicitly refuses to sum cross-currency totals or compute cross-currency weights without verified FX rates.
+  - **Full-Site Arbitrary-Ticker Support**: imported non-demo holdings (e.g., `VOO`, `QQQ`, `BRK.B`, `00700.HK`) work seamlessly across Home, Search (`Ctrl+K`), Markets, Instrument Detail, Portfolio, Paper Trade, and Orders without ever fabricating mock price charts, stats, or market news.
+- **Target Allocation & Read-Only Rebalance Calculator (Pure Decimal)**:
+  - Multi-holding allocation donut plus an encrypted-persisted target-weight planner strictly validating that holdings + cash sum to exactly **100%**.
+  - Supports both **Full Rebalance** and **Cash-Only Buy** (zero-sell) modes using pure exact `Decimal` math, with single-row one-click prefill into the 4-step paper trade ticket (**batch auto-execution is permanently disabled**).
+- **Hardened Optional Delayed Public Quotes (Off by Default)**:
+  - Disabled by default for local-first operation. When explicitly enabled in **Settings**, the Rust backend fetches unauthenticated, delayed read-only quotes exclusively from HTTPS-allowlisted hosts (`stooq.com` and `query1.finance.yahoo.com`) with `url.port().is_none()`, redirects disabled, **zero `f64`** (`i128` fixed-point parsing), a 512 KiB streamed HTTP body cap, bounded 4-way concurrency with a 20s batch timeout, encrypted cache persistence, and automatic offline fallback to cached or CSV baseline prices.
   - Every public quote view is clearly marked **"Delayed read-only public quotes · Not for live order execution"**.
 - **Native Desktop File Dialogs & Strict CSP**:
   - Uses controlled Rust `tauri-plugin-dialog` commands for opening brokerage CSVs and saving evidence bundles or safety diagnostics (gracefully falling back to browser file inputs and deferred-revoke Blob downloads in browser previews).
@@ -57,7 +63,7 @@ Screenshots from the local workbench (16:9; demo figures shown are fictional):
 
 ## Tech Stack
 
-- **Desktop & Security Core**: Tauri 2 (`2.11.x`), Rust (`rusqlite` bundled, `aes-gcm`, `ed25519-dalek`, `zeroize`, `keyring`, `reqwest` `rustls-tls`, `tauri-plugin-dialog`)
+- **Desktop & Security Core**: Tauri 2 (`2.11.x`), Rust (`rusqlite` bundled, `aes-gcm`, `argon2`, `ed25519-dalek`, `subtle`, `zeroize`, `keyring`, `reqwest` `rustls-tls`, `tauri-plugin-dialog`)
 - **Frontend**: React 19, TypeScript, Vite, Vitest, React Testing Library
 
 ## Security Boundaries
