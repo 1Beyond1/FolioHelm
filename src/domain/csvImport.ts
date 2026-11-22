@@ -11,6 +11,7 @@ import {
 } from "./decimal";
 import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "./accounts";
 import { appendEvidence } from "./evidenceJournal";
+import { MOCK_BROKER } from "./mockBroker";
 import {
   decimalToMicros,
   MICROS_PER_UNIT,
@@ -19,6 +20,7 @@ import {
   todayUtcIsoDate,
   type NavSnapshotRecord,
 } from "./nav";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import { readStored, removeStored, writeStored } from "../platform/storage";
 import {
   invokeCsvCommitImport,
@@ -1517,9 +1519,21 @@ export async function recordNavSnapshotsForPortfolio(
   source: "csv-import" | "portfolio-load",
   dateIso = todayUtcIsoDate(),
 ): Promise<void> {
+  const epoch = getCurrentLockEpoch();
   const records = buildNavRecordsFromImportedSnapshot(snapshot, dateIso, source);
-  if (records.length > 0) {
-    await NAV_STORE.recordSnapshots(records, true);
+  // P0-4: On cold-start / unlock / .fhvault restore (`portfolio-load`), NEVER overwrite an
+  // existing snapshot for today OR fabricate a stale future-day CSV price snapshot when the
+  // account+currency already has recorded real NAV history. Only seed an initial baseline
+  // if that (accountId, currency) bucket has zero NAV snapshots yet (e.g. legacy v1 vaults).
+  const eligible = source === "portfolio-load"
+    ? records.filter(
+        (rec) =>
+          !NAV_STORE.hasSnapshot(rec.date, rec.accountId, rec.currency)
+          && !NAV_STORE.hasAnySnapshotForAccountCurrency(rec.accountId, rec.currency),
+      )
+    : records;
+  if (eligible.length > 0 && isCurrentLockEpoch(epoch)) {
+    await NAV_STORE.recordSnapshots(eligible, true);
   }
 }
 
@@ -1541,35 +1555,54 @@ export async function commitBrokerCsv(
   accountId?: string,
   accountLabel?: string,
 ): Promise<CsvCommitResult> {
+  const epoch = getCurrentLockEpoch();
   if (isTauriRuntime()) {
     const result = await invokeCsvCommitImport(rawCsv, sourceLabel, accountId, accountLabel);
+    // P0-3 Fail-Closed: discard stale post-lock store mutations if session locked mid-flight.
+    if (!isCurrentLockEpoch(epoch)) return result;
     ACCOUNT_STORE.registerAccountSnapshot(result.snapshot);
     await NAV_STORE.hydrateFromVault().catch(() => {});
     return result;
   }
 
   const preview = await parseCsvLocally(rawCsv, sourceLabel, accountId, accountLabel);
+  if (!isCurrentLockEpoch(epoch)) {
+    return { deduplicated: false, evidenceSequence: null, snapshot: preview.snapshot };
+  }
+  const acctId = preview.snapshot.accountId ?? DEFAULT_ACCOUNT_ID;
   const fingerprints = storedFingerprints();
-  if (fingerprints.includes(preview.snapshot.fingerprint)) {
-    const existing = ACCOUNT_STORE.getSnapshotForAccount(preview.snapshot.accountId ?? DEFAULT_ACCOUNT_ID)
-      ?? readStored<ImportedPortfolioSnapshot | null>(LOCAL_PORTFOLIO_KEY, null);
-    const snap = existing ?? preview.snapshot;
-    ACCOUNT_STORE.registerAccountSnapshot(snap);
-    await recordNavSnapshotsForPortfolio(snap, "csv-import");
+  const currentAccountSnap = ACCOUNT_STORE.getSnapshotForAccount(acctId);
+
+  // P1-8: Deduplicate ONLY when the re-imported file matches the currently active snapshot
+  // for this account. Re-importing a previously seen historical state (`S1 -> S2 -> S1`)
+  // promotes `S1` back to active with a refreshed `importedAtUtc` instead of returning `S2`.
+  if (currentAccountSnap && currentAccountSnap.fingerprint === preview.snapshot.fingerprint) {
+    const refreshed: ImportedPortfolioSnapshot = {
+      ...currentAccountSnap,
+      importedAtUtc: preview.snapshot.importedAtUtc,
+    };
+    writeStored(LOCAL_PORTFOLIO_KEY, refreshed);
+    ACCOUNT_STORE.registerAccountSnapshot(refreshed);
+    await recordNavSnapshotsForPortfolio(refreshed, "csv-import");
     return {
       deduplicated: true,
       evidenceSequence: null,
-      snapshot: snap,
+      snapshot: refreshed,
     };
   }
 
   writeStored(LOCAL_PORTFOLIO_KEY, preview.snapshot);
-  writeStored(LOCAL_FINGERPRINTS_KEY, [...fingerprints, preview.snapshot.fingerprint]);
+  if (!fingerprints.includes(preview.snapshot.fingerprint)) {
+    writeStored(LOCAL_FINGERPRINTS_KEY, [...fingerprints, preview.snapshot.fingerprint]);
+  }
   ACCOUNT_STORE.registerAccountSnapshot(preview.snapshot);
   await recordNavSnapshotsForPortfolio(preview.snapshot, "csv-import");
+  if (!isCurrentLockEpoch(epoch)) {
+    return { deduplicated: false, evidenceSequence: null, snapshot: preview.snapshot };
+  }
   const evidence = await appendEvidence("portfolio_import", {
     mode: "local-csv",
-    accountId: preview.snapshot.accountId ?? DEFAULT_ACCOUNT_ID,
+    accountId: acctId,
     sourceFormat: preview.snapshot.sourceFormat,
     holdingsCount: String(preview.snapshot.holdings.length),
     transactionsCount: String(preview.snapshot.transactions.length),
@@ -1611,6 +1644,7 @@ export async function loadPersistedAccountPortfolios(): Promise<ImportedPortfoli
 
 export async function clearPersistedLocalPortfolio(): Promise<boolean> {
   const tauriOk = isTauriRuntime() ? await invokeVaultClearPortfolio() : true;
+  MOCK_BROKER.clearLocalPortfolio();
   ACCOUNT_STORE.clearAll();
   NAV_STORE.clearAll();
   const localOk = removeStored(LOCAL_PORTFOLIO_KEY)

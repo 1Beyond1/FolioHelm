@@ -2,13 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import type { Language } from "../../types";
 import { decimalCompare, decimalMultiply, decimalToNumber, money, price, quantity as makeQuantity, type Money, type Percent, type Price, type Quantity } from "../../domain/decimal";
-import { findMockHolding, findMockQuote, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
-import { ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID } from "../../domain/accounts";
+import { findHoldingInSnapshot, findQuoteInSnapshot, MOCK_BROKER, MockBrokerError, mockDraftHash } from "../../domain/mockBroker";
+import { ACCOUNT_STORE, ALL_ACCOUNTS_ID, DEFAULT_ACCOUNT_ID } from "../../domain/accounts";
 import { buildNavSnapshotsFromBrokerSnapshot, NAV_STORE, todayUtcIsoDate } from "../../domain/nav";
 import { appendEvidence } from "../../domain/evidenceJournal";
 import { persistPaperOrder } from "../../domain/vaultStorage";
 import { formatCurrency } from "../../formatters";
-import type { BrokerOrder, BrokerOrderStatus, BrokerSymbol, DataStatus, MockPreview, OrderDraft, QuoteSourceKind, TradePrefill } from "../../domain/contracts";
+import type { BrokerOrder, BrokerOrderStatus, BrokerSnapshot, BrokerSymbol, DataStatus, MockPreview, OrderDraft, QuoteSourceKind, TradePrefill } from "../../domain/contracts";
 import "./TradePage.css";
 
 export type TradeSymbol = BrokerSymbol;
@@ -46,11 +46,19 @@ interface DemoReceipt {
   estimatedAmount: Money;
   status: BrokerOrderStatus;
   currency: string;
+  accountId?: string;
+  accountLabel?: string;
 }
 
-function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
-  const canonicalQuote = findMockQuote(symbol);
-  const canonicalHolding = findMockHolding(symbol);
+function getTradeQuote(
+  snapshot: BrokerSnapshot,
+  symbol: TradeSymbol,
+  language: Language,
+  preferredCurrency?: string,
+): Quote {
+  const canonicalQuote = findQuoteInSnapshot(snapshot, symbol, preferredCurrency);
+  const resolvedCurrency = canonicalQuote?.currency ?? preferredCurrency;
+  const canonicalHolding = findHoldingInSnapshot(snapshot, symbol, resolvedCurrency);
   return {
     company: language === "zh" ? canonicalQuote?.companyZh ?? symbol : canonicalQuote?.companyEn ?? symbol,
     price: canonicalQuote?.price ?? price("0"),
@@ -58,7 +66,7 @@ function getTradeQuote(symbol: TradeSymbol, language: Language): Quote {
     heldShares: canonicalHolding?.availableQuantity ?? makeQuantity("0"),
     asOf: canonicalQuote?.asOf ?? "",
     status: canonicalQuote?.status ?? "no-data",
-    currency: canonicalQuote?.currency ?? canonicalHolding?.currency ?? "USD",
+    currency: (canonicalQuote?.currency ?? canonicalHolding?.currency ?? preferredCurrency ?? "USD").toUpperCase(),
     source: canonicalQuote?.source,
     provider: canonicalQuote?.provider,
   };
@@ -277,15 +285,79 @@ const ZERO_PRICE = price("0");
 export function TradePage({ language, initialSymbol, initialPrefill, onClose, onViewOrders }: TradePageProps) {
   const copy = COPY[language];
   const chinese = language === "zh";
-  const [, setBrokerRevision] = useState(0);
+  const [brokerRevision, setBrokerRevision] = useState(0);
 
   useEffect(() => {
-    return MOCK_BROKER.subscribe(() => setBrokerRevision((current) => current + 1));
+    const bump = () => setBrokerRevision((current) => current + 1);
+    const unsubBroker = MOCK_BROKER.subscribe(bump);
+    const unsubAccounts = ACCOUNT_STORE.subscribe(bump);
+    return () => {
+      unsubBroker();
+      unsubAccounts();
+    };
   }, []);
 
   const workspaceMode = MOCK_BROKER.getWorkspaceMode();
   const isLocalMode = workspaceMode === "local-csv";
-  const demoSnapshot = MOCK_BROKER.getSnapshot();
+  const concreteAccounts = useMemo(() => {
+    const byId = new Map<string, { id: string; name: string; baseCurrency: string }>();
+    for (const acct of ACCOUNT_STORE.getAccounts()) {
+      if (acct.id !== ALL_ACCOUNTS_ID) {
+        byId.set(acct.id, { id: acct.id, name: acct.name, baseCurrency: acct.baseCurrency });
+      }
+    }
+    for (const id of MOCK_BROKER.getLocalAccountIds()) {
+      if (id !== ALL_ACCOUNTS_ID && !byId.has(id)) {
+        byId.set(id, { id, name: id === DEFAULT_ACCOUNT_ID ? "Default Account" : id, baseCurrency: "USD" });
+      }
+    }
+    if (byId.size === 0) {
+      byId.set(DEFAULT_ACCOUNT_ID, { id: DEFAULT_ACCOUNT_ID, name: "Default Account", baseCurrency: "USD" });
+    }
+    return [...byId.values()];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brokerRevision]);
+
+  const requestedSymbol = initialPrefill?.symbol ?? initialSymbol;
+  const requestedCurrency = initialPrefill?.currency?.trim().toUpperCase() || undefined;
+
+  // P0-1 & P0-2: Paper trading MUST bind to one concrete target account (NEVER `"ALL"`).
+  const [targetAccountId, setTargetAccountId] = useState<string>(() => {
+    if (!isLocalMode) return DEFAULT_ACCOUNT_ID;
+    const prefillAcct = initialPrefill?.accountId?.trim();
+    if (prefillAcct && prefillAcct !== ALL_ACCOUNTS_ID) return prefillAcct;
+    const selectedAcct = MOCK_BROKER.getSelectedAccountId();
+    if (selectedAcct && selectedAcct !== ALL_ACCOUNTS_ID) return selectedAcct;
+    const reqSym = requestedSymbol?.trim().toUpperCase();
+    const localIds = MOCK_BROKER.getLocalAccountIds();
+    if (reqSym) {
+      for (const acctId of localIds) {
+        try {
+          const snap = MOCK_BROKER.getAccountSnapshot(acctId);
+          if (findHoldingInSnapshot(snap, reqSym, requestedCurrency) || findQuoteInSnapshot(snap, reqSym, requestedCurrency)) {
+            return acctId;
+          }
+        } catch {
+          // Ignore single-account lookup failures during initialization.
+        }
+      }
+    }
+    return localIds[0] ?? concreteAccounts[0]?.id ?? DEFAULT_ACCOUNT_ID;
+  });
+
+  const resolvedTargetAccountId = concreteAccounts.some((a) => a.id === targetAccountId)
+    ? targetAccountId
+    : (concreteAccounts[0]?.id ?? DEFAULT_ACCOUNT_ID);
+  const targetAccountProfile = concreteAccounts.find((a) => a.id === resolvedTargetAccountId) ?? {
+    id: resolvedTargetAccountId,
+    name: resolvedTargetAccountId === DEFAULT_ACCOUNT_ID ? "Default Account" : resolvedTargetAccountId,
+    baseCurrency: "USD",
+  };
+
+  // In Local Portfolio mode, read strictly the concrete target account's isolated snapshot!
+  const demoSnapshot: BrokerSnapshot = isLocalMode
+    ? MOCK_BROKER.getAccountSnapshot(resolvedTargetAccountId)
+    : MOCK_BROKER.getSnapshot();
   const availableSymbols = useMemo<readonly TradeSymbol[]>(() => {
     const set = new Set<string>();
     for (const h of demoSnapshot.holdings) set.add(h.symbol);
@@ -293,21 +365,21 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
     return [...set];
   }, [demoSnapshot.holdings, demoSnapshot.quotes]);
 
-  const requestedSymbol = initialPrefill?.symbol ?? initialSymbol;
   const initialTradeSymbol = normalizeTradeSymbol(requestedSymbol, availableSymbols);
   const hasUnsupportedInitialSymbol = requestedSymbol !== undefined && initialTradeSymbol === undefined;
   const unsupportedSymbol = requestedSymbol?.trim().toUpperCase() || "—";
 
   const demoAccount = isLocalMode
     ? chinese
-      ? `本地持仓 (CSV + 纸上模拟) · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
-      : `Local Portfolio (CSV + Paper) · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
+      ? `${targetAccountProfile.name} (纸上模拟 · ${resolvedTargetAccountId})`
+      : `${targetAccountProfile.name} (Paper · ${resolvedTargetAccountId})`
     : chinese
       ? `演示券商 · •••• ${demoSnapshot.account.accountKey.slice(-4)}`
       : `Demo brokerage · •••• ${demoSnapshot.account.accountKey.slice(-4)}`;
 
   const [step, setStep] = useState<TradeStep>("ticket");
   const [symbol, setSymbol] = useState<TradeSymbol>(() => initialTradeSymbol ?? availableSymbols[0] ?? "AAPL");
+  const [preferredCurrency, setPreferredCurrency] = useState<string | undefined>(() => requestedCurrency);
   const [side, setSide] = useState<TradeSide>(() => (initialPrefill?.side === "sell" ? "Sell" : "Buy"));
   const [orderType, setOrderType] = useState<OrderType>(() => (initialPrefill?.orderType === "limit" ? "Limit" : "Market"));
   const [quantity, setQuantity] = useState(() => initialPrefill?.quantity ?? "");
@@ -318,7 +390,22 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
   const [receipt, setReceipt] = useState<DemoReceipt | null>(null);
   const [flowError, setFlowError] = useState<string | null>(null);
 
-  const currentQuote = getTradeQuote(symbol, language);
+  const symbolCurrencies = useMemo(() => {
+    const set = new Set<string>();
+    for (const q of demoSnapshot.quotes) {
+      if (q.symbol === symbol) set.add((q.currency ?? "USD").toUpperCase());
+    }
+    for (const h of demoSnapshot.holdings) {
+      if (h.symbol === symbol) set.add((h.currency ?? "USD").toUpperCase());
+    }
+    return [...set];
+  }, [demoSnapshot.holdings, demoSnapshot.quotes, symbol]);
+
+  const effectivePreferredCurrency = preferredCurrency && symbolCurrencies.includes(preferredCurrency)
+    ? preferredCurrency
+    : symbolCurrencies[0];
+
+  const currentQuote = getTradeQuote(demoSnapshot, symbol, language, effectivePreferredCurrency);
   const quoteCurrency = currentQuote.currency;
   const demoBuyingPower: Money = demoSnapshot.account.isMultiCurrency && demoSnapshot.account.currencyBreakdowns
     ? (demoSnapshot.account.currencyBreakdowns.find((b) => b.currency === quoteCurrency)?.buyingPower ?? money("0"))
@@ -345,12 +432,15 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
       type: orderType === "Market" ? "market" : "limit",
       quantity: makeQuantity(quantity.trim()),
       limitPrice: orderType === "Limit" ? price(limitPrice.trim()) : null,
+      currency: quoteCurrency,
+      ...(isLocalMode ? { accountId: resolvedTargetAccountId } : {}),
     };
-  }, [limitPrice, orderType, quantity, side, symbol]);
+  }, [isLocalMode, limitPrice, orderType, quantity, quoteCurrency, resolvedTargetAccountId, side, symbol]);
   const stepNames = [copy.ticket, copy.safety, copy.preview, copy.receipt];
   const stepOrder: readonly TradeStep[] = ["ticket", "safety", "preview", "receipt"];
   const activeStepIndex = stepOrder.indexOf(step);
-  const accountReady = demoSnapshot.account.status === "available";
+  const accountReady = demoSnapshot.account.status === "available"
+    && (!isLocalMode || resolvedTargetAccountId !== ALL_ACCOUNTS_ID);
   const quoteReady = currentQuote.status === "available";
   const requestedAmount = draft === null
     ? null
@@ -376,7 +466,7 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
       title: copy.accountMatch,
       detail: accountReady
         ? isLocalMode
-          ? (chinese ? "已匹配 · 本地持仓组合" : "Matched · local CSV portfolio")
+          ? (chinese ? `已绑定 · ${targetAccountProfile.name} (${resolvedTargetAccountId})` : `Bound · ${targetAccountProfile.name} (${resolvedTargetAccountId})`)
           : copy.matchedDemo
         : copy.accountUnavailable,
       suffix: badgeText,
@@ -493,12 +583,12 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
 
       void persistPaperOrder(workspaceMode, simulatedOrder);
       if (isLocalMode) {
-        const activeAcctId = simulatedOrder.accountId
-          ?? (MOCK_BROKER.getSelectedAccountId() === ALL_ACCOUNTS_ID
-            ? DEFAULT_ACCOUNT_ID
-            : MOCK_BROKER.getSelectedAccountId());
+        // P0-1: Always build post-trade NAV strictly from the executed SINGLE concrete account's
+        // isolated snapshot — NEVER from the aggregated `"ALL"` snapshot!
+        const activeAcctId = simulatedOrder.accountId ?? resolvedTargetAccountId;
+        const singleAccountSnapshot = MOCK_BROKER.getAccountSnapshot(activeAcctId);
         const navRecords = buildNavSnapshotsFromBrokerSnapshot(
-          MOCK_BROKER.getSnapshot(),
+          singleAccountSnapshot,
           activeAcctId,
           todayUtcIsoDate(),
           "paper-trade",
@@ -512,7 +602,8 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
         draftHash: currentDraftHash,
         estimatedAmount: preview.estimatedAmount,
         status: simulatedOrder.status,
-        currency: quoteCurrency,
+        currency: simulatedOrder.currency ?? quoteCurrency,
+        ...(isLocalMode ? { accountId: simulatedOrder.accountId ?? resolvedTargetAccountId, accountLabel: targetAccountProfile.name } : {}),
       });
       setStep("receipt");
       void appendEvidence("user_confirmation", {
@@ -654,24 +745,85 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
 
           <div className="trade-ticket__layout">
             <div className="trade-fields">
+              {isLocalMode && (
+                <label className="trade-field">
+                  <span>{chinese ? "目标交易账户（单账户严格隔离）" : "Target account (isolated)"}</span>
+                  <select
+                    aria-label={chinese ? "目标交易账户" : "Target account"}
+                    data-testid="trade-account-select"
+                    value={resolvedTargetAccountId}
+                    onChange={(event) => {
+                      const nextAcctId = event.target.value;
+                      invalidateCurrentPreview();
+                      setTargetAccountId(nextAcctId);
+                      clearTicketErrors();
+                      try {
+                        const nextSnap = MOCK_BROKER.getAccountSnapshot(nextAcctId);
+                        const nextSyms = [...new Set([
+                          ...nextSnap.holdings.map((h) => h.symbol),
+                          ...nextSnap.quotes.map((q) => q.symbol),
+                        ])];
+                        if (nextSyms.length > 0 && !nextSyms.includes(symbol)) {
+                          const nextSym = nextSyms[0]!;
+                          setSymbol(nextSym);
+                          const nextQuote = findQuoteInSnapshot(nextSnap, nextSym);
+                          setPreferredCurrency(nextQuote?.currency?.toUpperCase());
+                        }
+                      } catch {
+                        // Ignore lookup failure on account switch.
+                      }
+                    }}
+                  >
+                    {concreteAccounts.map((acct) => (
+                      <option key={acct.id} value={acct.id}>
+                        {acct.name} ({acct.baseCurrency})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
               <label className="trade-field">
                 <span>{copy.symbol}</span>
                 <select
                   aria-label={copy.symbol}
                   value={symbol}
                   onChange={(event) => {
+                    const nextSymbol = event.target.value as TradeSymbol;
                     invalidateCurrentPreview();
-                    setSymbol(event.target.value as TradeSymbol);
+                    setSymbol(nextSymbol);
+                    const nextMatching = findQuoteInSnapshot(demoSnapshot, nextSymbol);
+                    setPreferredCurrency(nextMatching?.currency?.toUpperCase());
                     clearTicketErrors();
                   }}
                 >
                   {availableSymbols.map((option) => (
                     <option key={option} value={option}>
-                      {option} · {getTradeQuote(option, language).company}
+                      {option} · {getTradeQuote(demoSnapshot, option, language).company}
                     </option>
                   ))}
                 </select>
               </label>
+
+              {symbolCurrencies.length > 1 && (
+                <label className="trade-field">
+                  <span>{chinese ? "交易币种" : "Currency"}</span>
+                  <select
+                    aria-label={chinese ? "交易币种" : "Currency"}
+                    data-testid="trade-currency-select"
+                    value={quoteCurrency}
+                    onChange={(event) => {
+                      invalidateCurrentPreview();
+                      setPreferredCurrency(event.target.value.toUpperCase());
+                      clearTicketErrors();
+                    }}
+                  >
+                    {symbolCurrencies.map((curr) => (
+                      <option key={curr} value={curr}>{curr}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
 
               <fieldset className="trade-fieldset">
                 <legend>{copy.side}</legend>
@@ -795,6 +947,7 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
               <div className="trade-quote-panel__symbol">
                 <strong>{symbol}</strong>
                 <span>{currentQuote.company}</span>
+                <span className="trade-badge trade-badge--quiet" data-testid="trade-currency-badge">{quoteCurrency}</span>
               </div>
               <div className="trade-quote-panel__price">{formatMoney(currentQuote.price, language, quoteCurrency)}</div>
               <div className={`trade-quote-panel__change ${decimalCompare(currentQuote.changePct, ZERO_PRICE) < 0 ? "is-negative" : ""}`}>
@@ -899,6 +1052,8 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
           </div>
 
           <dl className="trade-preview-facts">
+             {isLocalMode && <div><dt>{copy.account}</dt><dd data-testid="trade-preview-account">{targetAccountProfile.name} ({resolvedTargetAccountId})</dd></div>}
+             <div><dt>{chinese ? "币种" : "Currency"}</dt><dd data-testid="trade-preview-currency">{quoteCurrency}</dd></div>
              <div><dt>{copy.estimatedAmount}</dt><dd>{preview ? formatMoney(preview.estimatedAmount, language, quoteCurrency) : "—"}</dd></div>
              <div><dt>{copy.validity}</dt><dd>{preview ? copy.validityValue : copy.previewFailed}</dd></div>
              <div><dt>{copy.previewId}</dt><dd>{preview?.previewId ?? "—"}</dd></div>
@@ -942,7 +1097,8 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
             <strong>{receipt.status === "unknown" ? copy.unknownReceiptStatus : copy.simulated}</strong>
           </div>
           <dl className="trade-preview-facts">
-            <div><dt>{copy.symbol}</dt><dd>{symbol}</dd></div>
+            <div><dt>{copy.symbol}</dt><dd>{symbol} ({receipt.currency})</dd></div>
+            {receipt.accountLabel && <div><dt>{copy.account}</dt><dd data-testid="trade-receipt-account">{receipt.accountLabel}</dd></div>}
              <div><dt>{copy.estimatedAmount}</dt><dd>{formatMoney(receipt.estimatedAmount, language, receipt.currency)}</dd></div>
              <div><dt>{copy.receiptId}</dt><dd>{receipt.receiptId}</dd></div>
              <div><dt>{copy.previewId}</dt><dd data-testid="trade-receipt-preview-id">{receipt.previewId}</dd></div>

@@ -81,16 +81,16 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     expect(single.points[0]?.cumulativeTwrPct).toBe("0.00");
   });
 
-  it("strips cross-day inflows and outflows cleanly via (V_end - CF) / V_start", () => {
+  it("strips cross-day inflows and outflows cleanly via GIPS BOD-inflow / EOD-outflow TWR", () => {
     // Day 1: $10,000
-    // Day 2: +10% gain -> $11,000 + $5,000 deposit => $16,000 (CF = +5,000)
-    // Day 3: -10% loss on $16,000 -> $14,400 - $4,400 withdrawal => $10,000 (CF = -4,400)
-    // Cumulative TWR = 1.10 * 0.90 - 1 = -1.00%, true P&L = -$600.00
+    // Day 2: BOD deposit +$5,000 (capital base $15,000) + 10% gain => $16,500 (CF = +5,000, P&L = +$1,500)
+    // Day 3: -10% loss on $16,500 -> $14,850, EOD withdrawal -$4,850 => $10,000 (CF = -4,850, P&L = -$1,650)
+    // Cumulative TWR = 1.10 * 0.90 - 1 = -1.00%, true P&L = -$150.00 (100% isomorphic to Rust nav/mod.rs!)
     const series = computeTwrSeries(
       [
         makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 10_000, 0),
-        makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 16_000, 5_000),
-        makeSnap("2026-11-20", DEFAULT_ACCOUNT_ID, "USD", 10_000, -4_400),
+        makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 16_500, 5_000),
+        makeSnap("2026-11-20", DEFAULT_ACCOUNT_ID, "USD", 10_000, -4_850),
       ],
       "USD",
       DEFAULT_ACCOUNT_ID,
@@ -99,10 +99,10 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     expect(series.points[1]?.dailyReturnPct).toBe("10.00");
     expect(series.points[2]?.dailyReturnPct).toBe("-10.00");
     expect(series.cumulativeTwrPct).toBe("-1.00");
-    expect(series.periodPnlMicros).toBe((-600n * MICROS_PER_UNIT).toString());
+    expect(series.periodPnlMicros).toBe((-150n * MICROS_PER_UNIT).toString());
   });
 
-  it("guards against zero V_start, negative adjusted end, MULTI currency, and i128 overflow", () => {
+  it("guards against zero V_start, P0-6 large inflow drawdown without -100% lockup, wipeout, MULTI currency, and i128 overflow", () => {
     const zeroStart = computeTwrSeries(
       [
         makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 0, 0),
@@ -116,16 +116,34 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     expect(zeroStart.points[2]?.dailyReturnPct).toBe("10.00");
     expect(zeroStart.cumulativeTwrPct).toBe("10.00");
 
-    const negativeAdjusted = computeTwrSeries(
+    // P0-6 cross-end golden vector (exact match with Rust `nav::tests`):
+    // Day 1: $100 -> Day 2: +$10,000 inflow & -2% dip ($9,898) -> Day 3: +50% ($14,847)
+    const largeInflowDip = computeTwrSeries(
       [
-        makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 1_000, 0),
-        makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 100, 500),
+        makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 100, 0),
+        makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 9_898, 10_000),
+        makeSnap("2026-11-20", DEFAULT_ACCOUNT_ID, "USD", 14_847, 0),
       ],
       "USD",
       DEFAULT_ACCOUNT_ID,
     );
-    expect(negativeAdjusted.points[1]?.dailyReturnPct).toBe("-100.00");
-    expect(negativeAdjusted.cumulativeTwrPct).toBe("-100.00");
+    expect(largeInflowDip.points[1]?.dailyReturnPct).toBe("-2.00");
+    expect(largeInflowDip.points[1]?.cumulativeTwrPct).toBe("-2.00");
+    expect(largeInflowDip.points[2]?.dailyReturnPct).toBe("50.00");
+    expect(largeInflowDip.cumulativeTwrPct).toBe("47.00");
+    expect(largeInflowDip.cumulativeFactor).toBe("1470000000");
+    expect(largeInflowDip.periodPnlMicros).toBe((4_747n * MICROS_PER_UNIT).toString());
+
+    const wiped = computeTwrSeries(
+      [
+        makeSnap("2026-11-18", DEFAULT_ACCOUNT_ID, "USD", 1_000, 0),
+        makeSnap("2026-11-19", DEFAULT_ACCOUNT_ID, "USD", 0, 0),
+      ],
+      "USD",
+      DEFAULT_ACCOUNT_ID,
+    );
+    expect(wiped.points[1]?.dailyReturnPct).toBe("-100.00");
+    expect(wiped.cumulativeTwrPct).toBe("-100.00");
 
     // Extreme i128 overflow throws cleanly instead of silently wrapping or turning into Infinity/NaN
     const maxI128 = ((1n << 127n) - 1n).toString();
@@ -152,8 +170,8 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     const snaps: NavSnapshotRecord[] = [
       makeSnap("2026-11-18", "acct_schwab_taxable", "USD", 10_000, 0),
       makeSnap("2026-11-19", "acct_schwab_taxable", "USD", 11_000, 0),
-      // Second USD account onboarded on Day 2 with $20,000 (must NOT create fake +210% spike)
-      makeSnap("2026-11-19", "acct_schwab_ira", "USD", 20_000, 0),
+      // Second USD account onboarded on Day 2 with $20,000 AND same-day internal CF=$1,000 (P1-1: full $20k must count as onboarding CF!)
+      makeSnap("2026-11-19", "acct_schwab_ira", "USD", 20_000, 1_000),
       // HKD account must be strictly excluded from USD bucket
       makeSnap("2026-11-19", "acct_futu_hk", "HKD", 50_000, 0),
     ];
@@ -164,7 +182,8 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     expect(aggUsd[1]?.externalCashFlowMicros).toBe(decimalToMicros("20000").toString());
 
     const twr = computeTwrSeries(aggUsd, "USD", ALL_ACCOUNTS_ID);
-    expect(twr.cumulativeTwrPct).toBe("10.00");
+    expect(twr.periodPnlMicros).toBe(decimalToMicros("1000").toString());
+    expect(twr.cumulativeTwrPct).toBe("3.33");
 
     // Allowlist check
     expect(isAllowlistedBenchmark("SPY")).toBe(true);
@@ -196,7 +215,7 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     const day1 = heatmap.entries.find((e) => e.date === "2026-11-18");
     const emptyDay = heatmap.entries.find((e) => e.date === "2026-01-05");
     expect(day2?.status).toBe("available");
-    expect(day2?.dailyReturnPct).toBe("10");
+    expect(day2?.dailyReturnPct).toBe("3.33");
     expect(day1?.status).toBe("no-data"); // baseline day 0 has no fabricated prior-day return
     expect(emptyDay?.status).toBe("no-data");
   });

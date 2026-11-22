@@ -199,13 +199,16 @@ function matchQuote(
   symbol: string,
   currency?: string,
 ): BrokerQuote | undefined {
-  if (currency) {
-    const exact = quotes.find(
-      (item) => item.symbol === symbol && (item.currency ?? "USD") === currency,
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const normalizedCurrency = currency?.trim().toUpperCase();
+  if (normalizedCurrency && normalizedCurrency !== "MULTI") {
+    return quotes.find(
+      (item) =>
+        item.symbol.toUpperCase() === normalizedSymbol
+        && (item.currency ?? "USD").toUpperCase() === normalizedCurrency,
     );
-    if (exact) return exact;
   }
-  return quotes.find((item) => item.symbol === symbol);
+  return quotes.find((item) => item.symbol.toUpperCase() === normalizedSymbol);
 }
 
 function matchHolding(
@@ -213,13 +216,16 @@ function matchHolding(
   symbol: string,
   currency?: string,
 ): BrokerHolding | undefined {
-  if (currency) {
-    const exact = holdings.find(
-      (item) => item.symbol === symbol && (item.currency ?? "USD") === currency,
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const normalizedCurrency = currency?.trim().toUpperCase();
+  if (normalizedCurrency && normalizedCurrency !== "MULTI") {
+    return holdings.find(
+      (item) =>
+        item.symbol.toUpperCase() === normalizedSymbol
+        && (item.currency ?? "USD").toUpperCase() === normalizedCurrency,
     );
-    if (exact) return exact;
   }
-  return holdings.find((item) => item.symbol === symbol);
+  return holdings.find((item) => item.symbol.toUpperCase() === normalizedSymbol);
 }
 
 function deriveHoldings(
@@ -477,7 +483,9 @@ const BASE_SNAPSHOT: BrokerSnapshot = {
 
 function stableDraftHash(draft: OrderDraft): string {
   const base = [draft.symbol, draft.side, draft.type, draft.quantity, draft.limitPrice ?? "market"];
-  return draft.currency ? [...base, draft.currency].join(":") : base.join(":");
+  if (draft.currency) base.push(draft.currency.trim().toUpperCase());
+  if (draft.accountId) base.push(`acct=${draft.accountId.trim()}`);
+  return base.join(":");
 }
 
 function nowValue(clock: () => number = () => Date.now()): { timestamp: number; iso: string } {
@@ -958,6 +966,7 @@ export class MockBroker implements BrokerAdapter {
   private publicQuoteLastUpdatedUtc: string | null = null;
   private readonly previews = new Map<string, MockPreview>();
   private readonly previewIssuedAt = new Map<string, number>();
+  private readonly previewTargetAccounts = new Map<string, string>();
   private readonly listeners = new Set<() => void>();
   private sequence = 0;
   private scenario: MockScenario = "healthy";
@@ -1065,12 +1074,17 @@ export class MockBroker implements BrokerAdapter {
     this.notify();
   }
 
+  private clearPreviews(): void {
+    this.previews.clear();
+    this.previewIssuedAt.clear();
+    this.previewTargetAccounts.clear();
+  }
+
   setWorkspaceMode(mode: WorkspaceMode): void {
     if (mode === "local-csv" && !this.localSnapshot) return;
     if (this.workspaceMode === mode) return;
     this.workspaceMode = mode;
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.notify();
   }
 
@@ -1082,6 +1096,75 @@ export class MockBroker implements BrokerAdapter {
     return [...this.localAccountSnapshots.keys()].sort();
   }
 
+  /**
+   * Returns an isolated single-account `BrokerSnapshot` (strictly rejecting `"ALL"`).
+   * Used by paper-trading validation, execution, NAV snapshots, and quote refreshes so
+   * aggregated multi-account snapshots are NEVER treated as a single account.
+   */
+  getAccountSnapshot(accountId: string): BrokerSnapshot {
+    if (this.workspaceMode !== "local-csv") {
+      return this.getSnapshot();
+    }
+    const trimmed = accountId.trim();
+    if (!trimmed || trimmed.toUpperCase() === ALL_ACCOUNTS_ID) {
+      throw new MockBrokerError(
+        "invalid-order",
+        "A concrete target account ID is required for single-account operations",
+      );
+    }
+    const exact = this.localAccountSnapshots.get(trimmed);
+    const imported: ImportedPortfolioSnapshot = exact ?? {
+      id: `empty-${trimmed}`,
+      accountId: trimmed,
+      fingerprint: `empty-${trimmed}`,
+      sourceFormat: "empty_account",
+      sourceLabel: "No CSV imported yet",
+      importedAtUtc: new Date().toISOString(),
+      accountLabel: trimmed,
+      currency: "USD",
+      cash: "0.00",
+      cashByCurrency: { USD: "0.00" },
+      currencies: ["USD"],
+      isMultiCurrency: false,
+      holdings: [],
+      transactions: [],
+      warnings: [],
+    };
+    const scopedOrders = this.allLocalOrders.filter(
+      (order) => (order.accountId ?? DEFAULT_ACCOUNT_ID) === trimmed,
+    );
+    return cloneSnapshot(
+      buildLocalSnapshotFromCsv(
+        imported,
+        scopedOrders,
+        this.publicQuotesEnabled && this.publicQuotes.size > 0 ? this.publicQuotes : undefined,
+      ),
+    );
+  }
+
+  private resolveOrderTargetAccountId(draftAccountId?: string): string {
+    if (draftAccountId !== undefined) {
+      const trimmed = draftAccountId.trim();
+      if (!trimmed || trimmed.toUpperCase() === ALL_ACCOUNTS_ID) {
+        throw new MockBrokerError(
+          "invalid-order",
+          "A concrete target account must be selected for paper trading",
+        );
+      }
+      return trimmed;
+    }
+    if (this.selectedAccountId !== ALL_ACCOUNTS_ID) {
+      return this.selectedAccountId;
+    }
+    if (this.localAccountSnapshots.size === 1) {
+      return [...this.localAccountSnapshots.keys()][0]!;
+    }
+    throw new MockBrokerError(
+      "invalid-order",
+      "Select a specific target account before placing a paper order across multiple accounts",
+    );
+  }
+
   setSelectedAccountId(accountId: string): void {
     const normalized = accountId.trim() || ALL_ACCOUNTS_ID;
     if (this.selectedAccountId === normalized) return;
@@ -1089,8 +1172,32 @@ export class MockBroker implements BrokerAdapter {
     if (this.localAccountSnapshots.size > 0) {
       this.rebuildActiveLocalSnapshot();
     }
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
+    this.notify();
+  }
+
+  removeLocalAccount(accountId: string): void {
+    const trimmed = accountId.trim();
+    if (!trimmed || trimmed === DEFAULT_ACCOUNT_ID || trimmed.toUpperCase() === ALL_ACCOUNTS_ID) {
+      return;
+    }
+    const removedSnap = this.localAccountSnapshots.delete(trimmed);
+    const prevOrderCount = this.allLocalOrders.length;
+    this.allLocalOrders = this.allLocalOrders.filter(
+      (order) => (order.accountId ?? DEFAULT_ACCOUNT_ID) !== trimmed,
+    );
+    const removedOrders = this.allLocalOrders.length !== prevOrderCount;
+    if (this.selectedAccountId === trimmed) {
+      this.selectedAccountId = ALL_ACCOUNTS_ID;
+    }
+    if (!removedSnap && !removedOrders) {
+      return;
+    }
+    this.rebuildActiveLocalSnapshot();
+    if (!this.localSnapshot) {
+      this.workspaceMode = "mock";
+    }
+    this.clearPreviews();
     this.notify();
   }
 
@@ -1186,8 +1293,7 @@ export class MockBroker implements BrokerAdapter {
     } else if (!this.localSnapshot) {
       this.workspaceMode = "mock";
     }
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.notify();
   }
 
@@ -1207,8 +1313,7 @@ export class MockBroker implements BrokerAdapter {
     if (options.switchMode !== false) {
       this.workspaceMode = "local-csv";
     }
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.notify();
   }
 
@@ -1293,8 +1398,7 @@ export class MockBroker implements BrokerAdapter {
     this.publicQuotes.clear();
     this.publicQuoteProvider = null;
     this.publicQuoteLastUpdatedUtc = null;
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.sequence = 0;
     this.notify();
   }
@@ -1307,8 +1411,7 @@ export class MockBroker implements BrokerAdapter {
     this.localSnapshot = null;
     this.localMeta = null;
     this.workspaceMode = "mock";
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.notify();
   }
 
@@ -1384,8 +1487,7 @@ export class MockBroker implements BrokerAdapter {
     this.publicQuotes.clear();
     this.publicQuoteProvider = null;
     this.publicQuoteLastUpdatedUtc = null;
-    this.previews.clear();
-    this.previewIssuedAt.clear();
+    this.clearPreviews();
     this.sequence = 0;
     this.scenario = "healthy";
     for (const hook of brokerResetHooks) {
@@ -1412,7 +1514,13 @@ export class MockBroker implements BrokerAdapter {
       throw new MockBrokerError("invalid-order", "Mock order input is invalid; preview was blocked");
     }
 
-    const snapshot = this.getSnapshot();
+    const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
+    const targetAccountId = isLocalMode
+      ? this.resolveOrderTargetAccountId(draft.accountId)
+      : undefined;
+    const snapshot = isLocalMode && targetAccountId
+      ? this.getAccountSnapshot(targetAccountId)
+      : this.getSnapshot();
     const matchedQuote = matchQuote(snapshot.quotes, draft.symbol, draft.currency);
     if (!matchedQuote) throw new Error(`No mock quote for ${draft.symbol}`);
     if (matchedQuote.status !== "available") {
@@ -1420,7 +1528,7 @@ export class MockBroker implements BrokerAdapter {
     }
 
     const unitPrice = draft.limitPrice ?? matchedQuote.price;
-    const quoteCurrency = matchedQuote.currency ?? draft.currency ?? "USD";
+    const quoteCurrency = (matchedQuote.currency ?? draft.currency ?? "USD").toUpperCase();
     const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(decimalMultiply(unitPrice, draft.quantity), 2, "half-even") as Money;
     if (draft.side === "buy" && decimalCompare(estimatedAmount, availableBuyingPower) > 0) {
@@ -1445,6 +1553,7 @@ export class MockBroker implements BrokerAdapter {
       previewId,
       draftHash,
       draft: { ...draft },
+      ...(targetAccountId ? { accountId: targetAccountId } : {}),
       quote: matchedQuote,
       estimatedAmount,
       createdAt,
@@ -1453,6 +1562,9 @@ export class MockBroker implements BrokerAdapter {
     };
     this.previews.set(previewId, preview);
     this.previewIssuedAt.set(previewId, created.timestamp);
+    if (targetAccountId) {
+      this.previewTargetAccounts.set(previewId, targetAccountId);
+    }
     return clonePreview(preview);
   }
 
@@ -1466,11 +1578,20 @@ export class MockBroker implements BrokerAdapter {
     if (issuedAt !== undefined && this.clock() - issuedAt >= PREVIEW_EXPIRY_MS) {
       preview.status = "invalidated";
       this.previewIssuedAt.delete(previewId);
+      this.previewTargetAccounts.delete(previewId);
       throw new MockBrokerError("preview-expired", "Mock preview expired; create a new preview before continuing");
     }
     if (preview.draftHash !== draftHash) throw new Error("Mock preview does not match the current draft");
 
-    const snapshot = this.getSnapshot();
+    const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
+    const orderAccountId = isLocalMode
+      ? (this.previewTargetAccounts.get(previewId)
+        ?? preview.accountId
+        ?? this.resolveOrderTargetAccountId(preview.draft.accountId))
+      : undefined;
+    const snapshot = isLocalMode && orderAccountId
+      ? this.getAccountSnapshot(orderAccountId)
+      : this.getSnapshot();
     const matchedQuote = matchQuote(
       snapshot.quotes,
       preview.draft.symbol,
@@ -1479,7 +1600,7 @@ export class MockBroker implements BrokerAdapter {
     if (!matchedQuote || matchedQuote.status !== "available") {
       throw new MockBrokerError("stale-quote", "Mock quote is not fresh enough for a preview");
     }
-    const quoteCurrency = matchedQuote.currency ?? preview.draft.currency ?? "USD";
+    const quoteCurrency = (matchedQuote.currency ?? preview.draft.currency ?? "USD").toUpperCase();
     const availableBuyingPower = buyingPowerForCurrency(snapshot.account, quoteCurrency);
     const estimatedAmount = decimalRound(
       decimalMultiply(preview.draft.limitPrice ?? matchedQuote.price, preview.draft.quantity),
@@ -1500,17 +1621,14 @@ export class MockBroker implements BrokerAdapter {
     }
     preview.status = "consumed";
     this.previewIssuedAt.delete(previewId);
+    this.previewTargetAccounts.delete(previewId);
 
-    const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
     const id = isLocalMode ? `PAPER-ORDER-${++this.sequence}` : `MOCK-ORDER-${++this.sequence}`;
     const unknown = !isLocalMode && (this.scenario === "unknown" || this.scenario === "reconciliation-failed");
     const eventAt = nowIso(this.clock);
     const event = unknown
       ? orderEvent("unknown", eventAt, "Mock acknowledgement is unknown; do not resubmit", "模拟确认状态未知；不要重下")
       : orderEvent("accepted", eventAt, "Accepted by the local paper ledger; no broker request exists", "本地纸上账本已接受；不存在券商请求");
-    const orderAccountId = isLocalMode
-      ? (this.selectedAccountId === ALL_ACCOUNTS_ID ? DEFAULT_ACCOUNT_ID : this.selectedAccountId)
-      : undefined;
     const order: BrokerOrder = {
       id,
       ...(orderAccountId ? { accountId: orderAccountId } : {}),
@@ -1530,7 +1648,14 @@ export class MockBroker implements BrokerAdapter {
       ],
     };
 
-    const activeTarget = isLocalMode ? this.localSnapshot! : this.snapshot;
+    if (isLocalMode) {
+      this.allLocalOrders = [order, ...this.allLocalOrders];
+      this.rebuildActiveLocalSnapshot();
+      this.notify();
+      return cloneOrder(order);
+    }
+
+    const activeTarget = this.snapshot;
     const nextAccount: BrokerAccount = preview.draft.side === "buy"
       ? activeTarget.account.isMultiCurrency && activeTarget.account.currencyBreakdowns
         ? {
@@ -1572,27 +1697,21 @@ export class MockBroker implements BrokerAdapter {
         })
       : activeTarget.holdings;
 
-    const updatedTarget: BrokerSnapshot = {
+    this.snapshot = {
       ...activeTarget,
       account: nextAccount,
       holdings: nextHoldings,
       orders: [order, ...activeTarget.orders],
     };
-
-    if (isLocalMode) {
-      this.allLocalOrders = [order, ...this.allLocalOrders];
-      this.localSnapshot = updatedTarget;
-    } else {
-      this.snapshot = updatedTarget;
-    }
     this.notify();
     return cloneOrder(order);
   }
 
   reconcileOrder(orderId: string): BrokerOrder {
     const isLocalMode = this.workspaceMode === "local-csv" && this.localSnapshot !== null;
-    const target = isLocalMode ? this.localSnapshot! : this.snapshot;
-    const order = target.orders.find((item) => item.id === orderId);
+    const order = isLocalMode
+      ? this.allLocalOrders.find((item) => item.id === orderId)
+      : this.snapshot.orders.find((item) => item.id === orderId);
     if (!order) throw new Error(`No mock order ${orderId}`);
     if (order.status !== "unknown") return cloneOrder(order);
     if (!isLocalMode && this.scenario === "reconciliation-failed") {
@@ -1604,15 +1723,14 @@ export class MockBroker implements BrokerAdapter {
       status: "working",
       events: [...order.events, orderEvent("accepted", nowIso(this.clock), "Reconciliation found a working mock order", "对账发现模拟订单仍在工作")],
     };
-    const nextTarget: BrokerSnapshot = {
-      ...target,
-      orders: target.orders.map((item) => item.id === orderId ? reconciled : item),
-    };
     if (isLocalMode) {
       this.allLocalOrders = this.allLocalOrders.map((item) => item.id === orderId ? reconciled : item);
-      this.localSnapshot = nextTarget;
+      this.rebuildActiveLocalSnapshot();
     } else {
-      this.snapshot = nextTarget;
+      this.snapshot = {
+        ...this.snapshot,
+        orders: this.snapshot.orders.map((item) => item.id === orderId ? reconciled : item),
+      };
     }
     this.notify();
     return cloneOrder(reconciled);
@@ -1623,11 +1741,28 @@ export class MockBroker implements BrokerAdapter {
     if (preview?.status === "preview") {
       preview.status = "invalidated";
       this.previewIssuedAt.delete(previewId);
+      this.previewTargetAccounts.delete(previewId);
     }
   }
 }
 
 export const MOCK_BROKER = new MockBroker();
+
+export function findQuoteInSnapshot(
+  snapshot: BrokerSnapshot,
+  symbol: string,
+  currency?: string,
+): BrokerQuote | undefined {
+  return matchQuote(snapshot.quotes, symbol, currency);
+}
+
+export function findHoldingInSnapshot(
+  snapshot: BrokerSnapshot,
+  symbol: string,
+  currency?: string,
+): BrokerHolding | undefined {
+  return matchHolding(snapshot.holdings, symbol, currency);
+}
 
 export function findMockQuote(symbol: string, currency?: string): BrokerQuote | undefined {
   return matchQuote(MOCK_BROKER.getSnapshot().quotes, symbol, currency);

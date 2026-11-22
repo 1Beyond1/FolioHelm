@@ -38,9 +38,12 @@ import {
   purgeAllFrontendSensitiveMemory,
   saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
+  WORKSPACE_PREFS_CHANGED_EVENT,
   WORKSPACE_PREFS_KEY,
   type VaultHydrationResult,
+  type WorkspacePreferences,
 } from "./domain/vaultStorage";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "./domain/sessionEpoch";
 import type { PublicQuoteProviderChoice } from "./domain/publicQuotes";
 import {
   invokeVaultLock,
@@ -182,39 +185,45 @@ export function App() {
 
   useEffect(() => {
     let active = true;
+    const mountEpoch = getCurrentLockEpoch();
     if (isTauriRuntime()) {
       void (async () => {
         try {
           const { status, preferences } = await hydrateWorkspaceFromVault();
           if (!active) return;
+          if (status && !status.unlocked) {
+            // Always honor a Fail-Closed locked/error-locked status from the vault backend.
+            setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+            setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+            if (status.lockState === "user-locked") {
+              purgeAllFrontendSensitiveMemory();
+              setSelectedBenchmark(null);
+              setBenchmarkNotice(null);
+              setTradePrefill(null);
+              setSearchOpen(false);
+              setUserLocked(true);
+              setLockTrigger("manual");
+              setRetryNonce((current) => current + 1);
+              setVaultErrorLocked(false);
+              setVaultLockedReason(null);
+            } else {
+              purgeAllFrontendSensitiveMemory();
+              setSelectedBenchmark(null);
+              setBenchmarkNotice(null);
+              setVaultErrorLocked(true);
+              setVaultLockedReason(status.lockedReason ?? null);
+            }
+            return;
+          }
+          // P0-3 Fail-Closed: discard stale unlocked hydration if user locked mid-flight.
+          if (!isCurrentLockEpoch(mountEpoch)) return;
           setIdleLockMinutes(preferences.idleLockMinutes);
           setQuoteProvider(preferences.quoteProvider);
           if (status) {
             setHasLockPassphrase(Boolean(status.hasLockPassphrase));
             setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
-            if (!status.unlocked) {
-              if (status.lockState === "user-locked") {
-                purgeAllFrontendSensitiveMemory();
-                setSelectedBenchmark(null);
-                setBenchmarkNotice(null);
-                setTradePrefill(null);
-                setSearchOpen(false);
-                setUserLocked(true);
-                setLockTrigger("manual");
-                setRetryNonce((current) => current + 1);
-                setVaultErrorLocked(false);
-                setVaultLockedReason(null);
-              } else {
-                purgeAllFrontendSensitiveMemory();
-                setSelectedBenchmark(null);
-                setBenchmarkNotice(null);
-                setVaultErrorLocked(true);
-                setVaultLockedReason(status.lockedReason ?? null);
-              }
-            } else {
-              setVaultErrorLocked(false);
-              setVaultLockedReason(null);
-            }
+            setVaultErrorLocked(false);
+            setVaultLockedReason(null);
           }
         } catch {
           // Keep UI responsive; settings page surfaces explicit vault diagnostics.
@@ -234,10 +243,18 @@ export function App() {
         setRetryAfterSeconds(detail.status.retryAfterSeconds ?? 0);
       }
     };
+    const onWorkspacePrefsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<WorkspacePreferences>).detail;
+      if (!detail) return;
+      setIdleLockMinutes(detail.idleLockMinutes);
+      setQuoteProvider(detail.quoteProvider);
+    };
     window.addEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
+    window.addEventListener(WORKSPACE_PREFS_CHANGED_EVENT, onWorkspacePrefsChanged);
     return () => {
       active = false;
       window.removeEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
+      window.removeEventListener(WORKSPACE_PREFS_CHANGED_EVENT, onWorkspacePrefsChanged);
     };
   }, []);
 
@@ -279,10 +296,15 @@ export function App() {
   }, [lockSession]);
 
   const unlockSession = useCallback(async (passphrase: string) => {
+    const unlockEpoch = getCurrentLockEpoch();
     setUnlocking(true);
     setLockError(null);
     if (!isTauriRuntime()) {
       await hydrateWorkspaceFromVault().catch(() => {});
+      if (!isCurrentLockEpoch(unlockEpoch)) {
+        setUnlocking(false);
+        return;
+      }
       setUserLocked(false);
       setRetryAfterSeconds(0);
       setUnlocking(false);
@@ -291,11 +313,13 @@ export function App() {
 
     try {
       const status = await invokeVaultUnlock(passphrase);
+      if (!isCurrentLockEpoch(unlockEpoch)) return;
       if (status.unlocked) {
         setHasLockPassphrase(Boolean(status.hasLockPassphrase));
         setRetryAfterSeconds(0);
         setLockError(null);
         await hydrateWorkspaceFromVault().catch(() => {});
+        if (!isCurrentLockEpoch(unlockEpoch)) return;
         setUserLocked(false);
       } else {
         setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
@@ -576,15 +600,32 @@ export function App() {
     ? selectedDashboardCurrency
     : availableCurrencies[0]!;
 
-  const localNavSnapshots = isLocalMode
-    ? aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeNavCurrency, selectedAccountId)
-    : [];
-  const localTwrSeries = isLocalMode
-    ? computeTwrSeries(localNavSnapshots, activeNavCurrency, selectedAccountId)
-    : null;
-  const localHeatmapBundle = isLocalMode && localTwrSeries
-    ? buildCalendarHeatmapFromNav(localTwrSeries, rawSnapshot.orders)
-    : null;
+  // P1-10: Fault-isolated render-time NAV / TWR / heatmap computation so corrupt micro strings
+  // or arithmetic overflow can never take down the entire application.
+  const localNavSnapshots = (() => {
+    if (!isLocalMode) return [];
+    try {
+      return aggregateNavSnapshotsByCurrency(NAV_STORE.getAllSnapshots(), activeNavCurrency, selectedAccountId);
+    } catch {
+      return [];
+    }
+  })();
+  const localTwrSeries = (() => {
+    if (!isLocalMode) return null;
+    try {
+      return computeTwrSeries(localNavSnapshots, activeNavCurrency, selectedAccountId);
+    } catch {
+      return null;
+    }
+  })();
+  const localHeatmapBundle = (() => {
+    if (!isLocalMode || !localTwrSeries) return null;
+    try {
+      return buildCalendarHeatmapFromNav(localTwrSeries, rawSnapshot.orders);
+    } catch {
+      return null;
+    }
+  })();
 
   const heatmapEntries = localHeatmapBundle
     ? localHeatmapBundle.entries.map((entry) => ({
@@ -598,10 +639,20 @@ export function App() {
     : mockPortfolio.heatmap;
 
   const handleRefreshBenchmark = async (symbol: string) => {
+    const epoch = getCurrentLockEpoch();
+    if (!MOCK_BROKER.isPublicQuotesEnabled()) {
+      setBenchmarkNotice(
+        language === "zh"
+          ? `未开启「启用公开延迟行情」联网总开关：请先在设置页开启后再同步 ${symbol} 基准历史（当前不会发起任何联网请求）。`
+          : `Public delayed quotes are disabled in Settings; enable them first to fetch ${symbol} history (no network request was sent).`,
+      );
+      return;
+    }
     setBenchmarkLoading(true);
     setBenchmarkNotice(null);
     try {
       const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, quoteProvider);
+      if (!isCurrentLockEpoch(epoch)) return;
       if (outcome.degradedReason) {
         setBenchmarkNotice(
           outcome.series
@@ -616,9 +667,12 @@ export function App() {
         setBenchmarkNotice(null);
       }
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setBenchmarkNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      setBenchmarkLoading(false);
+      if (isCurrentLockEpoch(epoch)) {
+        setBenchmarkLoading(false);
+      }
     }
   };
 
@@ -666,6 +720,7 @@ export function App() {
           activeDays={localHeatmapBundle ? localHeatmapBundle.activeDays : mockPortfolio.activeDays}
           ordersFilled={localHeatmapBundle ? localHeatmapBundle.ordersFilled : mockPortfolio.ordersFilled}
           netChange={localHeatmapBundle ? decimalToNumber(localHeatmapBundle.yearNetChange) : mockPortfolio.netChange}
+          year={localHeatmapBundle?.year}
           currency={isLocalMode ? activeNavCurrency : mockPortfolio.currency}
           isMultiCurrency={isLocalMode ? false : mockPortfolio.isMultiCurrency}
           localNavSummary={isLocalMode && localTwrSeries ? {
@@ -792,7 +847,7 @@ export function App() {
           onClose={closeTrade}
         >
           <TradePage
-            key={`${tradeRequest.symbol ?? "default-trade"}:${tradePrefill?.side ?? ""}:${tradePrefill?.quantity ?? ""}`}
+            key={`${tradeRequest.symbol ?? "default-trade"}:${tradePrefill?.side ?? ""}:${tradePrefill?.quantity ?? ""}:${tradePrefill?.currency ?? ""}:${tradePrefill?.accountId ?? ""}`}
             language={language}
             initialSymbol={tradeRequest.symbol}
             initialPrefill={tradePrefill ?? undefined}

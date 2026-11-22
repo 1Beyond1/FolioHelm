@@ -7,6 +7,7 @@ import { price, quantity } from "./decimal";
 import { MOCK_BROKER } from "./mockBroker";
 import { NAV_STORE } from "./nav";
 import { hydrateCachedPublicQuotes, type PublicQuoteProviderChoice } from "./publicQuotes";
+import { advanceLockEpoch, getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
   invokeVaultLoadPaperOrders,
   invokeVaultLoadSetting,
@@ -19,6 +20,7 @@ import {
 } from "./tauriBridge";
 
 export const VAULT_HYDRATED_EVENT = "foliohelm:vault-hydrated";
+export const WORKSPACE_PREFS_CHANGED_EVENT = "foliohelm:workspace-prefs-changed";
 export const WORKSPACE_PREFS_KEY = "workspace_preferences";
 export const PROTECTIONS_SETTING_KEY = "protections";
 export const AUTOMATION_SETTING_KEY = "automation";
@@ -143,9 +145,13 @@ export async function loadWorkspacePreferences(): Promise<WorkspacePreferences> 
 export async function saveWorkspacePreferences(
   patch: Partial<WorkspacePreferences>,
 ): Promise<WorkspacePreferences> {
+  const epoch = getCurrentLockEpoch();
   const current = await loadWorkspacePreferences();
   const next = normalizeWorkspacePreferences({ ...current, ...patch });
   await saveEncryptedSetting(WORKSPACE_PREFS_KEY, next, WORKSPACE_PREFS_KEY);
+  if (isCurrentLockEpoch(epoch) && typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<WorkspacePreferences>(WORKSPACE_PREFS_CHANGED_EVENT, { detail: next }));
+  }
   return next;
 }
 
@@ -269,10 +275,13 @@ export interface VaultHydrationResult {
 }
 
 /**
- * Synchronously scrubs all sensitive frontend domain memory (portfolios, quotes,
- * paper orders, automation rules, accounts, NAV snapshots, and benchmark caches).
+ * Synchronously advances the global lock epoch barrier and scrubs all sensitive
+ * frontend domain memory (portfolios, quotes, paper orders, automation rules,
+ * accounts, NAV snapshots, and benchmark caches). Any in-flight async callback
+ * started prior to this call sees a stale epoch and discards its result silently.
  */
 export function purgeAllFrontendSensitiveMemory(): void {
+  advanceLockEpoch();
   MOCK_BROKER.purgeSensitiveMemory();
   AUTOMATION_CONTROLLER.purgeSensitiveMemory();
   ACCOUNT_STORE.purgeSensitiveMemory();
@@ -283,19 +292,29 @@ export function purgeAllFrontendSensitiveMemory(): void {
  * Hydrate the entire workspace from the encrypted SQLite vault on desktop launch,
  * after unlocking a locked session, or after restoring a `.fhvault` backup.
  *
- * Always performs a complete replacement (never a union-merge) so stale pre-restore
- * or pre-lock holdings, paper orders, quotes, accounts, NAV snapshots, benchmarks,
- * or automation rules cannot survive in RAM.
+ * Always performs a complete replacement (never a union-merge) and enforces the
+ * `lockEpoch` barrier after every `await` so stale pre-lock or pre-restore
+ * holdings, paper orders, quotes, accounts, NAV snapshots, benchmarks, or
+ * automation rules can NEVER survive in or repopulate RAM.
  */
 export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult> {
+  const epoch = getCurrentLockEpoch();
+  const staleResult = (): VaultHydrationResult => ({
+    status: null,
+    preferences: { ...DEFAULT_WORKSPACE_PREFERENCES },
+  });
+
   if (!isTauriRuntime()) {
     const preferences = await loadWorkspacePreferences();
+    if (!isCurrentLockEpoch(epoch)) return staleResult();
     MOCK_BROKER.setPublicQuotesEnabled(preferences.publicQuotesEnabled);
     await Promise.all([
       ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => []),
       NAV_STORE.hydrateFromVault().catch(() => {}),
     ]);
+    if (!isCurrentLockEpoch(epoch)) return staleResult();
     const persistedPortfolios = await loadPersistedAccountPortfolios().catch(() => []);
+    if (!isCurrentLockEpoch(epoch)) return staleResult();
     if (persistedPortfolios.length > 0) {
       ACCOUNT_STORE.replaceAll(ACCOUNT_STORE.getAccounts(), persistedPortfolios);
       MOCK_BROKER.applyAccountPortfolioSnapshots(persistedPortfolios, {
@@ -303,14 +322,17 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
         resetOrders: true,
       });
       const localOrders = await loadPersistedPaperOrders("local-csv");
+      if (!isCurrentLockEpoch(epoch)) return staleResult();
       MOCK_BROKER.hydratePaperOrders("local-csv", localOrders, { replace: true });
       for (const snap of persistedPortfolios) {
+        if (!isCurrentLockEpoch(epoch)) return staleResult();
         await recordNavSnapshotsForPortfolio(snap, "portfolio-load").catch(() => {});
       }
     } else {
       ACCOUNT_STORE.replaceAll(ACCOUNT_STORE.getAccounts(), []);
       MOCK_BROKER.clearLocalPortfolio();
     }
+    if (!isCurrentLockEpoch(epoch)) return staleResult();
     const storedAutomation = readStored<unknown>("automation", null);
     if (storedAutomation !== null) {
       AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(storedAutomation));
@@ -324,6 +346,7 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
   }
 
   const status = await invokeVaultStatus();
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
   if (!status.unlocked) {
     // Fail-Closed: purge any sensitive user data from the JS heap whenever vault is locked.
     purgeAllFrontendSensitiveMemory();
@@ -331,22 +354,26 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
   }
 
   const preferences = await loadWorkspacePreferences();
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
 
   // Restore public quote opt-in preference and completely replace encrypted quote cache first.
   MOCK_BROKER.setPublicQuotesEnabled(preferences.publicQuotesEnabled);
   await hydrateCachedPublicQuotes().catch(() => {
-    MOCK_BROKER.replacePublicQuotes([]);
+    if (isCurrentLockEpoch(epoch)) MOCK_BROKER.replacePublicQuotes([]);
     return 0;
   });
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
 
   // Completely replace accounts, NAV snapshots, and cached benchmarks from encrypted SQLite.
   const [hydratedAccounts] = await Promise.all([
     ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => ACCOUNT_STORE.getAccounts()),
     NAV_STORE.hydrateFromVault().catch(() => {}),
   ]);
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
 
   // Restore persisted local CSV portfolios per account (or clear stale portfolios if absent).
   const persistedPortfolios = await loadPersistedAccountPortfolios().catch(() => []);
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
   if (persistedPortfolios.length > 0) {
     ACCOUNT_STORE.replaceAll(hydratedAccounts, persistedPortfolios);
     const restoreLocalMode = preferences.workspaceMode === "local-csv";
@@ -355,18 +382,21 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
       resetOrders: true,
     });
     for (const snap of persistedPortfolios) {
+      if (!isCurrentLockEpoch(epoch)) return staleResult();
       await recordNavSnapshotsForPortfolio(snap, "portfolio-load").catch(() => {});
     }
   } else {
     ACCOUNT_STORE.replaceAll(hydratedAccounts, []);
     MOCK_BROKER.clearLocalPortfolio();
   }
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
 
   // Completely replace persisted paper orders for both isolated ledgers (never union-merge).
   const [localOrders, mockOrders] = await Promise.all([
     loadPersistedPaperOrders("local-csv"),
     loadPersistedPaperOrders("mock"),
   ]);
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
   MOCK_BROKER.hydratePaperOrders("local-csv", localOrders, { replace: true });
   MOCK_BROKER.hydratePaperOrders("mock", mockOrders, { replace: true });
 
@@ -376,6 +406,7 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
     null,
     "automation",
   );
+  if (!isCurrentLockEpoch(epoch)) return staleResult();
   if (storedAutomation !== null) {
     AUTOMATION_CONTROLLER.replaceState(normalizeAutomationState(storedAutomation));
   } else {

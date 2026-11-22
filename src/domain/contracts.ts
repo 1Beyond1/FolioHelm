@@ -101,6 +101,8 @@ export interface TradePrefill {
   quantity?: string;
   orderType?: BrokerOrderType;
   limitPrice?: string;
+  currency?: string;
+  accountId?: string;
 }
 
 export interface BrokerOrderEvent {
@@ -154,12 +156,14 @@ export interface OrderDraft {
   quantity: Quantity;
   limitPrice: Price | null;
   currency?: string;
+  accountId?: string;
 }
 
 export interface MockPreview {
   previewId: string;
   draftHash: string;
   draft: OrderDraft;
+  accountId?: string;
   quote: BrokerQuote;
   estimatedAmount: Money;
   createdAt: string;

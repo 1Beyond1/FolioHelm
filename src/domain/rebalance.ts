@@ -694,7 +694,7 @@ export function extractCurrencyBuckets(
         .map((holding) => {
           const quote = snapshot.quotes.find(
             (q) => q.symbol === holding.symbol && (q.currency ?? "USD").toUpperCase() === curr,
-          ) ?? snapshot.quotes.find((q) => q.symbol === holding.symbol);
+          );
           return {
             symbol: holding.symbol,
             company: language === "zh" ? holding.companyZh : holding.companyEn,
