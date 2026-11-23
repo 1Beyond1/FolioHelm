@@ -10,6 +10,7 @@ import {
   type DecimalString,
 } from "./decimal";
 import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "./accounts";
+import { CASH_FLOW_STORE } from "./cashFlows";
 import { appendEvidence } from "./evidenceJournal";
 import { MOCK_BROKER } from "./mockBroker";
 import {
@@ -707,9 +708,21 @@ function accumulateHolding(
   }
 }
 
+function isReverseSplitAction(lower: string): boolean {
+  return lower.includes("reverse split")
+    || lower.includes("reverse-split")
+    || lower.includes("rev split")
+    || lower.includes("share consolidation")
+    || lower.includes("consolidation")
+    || lower.includes("合股")
+    || lower.includes("并股")
+    || lower.includes("缩股");
+}
+
 function txActionReplayRank(action: string): number {
   const lower = action.toLowerCase();
-  if (lower.includes("split") || lower.includes("拆股") || lower.includes("合股")) return 0;
+  if (isReverseSplitAction(lower)) return 6;
+  if (lower.includes("split") || lower.includes("拆股")) return 0;
   if (lower.includes("reinvest") || lower.includes("buy") || lower.includes("purchase") || lower.includes("买入")) return 1;
   if (lower.includes("sell") || lower.includes("sale") || lower.includes("redemption") || lower.includes("卖出")) return 2;
   if (lower.includes("dividend") || lower.includes("div") || lower.includes("interest") || lower.includes("股息") || lower.includes("分红")) return 3;
@@ -797,6 +810,12 @@ function replayTransactions(
 
   for (const { tx } of indexed) {
     const rank = txActionReplayRank(tx.action);
+    if (rank === 6) {
+      warnings.push(
+        `Reverse split / share consolidation for ${tx.symbol} (${tx.action}) skipped in transaction replay to prevent share inflation; import a broker Positions CSV for exact post-consolidation share count`,
+      );
+      continue;
+    }
     const qty = decimal(tx.quantity);
     const price = decimal(tx.price);
     if (decimalCompare(qty, ZERO) <= 0) continue;
@@ -1252,7 +1271,7 @@ export async function parseCsvLocally(
 
       if (isTx) {
         const symbol = validateCsvSymbol(rawSymbol, rowNum);
-        const action = sanitizeCsvTextCell(actionCell ?? "", "Action", warnings);
+        let action = sanitizeCsvTextCell(actionCell ?? "", "Action", warnings);
         const dateSanitized = sanitizeCsvTextCell(
           findCell(headers, row, ["date", "trade date", "settlement date"]) ?? "",
           "Date",
@@ -1265,6 +1284,14 @@ export async function parseCsvLocally(
         const amtRaw = findCell(headers, row, ["amount", "net amount", "principal amount", "proceeds"]) ?? "0";
 
         const qty = qtyRaw.trim() && !isNaPlaceholder(qtyRaw) ? parseCsvDecimal(qtyRaw, rowNum, "Quantity") : ZERO;
+        const actionLower = action.toLowerCase();
+        if (
+          decimalCompare(qty, ZERO) < 0
+          && !isReverseSplitAction(actionLower)
+          && (actionLower.includes("split") || actionLower.includes("拆股"))
+        ) {
+          action = `${action} (Reverse Split)`;
+        }
         const px = pxRaw.trim() && !isNaPlaceholder(pxRaw) ? parseCsvDecimal(pxRaw, rowNum, "Price") : ZERO;
         const fees = feesRaw.trim() && !isNaPlaceholder(feesRaw) ? parseCsvDecimal(feesRaw, rowNum, "Fees") : ZERO;
         const amt = amtRaw.trim() && !isNaPlaceholder(amtRaw) ? parseCsvDecimal(amtRaw, rowNum, "Amount") : ZERO;
@@ -1647,6 +1674,7 @@ export async function clearPersistedLocalPortfolio(): Promise<boolean> {
   MOCK_BROKER.clearLocalPortfolio();
   ACCOUNT_STORE.clearAll();
   NAV_STORE.clearAll();
+  CASH_FLOW_STORE.clearAll();
   const localOk = removeStored(LOCAL_PORTFOLIO_KEY)
     && removeStored(LOCAL_FINGERPRINTS_KEY)
     && removeStored(LOCAL_PAPER_ORDERS_KEY);

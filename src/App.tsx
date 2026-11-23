@@ -36,7 +36,6 @@ import {
   hydrateWorkspaceFromVault,
   normalizeWorkspacePreferences,
   purgeAllFrontendSensitiveMemory,
-  saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
   WORKSPACE_PREFS_CHANGED_EVENT,
   WORKSPACE_PREFS_KEY,
@@ -118,7 +117,10 @@ export function App() {
   const [retryAfterSeconds, setRetryAfterSeconds] = useState(0);
   const [retryNonce, setRetryNonce] = useState(0);
   const [lockError, setLockError] = useState<string | null>(null);
+  const [locking, setLocking] = useState(false);
   const [unlocking, setUnlocking] = useState(false);
+  const lockingRef = useRef(false);
+  const benchmarkReqSeqRef = useRef(0);
   const [idleLockMinutes, setIdleLockMinutes] = useState<number>(() =>
     !isTauriRuntime()
       ? normalizeWorkspacePreferences(readStored(WORKSPACE_PREFS_KEY, DEFAULT_WORKSPACE_PREFERENCES)).idleLockMinutes
@@ -262,6 +264,7 @@ export function App() {
 
   const lockSession = useCallback(async (trigger: "manual" | "idle") => {
     const mode = MOCK_BROKER.getWorkspaceMode();
+    benchmarkReqSeqRef.current += 1;
     // P0-2 Fail-Closed: immediately wipe all sensitive user portfolio, quote, order,
     // automation, accounts, NAV snapshots, benchmark caches, and draft state from JS memory,
     // sanitize window title, and engage LockScreen synchronously BEFORE awaiting any IPC.
@@ -276,8 +279,11 @@ export function App() {
     setLockedAtUtc(new Date().toISOString());
     setLockError(null);
     document.title = "FolioHelm — Locked";
-    setUserLocked(true);
     if (isTauriRuntime()) {
+      // P1-3: Block unlock clicks until the backend lock IPC completes.
+      lockingRef.current = true;
+      setLocking(true);
+      setUserLocked(true);
       try {
         const status = await invokeVaultLock(trigger, mode);
         setHasLockPassphrase(Boolean(status.hasLockPassphrase));
@@ -285,9 +291,13 @@ export function App() {
         setRetryNonce((current) => current + 1);
       } catch {
         // LockScreen is already engaged fail-closed even if IPC reports already locked or fails.
+      } finally {
+        lockingRef.current = false;
+        setLocking(false);
       }
       return;
     }
+    setUserLocked(true);
     setHasLockPassphrase(false);
     setRetryAfterSeconds(0);
     await appendEvidence("session_locked", { trigger, mode }).catch(() => {});
@@ -299,6 +309,7 @@ export function App() {
   }, [lockSession]);
 
   const unlockSession = useCallback(async (passphrase: string) => {
+    if (lockingRef.current) return;
     const unlockEpoch = getCurrentLockEpoch();
     setUnlocking(true);
     setLockError(null);
@@ -574,6 +585,7 @@ export function App() {
         retryAfterSeconds={retryAfterSeconds}
         retryNonce={retryNonce}
         errorMessage={lockError}
+        locking={locking}
         unlocking={unlocking}
         onUnlock={unlockSession}
       />
@@ -643,6 +655,7 @@ export function App() {
 
   const handleRefreshBenchmark = async (symbol: string) => {
     const epoch = getCurrentLockEpoch();
+    const reqSeq = ++benchmarkReqSeqRef.current;
     if (!MOCK_BROKER.isPublicQuotesEnabled()) {
       setBenchmarkNotice(
         language === "zh"
@@ -655,7 +668,7 @@ export function App() {
     setBenchmarkNotice(null);
     try {
       const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, quoteProvider);
-      if (!isCurrentLockEpoch(epoch)) return;
+      if (!isCurrentLockEpoch(epoch) || benchmarkReqSeqRef.current !== reqSeq) return;
       if (outcome.degradedReason) {
         setBenchmarkNotice(
           outcome.series
@@ -670,10 +683,10 @@ export function App() {
         setBenchmarkNotice(null);
       }
     } catch (error) {
-      if (!isCurrentLockEpoch(epoch)) return;
+      if (!isCurrentLockEpoch(epoch) || benchmarkReqSeqRef.current !== reqSeq) return;
       setBenchmarkNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      if (isCurrentLockEpoch(epoch)) {
+      if (isCurrentLockEpoch(epoch) && benchmarkReqSeqRef.current === reqSeq) {
         setBenchmarkLoading(false);
       }
     }
@@ -691,6 +704,8 @@ export function App() {
           accounts: localAccounts,
           selectedAccountId,
           onSelectAccount: (acctId) => {
+            benchmarkReqSeqRef.current += 1;
+            setBenchmarkLoading(false);
             ACCOUNT_STORE.setSelectedAccountId(acctId);
             MOCK_BROKER.setSelectedAccountId(acctId);
             setBenchmarkNotice(null);
@@ -698,6 +713,8 @@ export function App() {
           availableCurrencies,
           activeCurrency: activeNavCurrency,
           onSelectCurrency: (curr) => {
+            benchmarkReqSeqRef.current += 1;
+            setBenchmarkLoading(false);
             setSelectedDashboardCurrency(curr);
             setSelectedBenchmark(null);
             setBenchmarkNotice(null);
@@ -708,6 +725,8 @@ export function App() {
           benchmarkLoading,
           benchmarkNotice,
           onSelectBenchmark: (sym) => {
+            benchmarkReqSeqRef.current += 1;
+            setBenchmarkLoading(false);
             setSelectedBenchmark(sym);
             setBenchmarkNotice(null);
           },
@@ -755,7 +774,7 @@ export function App() {
           <MarketsPage
             language={language}
             onOpenInstrument={(symbol) => navigate("instrument", symbol)}
-            onOpenTrade={(symbol) => navigate("trade", symbol)}
+            onOpenTrade={(symbol, prefill) => navigate("trade", symbol, prefill)}
           />
         );
       case "instrument":
@@ -764,7 +783,7 @@ export function App() {
             <MarketsPage
               language={language}
               onOpenInstrument={(symbol) => navigate("instrument", symbol)}
-              onOpenTrade={(symbol) => navigate("trade", symbol)}
+              onOpenTrade={(symbol, prefill) => navigate("trade", symbol, prefill)}
             />
           );
         }
@@ -799,11 +818,12 @@ export function App() {
             onMockScenarioChange={setMockScenario}
             onModalStateChange={setSettingsModalOpen}
             idleLockMinutes={idleLockMinutes}
-            onIdleLockMinutesChange={(minutes) => {
-              setIdleLockMinutes(minutes);
-              void saveWorkspacePreferences({ idleLockMinutes: minutes });
-            }}
+            onIdleLockMinutesChange={setIdleLockMinutes}
             onLockSession={(trigger) => void lockSession(trigger)}
+            onVaultStatusChange={(status) => {
+              setHasLockPassphrase(Boolean(status.hasLockPassphrase));
+              setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+            }}
           />
         );
       default:

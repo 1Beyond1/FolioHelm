@@ -6,31 +6,33 @@ FolioHelm is a local-first, security-first Windows desktop portfolio and paper-t
 
 > FolioHelm runs in two isolated local modes — **Mock Demo** and **Local Portfolio (CSV + Paper)** — keeping all portfolio data on your machine. Live brokerage OAuth and order execution are planned once [API Gate](docs/api-gate.md) review is completed.
 
-## What's Implemented
+## What's Implemented (v0.2.0)
 
 - **Encrypted Local Persistence & `.fhvault` Offline Backup (Fail-Closed)**:
-  - Stores your imported portfolios, cash snapshots, paper orders, evidence journal, cached quotes, safety preferences, automation policies, and rebalance targets in a bundled SQLite database (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + per-record AAD binding `schema_version|table|record_id`), with lossless migration from legacy browser storage and automatic restoration of your `local-csv` workspace & cached quotes on relaunch.
-  - Protects the 256-bit database master key and **Ed25519** device signing seed inside the operating system credential manager (**Windows Credential Manager** / OS Keyring) and scrubs key buffers from memory with `zeroize`.
-  - **`.fhvault` Passphrase-Encrypted Offline Migration**: exports the entire encrypted vault + signing identity using **Argon2id** + random 128-bit salt + **AES-256-GCM** + format/version AAD; restore verifies AEAD authentication and the full Ed25519 evidence chain before atomically swapping the database (Fail-Closed: failures never touch your existing vault). Evidence and backup imports enforce a 20 MB hard cap.
-  - **Real Manual & Idle App Lock**: locking writes an Ed25519-signed `SessionLocked` evidence event, immediately drops and `Zeroizing`-wipes in-memory session keys, and unmounts portfolio data behind a lock screen; unlocking supports an optional Argon2id lock passphrase verified in constant time with exponential anti-bruteforce backoff (passphrases are never persisted or logged).
-  - **Fail-Closed by design**: if an existing encrypted vault cannot be decrypted or its OS keyring key is missing, FolioHelm locks the vault, preserves the untouched ciphertext, and never silently resets or downgrades to plaintext.
+  - Stores imported portfolios, multi-account profiles, daily NAV snapshots, cached benchmarks, cash-flow & dividend ledgers, watchlist targets, paper orders, evidence journal, cached quotes, automation policies, safety preferences, and rebalance targets in bundled SQLite (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + `schema_version|table|record_id` AAD) and `Zeroizing` plaintext buffers.
+  - Stores the 256-bit database master key and **Ed25519** device signing seed in the OS credential manager (**Windows Credential Manager** / OS Keyring).
+  - **`.fhvault` Offline Migration**: exports the full vault (including accounts, NAV history, cash flows, watchlist targets, and signing identity) using **Argon2id** + random 128-bit salt + **AES-256-GCM** + header AAD; restore verifies AEAD tags and the Ed25519 chain before atomically swapping databases, transitioning to Fail-Closed `ErrorLocked` if a rollback cannot reopen the original vault.
+  - **Manual & Idle App Lock**: writes an Ed25519-signed `SessionLocked` event, wipes in-memory keys and frontend sensitive heap via a monotonic lock-epoch barrier, blocks unlock clicks while lock IPC is in flight, and verifies optional Argon2id passphrases with persisted exponential backoff.
+- **Multi-Account Portfolios, Per-Currency Buckets & Real NAV / `i128` TWR**:
+  - Manages multiple local brokerage accounts (`All Accounts` aggregate or single-account scope) with strict per-currency bucket isolation (`USD`, `HKD`, `CNY`, etc.) for allocation donuts, rebalance plans, and NAV tracking.
+  - Computes real **Time-Weighted Return (TWR)** in pure `i128` / `BigInt` fixed-point micro-units with external cash-flow stripping and optional allowlisted benchmark overlay (`SPY`, `QQQ`, `2800.HK`, etc.) when at least 2 real snapshots exist.
+- **Cash-Flow & Dividend Ledger + P&L Attribution**:
+  - Records dividends, deposits, withdrawals, and fees encrypted in SQLite with Ed25519 evidence logging, isolated by account and currency bucket.
+  - Ranks per-symbol P&L attribution combining unrealized price P&L and recorded dividends using exact `Decimal` math.
+- **Local Watchlist & Price Target Alerts**:
+  - Tracks custom buy/sell target prices per symbol in native currency inside the encrypted vault, comparing against local holding baselines or opted-in delayed public quotes.
+  - Highlights triggered targets read-only and offers one-click prefill into the 4-step paper trade ticket for manual review.
+- **Sanitized Portfolio Review Report Export (Markdown / CSV)**:
+  - Exports currency-isolated holdings, P&L attribution, TWR summary, and cash-flow ledgers to Markdown or CSV via lock-protected native save dialogs (with browser Blob fallback), automatically redacting sensitive account-number patterns and neutralizing CSV formula prefixes.
 - **Tamper-Evident Ed25519 Evidence Journal**:
-  - Records trade previews, confirmations, reconciliations, safety setting changes, App Lock events (`SessionLocked`), and CSV portfolio imports (tagged with exact `mock` / `local-csv` mode) into a hash-chained, Ed25519-signed local evidence journal that persists across restarts and rejects credentials or sensitive fields before writing.
-- **Safe Multi-Broker CSV Import, Multi-Currency Fail-Safe Isolation & Full-Site Local Portfolio**:
-  - Supports **Charles Schwab**, **Interactive Brokers (IBKR)**, **Fidelity**, **Vanguard**, **Futu (富途)**, **Tiger (老虎)**, and **Standard Portfolio CSV**.
-  - Enforces a 5 MB / 10,000-row safety limit, neutralizes spreadsheet formula injection (`=`, `+`, `-`, `@` prefixes), validates ticker format and non-negative share quantities, calculates cost basis and P&L with **exact `Decimal` / fixed-point arithmetic** (never IEEE-754 floats), and computes deterministic SHA-256 fingerprints for **idempotent deduplication**.
-  - **Multi-Currency Isolation**: when a CSV spans multiple settlement currencies (e.g., USD + HKD), FolioHelm isolates per-currency subtotals and computes allocation and rebalance plans per currency bucket without mixing currencies.
-  - **Full-Site Arbitrary-Ticker Support**: imported non-demo holdings (e.g., `VOO`, `QQQ`, `BRK.B`, `00700.HK`) work seamlessly across Home, Search (`Ctrl+K`), Markets, Instrument Detail, Portfolio, Paper Trade, and Orders using real imported positions, cached quotes, and local NAV history.
-- **Target Allocation & Read-Only Rebalance Calculator (Pure Decimal)**:
-  - Multi-holding allocation donut plus an encrypted-persisted target-weight planner strictly validating that holdings + cash sum to exactly **100%**.
-  - Supports both **Full Rebalance** and **Cash-Only Buy** (zero-sell) modes using pure exact `Decimal` math, with single-row one-click prefill into the 4-step paper trade ticket (manual single-order review only; no batch auto-execution).
-- **Hardened Optional Delayed Public Quotes (Off by Default)**:
-  - Disabled by default for local-first operation. When explicitly enabled in **Settings**, the Rust backend fetches unauthenticated, delayed read-only quotes exclusively from HTTPS-allowlisted hosts (`stooq.com` and `query1.finance.yahoo.com`) with `url.port().is_none()`, redirects disabled, **zero `f64`** (`i128` fixed-point parsing), a 512 KiB streamed HTTP body cap, bounded 4-way concurrency with a 20s batch timeout, encrypted cache persistence, and automatic offline fallback to cached or CSV baseline prices.
-- **Native Desktop File Dialogs & Strict CSP**:
-  - Uses controlled Rust `tauri-plugin-dialog` commands for opening brokerage CSVs and saving evidence bundles or safety diagnostics (gracefully falling back to browser file inputs and deferred-revoke Blob downloads in browser previews).
-  - Preserves a strict WebView Content Security Policy without exposing external network origins or unrestricted filesystem access to the frontend.
-- **Interactive Workbench**:
-  - Global symbol search (`Ctrl+K`), market/instrument explorer, portfolio allocation & return views, annual investing activity/return heatmap, working/filled/canceled/rejected/unknown order timelines with reconciliation, and a 4-step simulated trade workflow (`Ticket → Safety check → Mock preview → Demo receipt`).
+  - Hash-chained, Ed25519-signed local audit journal tagging `mock` / `local-csv` workspace modes accurately on append and export, rejecting secret-like keys/tokens and enforcing a 20 MB import cap.
+- **Safe Multi-Broker CSV Import & Target Rebalance Calculator**:
+  - Supports **Charles Schwab**, **Interactive Brokers (IBKR)**, **Fidelity**, **Vanguard**, **Futu (富途)**, **Tiger (老虎)**, and **Standard CSV** (UTF-8/UTF-16/GBK, 5 MB / 10,000-row cap, formula sanitization, reverse-split inflation guard, exact `Decimal` cost basis, SHA-256 deduplication).
+  - Read-only pure-`Decimal` rebalance planner (Full Rebalance & Cash-Only Buy modes) scoped per currency bucket with single-row paper ticket prefill.
+- **Optional Read-Only Delayed Public Quotes (Off by Default)**:
+  - Fetched exclusively by the Rust backend over HTTPS allowlisted hosts (`stooq.com`, `query1.finance.yahoo.com`, no custom ports or redirects), parsed in `i128` fixed-point with a 512 KiB streamed body cap, 4-way concurrency limit, 20s timeout, encrypted cache, and offline fallback.
+- **Lock-Protected Native Dialogs & Strict CSP**:
+  - Native `tauri-plugin-dialog` commands verify unlocked vault state before and after OS dialogs; WebView CSP blocks arbitrary external `connect-src` and unrestricted filesystem access.
 
 ### Roadmap
 

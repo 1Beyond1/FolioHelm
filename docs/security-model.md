@@ -1,28 +1,28 @@
 # Security Model
 
-Updated: 2026-11-22
+Updated: 2026-11-23 (v0.2.0)
 
 ## Assets
 
 The protected assets are:
-1. Local encrypted portfolio holdings, cash snapshots, paper orders, rebalance targets, automation policies, and preferences.
+1. Local encrypted multi-account profiles, portfolio holdings, daily NAV snapshots, cached benchmarks, cash-flow & dividend ledgers, watchlist targets, paper orders, rebalance targets, automation policies, and workspace preferences.
 2. Device cryptographic key material: 256-bit vault database encryption key, Ed25519 evidence signing seed, and optional App Lock Argon2id verifier.
 3. User-supplied passphrases for `.fhvault` offline migration backups and App Lock unlock (transient in memory only; never persisted or logged).
 4. Tamper-evident Ed25519 local evidence journal.
-5. Future live-brokerage credentials, OAuth tokens, and real funds — **intentionally absent** in this build (`API Gate Pending`; zero brokerage write capability).
+5. Future live-brokerage credentials, OAuth tokens, and real funds — absent in this build (`API Gate Pending`; no live brokerage write capability).
 
 ## Trust boundaries
 
-1. **React UI (WebView)**: Untrusted presentation layer under a strict CSP (no arbitrary external `connect-src`, no unrestricted filesystem permissions). While locked (`App Lock`), portfolio DOM nodes are completely unmounted and replaced by `<LockScreen />`.
-2. **TypeScript Domain Layer**: Deterministic pure-Decimal math (`src/domain/decimal.ts`, `src/domain/rebalance.ts`), CSV sanitization, strict mode isolation (`mock` vs `local-csv`), 4-step paper-order state machine, and encrypted vault bridge (`src/domain/vaultStorage.ts`).
+1. **React UI (WebView)**: Untrusted presentation layer under a strict CSP (no arbitrary external `connect-src`, no unrestricted filesystem permissions). While locked (`App Lock`), sensitive JS stores are purged synchronously via a monotonic `lockEpoch` barrier, portfolio DOM nodes are unmounted behind `<LockScreen />`, and unlock actions are blocked while lock IPC is in flight.
+2. **TypeScript Domain Layer**: Deterministic pure-`Decimal` / `BigInt` math (`decimal.ts`, `nav.ts`, `rebalance.ts`, `cashFlows.ts`, `watchlist.ts`, `portfolioReport.ts`), serialized preference write queues, CSV sanitization, strict mode isolation (`mock` vs `local-csv`), 4-step paper-order state machine, and encrypted vault bridge (`vaultStorage.ts`).
 3. **Tauri / Rust Security Core (`src-tauri/`)**:
-   - **Encrypted SQLite Vault (`vault/` + `storage/`)**: Bundled SQLite (`WAL` + `PRAGMA secure_delete = ON`) with per-record **AES-256-GCM** encryption, random 96-bit nonces, and per-record AAD binding (`schema_version|table|record_id`). Master key and Ed25519 signing seed live in OS Credential Manager (**Windows Credential Manager** / OS Keyring) and are held in `Zeroizing` memory wrappers.
-   - **Fail-Closed Startup & Restore**: Missing keyring material, canary decryption mismatch, corrupted `.fhvault` AEAD tags, or invalid Ed25519 chain signatures fail closed immediately — preserving existing ciphertext without silent downgrade or reset.
-   - **`.fhvault` Offline Encrypted Backup**: Derives a one-time 256-bit key via **Argon2id** (`m=64 MiB`, `t=3`, `p=1`, bounded DoS parameter validation) + random 128-bit salt, encrypts the complete vault payload + signing seed using **AES-256-GCM** with full format/version/KDF/salt AAD, and verifies decrypted Ed25519 evidence chains before performing an atomic SQLite replacement (with keyring rollback on failure).
-   - **Real App Lock (Manual & Idle)**: Writes an Ed25519-signed `EvidenceKind::SessionLocked` record before dropping and `Zeroizing`-wiping active database and journal handles from memory. Unlock verifies the optional Argon2id passphrase verifier in constant time (`subtle::ConstantTimeEq`) with exponential backoff (`1s → 2s → 4s … → 300s`) against brute-force attempts.
-   - **Hardened Read-Only Public Quotes (`quotes/`)**: Disabled by default; HTTPS allowlist only (`stooq.com`, `query1.finance.yahoo.com`) with `url.port().is_none()` and redirects disabled; **zero `f64`** (parsed strictly into `i128` fixed-point / `RawValue`); 512 KiB streamed HTTP body cap; bounded 4-way concurrency (`Semaphore`) with 20s batch timeout; encrypted local quote cache fallback.
-   - **Controlled Native Dialogs & CSV Import (`csv_import/`)**: Native `tauri-plugin-dialog` commands only; 5 MB / 10,000-row CSV cap; spreadsheet formula-injection neutralization; exact Decimal arithmetic; deterministic SHA-256 deduplication; **multi-currency Fail-Safe isolation** (never sums cross-currency totals without verified FX rates).
-4. **Schwab / External Brokerages**: Out of scope until official API Gate approval; zero live API adapters exist.
+   - **Encrypted SQLite Vault (`vault/` + `storage/`)**: Bundled SQLite (`WAL` + `PRAGMA secure_delete = ON`) with per-record **AES-256-GCM** encryption, random 96-bit nonces, `Zeroizing` serialization buffers, and per-record AAD binding (`schema_version|table|record_id`) across `evidence_entries`, `portfolio_snapshots`, `paper_orders`, `quote_cache`, `app_settings`, `accounts`, `nav_snapshots`, `benchmark_history`, `cash_flows`, and `watchlist_items`. Master key and Ed25519 signing seed live in OS Credential Manager (**Windows Credential Manager** / OS Keyring) and `Zeroizing` wrappers.
+   - **Fail-Closed Startup & Restore**: Missing keyring material, canary decryption mismatch, corrupted `.fhvault` AEAD tags, invalid Ed25519 chain signatures, or a rollback failure to reopen/verify the original DB immediately transition `VaultRuntimeState` into Fail-Closed `ErrorLocked`, preserving ciphertext and `.restore-intent` recovery metadata.
+   - **`.fhvault` Offline Encrypted Backup**: Derives a one-time 256-bit key via **Argon2id** (`m=64 MiB`, `t=3`, `p=1`, bounded DoS parameter validation) + random 128-bit salt, encrypts the complete vault payload + signing seed using **AES-256-GCM** with full header/KDF/salt AAD, re-checks unlocked state after async encryption, and verifies decrypted Ed25519 evidence chains before atomic SQLite swap with keyring rollback.
+   - **Real App Lock (Manual & Idle)**: Writes an Ed25519-signed `EvidenceKind::SessionLocked` record before dropping and `Zeroizing`-wiping active database, journal, and runtime cache handles from memory. Unlock verifies the optional Argon2id passphrase verifier in constant time (`subtle::ConstantTimeEq`) with persisted exponential backoff (`1s → 2s → 4s … → 300s`).
+   - **Hardened Read-Only Public Quotes & Benchmarks (`quotes/` + `nav/`)**: Disabled by default; HTTPS allowlist only (`stooq.com`, `query1.finance.yahoo.com`) with `url.port().is_none()` and redirects disabled; **zero `f64`** (`i128` fixed-point / `RawValue`); 512 KiB streamed body cap; 4-way bounded concurrency with 20s timeout; lock state verified before and after network I/O; encrypted local cache fallback.
+   - **Lock-Protected Native Dialogs, CSV Import & Sanitized Report Export (`csv_import/` + `lib.rs`)**: All native `tauri-plugin-dialog` open/save commands (`CSV`, `JSON`, `Markdown/CSV report`, `.fhvault`) verify unlocked vault state both before opening the OS dialog and after it returns before reading or writing disk; CSV import enforces 5 MB / 10,000-row caps, UTF-8-safe option detection, formula neutralization, reverse-split inflation prevention, `i128` cost basis, and SHA-256 deduplication; report exports redact sensitive account numbers and neutralize CSV formula prefixes.
+4. **Schwab / External Brokerages**: Out of scope until official API Gate approval; no live API adapters exist.
 5. **Optional Remote Notary**: Privacy-minimized commitment/receipt primitives exist in Rust; no remote calls are enabled.
 
 ## Safety properties

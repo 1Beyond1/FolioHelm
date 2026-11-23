@@ -51,6 +51,10 @@ pub fn default_account_id() -> String {
     DEFAULT_ACCOUNT_ID.to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub mod i128_string_serde {
     use std::fmt;
 
@@ -109,6 +113,92 @@ pub mod i128_string_serde {
         }
 
         deserializer.deserialize_any(I128Visitor)
+    }
+}
+
+pub mod option_i128_string_serde {
+    use std::fmt;
+
+    use serde::{
+        de::{self, Visitor},
+        Deserializer, Serializer,
+    };
+
+    pub fn serialize<S>(value: &Option<i128>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(v) => serializer.serialize_some(&v.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<i128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptI128Visitor;
+
+        impl<'de> Visitor<'de> for OptI128Visitor {
+            type Value = Option<i128>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or a base-10 integer string/integer representing i128")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                super::i128_string_serde::deserialize(deserializer).map(Some)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Some(i128::from(v)))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(Some(i128::from(v)))
+            }
+
+            fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E> {
+                Ok(Some(v))
+            }
+
+            fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                i128::try_from(v)
+                    .map(Some)
+                    .map_err(|_| E::custom("u128 out of i128 range"))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                trimmed
+                    .parse::<i128>()
+                    .map(Some)
+                    .map_err(|_| E::custom(format!("invalid optional i128 string: {v}")))
+            }
+        }
+
+        deserializer.deserialize_option(OptI128Visitor)
     }
 }
 
@@ -188,6 +278,8 @@ pub enum StorageError {
     Integrity(String),
     #[error("invalid storage input: {0}")]
     InvalidInput(String),
+    #[error("encrypted vault rollback failed; session must lock fail-closed: {0}")]
+    RollbackLockRequired(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -276,6 +368,44 @@ pub struct StoredBenchmarkSeries {
     pub provider: String,
     pub as_of_utc: String,
     pub points: Vec<BenchmarkPricePoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredCashFlow {
+    pub id: String,
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// "dividend" | "deposit" | "withdrawal" | "fee"
+    pub flow_type: String,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub currency: String,
+    /// Strictly positive magnitude in 10^6 micro-units; signed direction is determined by `flow_type`.
+    #[serde(with = "i128_string_serde")]
+    pub amount_micros: i128,
+    /// YYYY-MM-DD
+    pub flow_date: String,
+    #[serde(default)]
+    pub note: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredWatchlistItem {
+    pub id: String,
+    pub symbol: String,
+    pub currency: String,
+    #[serde(default, with = "option_i128_string_serde")]
+    pub target_buy_micros: Option<i128>,
+    #[serde(default, with = "option_i128_string_serde")]
+    pub target_sell_micros: Option<i128>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,6 +530,10 @@ pub struct VaultBackupPayload {
     pub nav_snapshots: Vec<StoredNavSnapshot>,
     #[serde(default)]
     pub benchmark_history: Vec<StoredBenchmarkSeries>,
+    #[serde(default)]
+    pub cash_flows: Vec<StoredCashFlow>,
+    #[serde(default)]
+    pub watchlist_items: Vec<StoredWatchlistItem>,
 }
 
 impl fmt::Debug for VaultBackupPayload {
@@ -416,6 +550,8 @@ impl fmt::Debug for VaultBackupPayload {
             .field("accounts_len", &self.accounts.len())
             .field("nav_snapshots_len", &self.nav_snapshots.len())
             .field("benchmark_history_len", &self.benchmark_history.len())
+            .field("cash_flows_len", &self.cash_flows.len())
+            .field("watchlist_items_len", &self.watchlist_items.len())
             .finish()
     }
 }
@@ -446,6 +582,10 @@ pub struct VaultRestoreSummaryDto {
     pub nav_snapshot_count: usize,
     #[serde(default)]
     pub benchmark_count: usize,
+    #[serde(default)]
+    pub cash_flow_count: usize,
+    #[serde(default)]
+    pub watchlist_count: usize,
     pub signer_public_key: String,
 }
 
@@ -687,7 +827,7 @@ impl EncryptedVaultDb {
             "evidence_entries",
             &entry.event.sequence.to_string(),
         );
-        let plaintext = serde_json::to_vec(entry)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(entry)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -720,7 +860,7 @@ impl EncryptedVaultDb {
                 "evidence_entries",
                 &entry.event.sequence.to_string(),
             );
-            let plaintext = serde_json::to_vec(entry)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(entry)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             tx.execute(
                 "INSERT INTO evidence_entries (sequence, event_id, occurred_at_utc, ciphertext)
@@ -803,7 +943,7 @@ impl EncryptedVaultDb {
             };
             stored.imported_at_utc = refreshed_ts;
 
-            let updated_plaintext = serde_json::to_vec(&stored)?;
+            let updated_plaintext = Zeroizing::new(serde_json::to_vec(&stored)?);
             let updated_ciphertext =
                 encrypt_record(self.keys.db_master_key(), &aad, &updated_plaintext)?;
 
@@ -835,7 +975,7 @@ impl EncryptedVaultDb {
         }
 
         let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &snapshot.id);
-        let plaintext = serde_json::to_vec(snapshot)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(snapshot)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -892,6 +1032,7 @@ impl EncryptedVaultDb {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM portfolio_snapshots", [])?;
         tx.execute("DELETE FROM nav_snapshots", [])?;
+        tx.execute("DELETE FROM cash_flows", [])?;
         tx.execute(
             "DELETE FROM paper_orders WHERE workspace_mode = 'local-csv'",
             [],
@@ -914,7 +1055,7 @@ impl EncryptedVaultDb {
             ));
         }
         let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
-        let plaintext = serde_json::to_vec(order)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(order)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -958,7 +1099,7 @@ impl EncryptedVaultDb {
         let tx = self.conn.transaction()?;
         for quote in quotes {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "quote_cache", &quote.symbol);
-            let plaintext = serde_json::to_vec(quote)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(quote)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             tx.execute(
                 "INSERT OR REPLACE INTO quote_cache (symbol, provider, as_of_utc, ciphertext)
@@ -1166,7 +1307,7 @@ impl EncryptedVaultDb {
                 params![APP_LOCK_BACKOFF_META_KEY],
             )?;
         } else {
-            let plaintext = serde_json::to_vec(state)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(state)?);
             let aad = build_aad(
                 STORAGE_SCHEMA_VERSION,
                 "vault_meta",
@@ -1299,7 +1440,7 @@ impl EncryptedVaultDb {
     ) -> Result<StoredAccount, StorageError> {
         let normalized = validate_and_normalize_account(account)?;
         let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &normalized.id);
-        let plaintext = serde_json::to_vec(&normalized)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -1345,6 +1486,10 @@ impl EncryptedVaultDb {
         let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![trimmed])?;
         tx.execute(
             "DELETE FROM nav_snapshots WHERE account_id = ?1",
+            params![trimmed],
+        )?;
+        tx.execute(
+            "DELETE FROM cash_flows WHERE account_id = ?1",
             params![trimmed],
         )?;
         for snap_id in snap_ids_to_remove {
@@ -1403,7 +1548,7 @@ impl EncryptedVaultDb {
         }
 
         let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
-        let plaintext = serde_json::to_vec(&normalized)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -1485,7 +1630,7 @@ impl EncryptedVaultDb {
             "benchmark_history",
             &normalized.symbol,
         );
-        let plaintext = serde_json::to_vec(&normalized)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
@@ -1553,6 +1698,153 @@ impl EncryptedVaultDb {
         Ok(())
     }
 
+    pub fn upsert_cash_flow(
+        &mut self,
+        record: &StoredCashFlow,
+    ) -> Result<StoredCashFlow, StorageError> {
+        let normalized = validate_and_normalize_cash_flow(record)?;
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &normalized.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
+        let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO cash_flows
+                (id, account_id, flow_date, currency, created_at_utc, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                normalized.id,
+                normalized.account_id,
+                normalized.flow_date,
+                normalized.currency,
+                normalized.created_at,
+                ciphertext
+            ],
+        )?;
+        tx.commit()?;
+        Ok(normalized)
+    }
+
+    pub fn load_all_cash_flows(&self) -> Result<Vec<StoredCashFlow>, StorageError> {
+        self.list_cash_flows(None, None)
+    }
+
+    pub fn list_cash_flows(
+        &self,
+        account_id: Option<&str>,
+        currency: Option<&str>,
+    ) -> Result<Vec<StoredCashFlow>, StorageError> {
+        let acct_filter = account_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("ALL"));
+        let curr_filter = currency
+            .map(|c| c.trim().to_ascii_uppercase())
+            .filter(|c| !c.is_empty() && c != "MULTI");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ciphertext FROM cash_flows
+             ORDER BY flow_date DESC, created_at_utc DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            let item: StoredCashFlow = serde_json::from_slice(&plaintext)?;
+            if let Some(target_acct) = acct_filter {
+                if item.account_id != target_acct {
+                    continue;
+                }
+            }
+            if let Some(ref target_curr) = curr_filter {
+                if !item.currency.eq_ignore_ascii_case(target_curr) {
+                    continue;
+                }
+            }
+            out.push(item);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_cash_flow(&mut self, id: &str) -> Result<bool, StorageError> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "cash flow id must not be empty".to_string(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute("DELETE FROM cash_flows WHERE id = ?1", params![trimmed])?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    pub fn upsert_watchlist_item(
+        &mut self,
+        item: &StoredWatchlistItem,
+    ) -> Result<StoredWatchlistItem, StorageError> {
+        let normalized = validate_and_normalize_watchlist_item(item)?;
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "watchlist_items", &normalized.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
+        let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM watchlist_items WHERE symbol = ?1 AND id != ?2",
+            params![normalized.symbol, normalized.id],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO watchlist_items
+                (id, symbol, updated_at_utc, ciphertext)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                normalized.id,
+                normalized.symbol,
+                normalized.updated_at,
+                ciphertext
+            ],
+        )?;
+        tx.commit()?;
+        Ok(normalized)
+    }
+
+    pub fn list_watchlist_items(&self) -> Result<Vec<StoredWatchlistItem>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ciphertext FROM watchlist_items
+             ORDER BY updated_at_utc DESC, symbol ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, ciphertext) = row?;
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "watchlist_items", &id);
+            let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &ciphertext)?;
+            out.push(serde_json::from_slice(&plaintext)?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_watchlist_item(&mut self, id: &str) -> Result<bool, StorageError> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "watchlist item id must not be empty".to_string(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM watchlist_items WHERE id = ?1",
+            params![trimmed],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
     /// Export all encrypted tables and the device signing seed into a payload ready for
     /// Argon2id + AES-256-GCM `.fhvault` backup encryption.
     pub fn export_backup_payload(&self) -> Result<VaultBackupPayload, StorageError> {
@@ -1564,6 +1856,8 @@ impl EncryptedVaultDb {
         let accounts = self.list_accounts()?;
         let nav_snapshots = self.load_all_nav_snapshots()?;
         let benchmark_history = self.load_all_benchmark_series()?;
+        let cash_flows = self.load_all_cash_flows()?;
+        let watchlist_items = self.list_watchlist_items()?;
         let seed_hex = self.keys.device_signing_seed_hex();
 
         Ok(VaultBackupPayload {
@@ -1578,6 +1872,8 @@ impl EncryptedVaultDb {
             accounts,
             nav_snapshots,
             benchmark_history,
+            cash_flows,
+            watchlist_items,
         })
     }
 
@@ -1734,6 +2030,39 @@ impl EncryptedVaultDb {
             normalized_benchmarks.push(norm);
         }
 
+        let mut seen_cash_flow_ids = BTreeSet::new();
+        let mut normalized_cash_flows = Vec::with_capacity(payload.cash_flows.len());
+        for cf in &payload.cash_flows {
+            let norm = validate_and_normalize_cash_flow(cf)?;
+            if !seen_cash_flow_ids.insert(norm.id.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate cash flow id '{}'",
+                    norm.id
+                )));
+            }
+            normalized_cash_flows.push(norm);
+        }
+
+        let mut seen_watchlist_ids = BTreeSet::new();
+        let mut seen_watchlist_symbols = BTreeSet::new();
+        let mut normalized_watchlist = Vec::with_capacity(payload.watchlist_items.len());
+        for item in &payload.watchlist_items {
+            let norm = validate_and_normalize_watchlist_item(item)?;
+            if !seen_watchlist_ids.insert(norm.id.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate watchlist id '{}'",
+                    norm.id
+                )));
+            }
+            if !seen_watchlist_symbols.insert(norm.symbol.clone()) {
+                return Err(StorageError::InvalidInput(format!(
+                    "backup contains duplicate watchlist symbol '{}'",
+                    norm.symbol
+                )));
+            }
+            normalized_watchlist.push(norm);
+        }
+
         // Preserve local device App Lock configuration across backup restore.
         let preserved_verifier = self.load_app_lock_verifier()?;
         let preserved_backoff = self.load_app_lock_backoff()?;
@@ -1749,7 +2078,7 @@ impl EncryptedVaultDb {
                 "evidence_entries",
                 &entry.event.sequence.to_string(),
             );
-            let plaintext = serde_json::to_vec(entry)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(entry)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_evidence.push((
                 seq,
@@ -1762,7 +2091,7 @@ impl EncryptedVaultDb {
         let mut encrypted_portfolios = Vec::with_capacity(payload.portfolio_snapshots.len());
         for snapshot in &payload.portfolio_snapshots {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &snapshot.id);
-            let plaintext = serde_json::to_vec(snapshot)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(snapshot)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_portfolios.push((
                 snapshot.id.clone(),
@@ -1776,7 +2105,7 @@ impl EncryptedVaultDb {
         let mut encrypted_orders = Vec::with_capacity(payload.paper_orders.len());
         for order in &payload.paper_orders {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
-            let plaintext = serde_json::to_vec(order)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(order)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_orders.push((
                 order.id.clone(),
@@ -1789,7 +2118,7 @@ impl EncryptedVaultDb {
         let mut encrypted_quotes = Vec::with_capacity(payload.quote_cache.len());
         for quote in &payload.quote_cache {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "quote_cache", &quote.symbol);
-            let plaintext = serde_json::to_vec(quote)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(quote)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_quotes.push((
                 quote.symbol.clone(),
@@ -1811,7 +2140,7 @@ impl EncryptedVaultDb {
         let mut encrypted_accounts = Vec::with_capacity(normalized_accounts.len());
         for account in &normalized_accounts {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &account.id);
-            let plaintext = serde_json::to_vec(account)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(account)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_accounts.push((account.id.clone(), account.created_at.clone(), ciphertext));
         }
@@ -1819,7 +2148,7 @@ impl EncryptedVaultDb {
         let mut encrypted_nav_snapshots = Vec::with_capacity(normalized_nav_snapshots.len());
         for (record_id, snap) in &normalized_nav_snapshots {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", record_id);
-            let plaintext = serde_json::to_vec(snap)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(snap)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_nav_snapshots.push((
                 record_id.clone(),
@@ -1834,13 +2163,41 @@ impl EncryptedVaultDb {
         let mut encrypted_benchmarks = Vec::with_capacity(normalized_benchmarks.len());
         for series in &normalized_benchmarks {
             let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &series.symbol);
-            let plaintext = serde_json::to_vec(series)?;
+            let plaintext = Zeroizing::new(serde_json::to_vec(series)?);
             let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
             encrypted_benchmarks.push((
                 series.symbol.clone(),
                 series.currency.clone(),
                 series.provider.clone(),
                 series.as_of_utc.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_cash_flows = Vec::with_capacity(normalized_cash_flows.len());
+        for cf in &normalized_cash_flows {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &cf.id);
+            let plaintext = Zeroizing::new(serde_json::to_vec(cf)?);
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_cash_flows.push((
+                cf.id.clone(),
+                cf.account_id.clone(),
+                cf.flow_date.clone(),
+                cf.currency.clone(),
+                cf.created_at.clone(),
+                ciphertext,
+            ));
+        }
+
+        let mut encrypted_watchlist = Vec::with_capacity(normalized_watchlist.len());
+        for item in &normalized_watchlist {
+            let aad = build_aad(STORAGE_SCHEMA_VERSION, "watchlist_items", &item.id);
+            let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
+            encrypted_watchlist.push((
+                item.id.clone(),
+                item.symbol.clone(),
+                item.updated_at.clone(),
                 ciphertext,
             ));
         }
@@ -1883,7 +2240,7 @@ impl EncryptedVaultDb {
             if preserved_backoff.failed_attempts > 0
                 || preserved_backoff.locked_until_unix.is_some()
             {
-                let plaintext = serde_json::to_vec(&preserved_backoff)?;
+                let plaintext = Zeroizing::new(serde_json::to_vec(&preserved_backoff)?);
                 let aad = build_aad(
                     STORAGE_SCHEMA_VERSION,
                     "vault_meta",
@@ -1963,6 +2320,31 @@ impl EncryptedVaultDb {
                         (symbol, currency, provider, updated_at_utc, ciphertext)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![symbol, currency, provider, updated_at_utc, ciphertext],
+                )?;
+            }
+            for (id, account_id, flow_date, currency, created_at_utc, ciphertext) in
+                &encrypted_cash_flows
+            {
+                tx.execute(
+                    "INSERT INTO cash_flows
+                        (id, account_id, flow_date, currency, created_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id,
+                        account_id,
+                        flow_date,
+                        currency,
+                        created_at_utc,
+                        ciphertext
+                    ],
+                )?;
+            }
+            for (id, symbol, updated_at_utc, ciphertext) in &encrypted_watchlist {
+                tx.execute(
+                    "INSERT INTO watchlist_items
+                        (id, symbol, updated_at_utc, ciphertext)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, symbol, updated_at_utc, ciphertext],
                 )?;
             }
             tx.commit()?;
@@ -2048,12 +2430,7 @@ impl EncryptedVaultDb {
 
         if let Err(error) = swap_result {
             remove_sqlite_files(&staging_path);
-            let _ = fs::remove_file(&intent_path);
-            if let Ok(reopened) = Connection::open(&self.db_path) {
-                let _ = configure_connection(&reopened);
-                self.conn = reopened;
-            }
-            return Err(error);
+            return Err(self.try_reopen_original_after_rollback(error, &intent_path));
         }
 
         // Synchronize OS keyring Ed25519 signing seed AFTER DB file switch succeeds.
@@ -2064,14 +2441,15 @@ impl EncryptedVaultDb {
             Ok(prev) => prev,
             Err(error) => {
                 remove_sqlite_files(&self.db_path);
-                let _ = fs::rename(&backup_path, &self.db_path);
+                let rename_res = fs::rename(&backup_path, &self.db_path);
                 remove_sqlite_files(&staging_path);
-                let _ = fs::remove_file(&intent_path);
-                if let Ok(reopened) = Connection::open(&self.db_path) {
-                    let _ = configure_connection(&reopened);
-                    self.conn = reopened;
+                if let Err(rename_err) = rename_res {
+                    return Err(StorageError::RollbackLockRequired(format!(
+                        "restore keyring update failed ({error}); rollback rename failed ({rename_err})"
+                    )));
                 }
-                return Err(StorageError::Vault(error));
+                return Err(self
+                    .try_reopen_original_after_rollback(StorageError::Vault(error), &intent_path));
             }
         };
 
@@ -2093,15 +2471,20 @@ impl EncryptedVaultDb {
         })();
 
         if let Err(error) = verify_reopened {
-            let _ = self.keys.restore_signing_seed(key_store, previous_seed);
+            let seed_res = self.keys.restore_signing_seed(key_store, previous_seed);
             remove_sqlite_files(&self.db_path);
-            let _ = fs::rename(&backup_path, &self.db_path);
-            let _ = fs::remove_file(&intent_path);
-            if let Ok(reopened) = Connection::open(&self.db_path) {
-                let _ = configure_connection(&reopened);
-                self.conn = reopened;
+            let rename_res = fs::rename(&backup_path, &self.db_path);
+            if let Err(seed_err) = seed_res {
+                return Err(StorageError::RollbackLockRequired(format!(
+                    "restore verification failed ({error}); rollback signing seed restore failed ({seed_err})"
+                )));
             }
-            return Err(error);
+            if let Err(rename_err) = rename_res {
+                return Err(StorageError::RollbackLockRequired(format!(
+                    "restore verification failed ({error}); rollback rename failed ({rename_err})"
+                )));
+            }
+            return Err(self.try_reopen_original_after_rollback(error, &intent_path));
         }
 
         // Clean up backup and crash-recovery intent once both DB and keyring are live & verified.
@@ -2121,9 +2504,44 @@ impl EncryptedVaultDb {
             account_count: encrypted_accounts.len(),
             nav_snapshot_count: encrypted_nav_snapshots.len(),
             benchmark_count: encrypted_benchmarks.len(),
+            cash_flow_count: encrypted_cash_flows.len(),
+            watchlist_count: encrypted_watchlist.len(),
             signer_public_key: verified_journal.signer_public_key_hex(),
         };
         Ok((verified_journal, summary))
+    }
+
+    /// Reopen and cryptographically verify the original database file after a failed
+    /// `.fhvault` restore rollback. If reopening or canary verification fails, preserves
+    /// the `.restore-intent` recovery file and returns `StorageError::RollbackLockRequired`
+    /// so `VaultRuntimeState` switches fail-closed to `ErrorLocked` instead of leaving an
+    /// empty in-memory placeholder connection inside `Unlocked`.
+    fn try_reopen_original_after_rollback(
+        &mut self,
+        cause: StorageError,
+        intent_path: &Path,
+    ) -> StorageError {
+        let reopened = Connection::open(&self.db_path).and_then(|conn| {
+            configure_connection(&conn)?;
+            Ok(conn)
+        });
+        match reopened {
+            Ok(conn) => {
+                if let Err(verify_err) =
+                    verify_connection_schema_and_canary(&conn, self.keys.db_master_key())
+                {
+                    return StorageError::RollbackLockRequired(format!(
+                        "restore failed ({cause}); rolled-back vault failed canary check ({verify_err})"
+                    ));
+                }
+                self.conn = conn;
+                let _ = fs::remove_file(intent_path);
+                cause
+            }
+            Err(reopen_err) => StorageError::RollbackLockRequired(format!(
+                "restore failed ({cause}); unable to reopen original vault ({reopen_err})"
+            )),
+        }
     }
 
     /// Clear all workspace records inside one atomic transaction while keeping
@@ -2138,6 +2556,8 @@ impl EncryptedVaultDb {
         tx.execute("DELETE FROM accounts", [])?;
         tx.execute("DELETE FROM nav_snapshots", [])?;
         tx.execute("DELETE FROM benchmark_history", [])?;
+        tx.execute("DELETE FROM cash_flows", [])?;
+        tx.execute("DELETE FROM watchlist_items", [])?;
         tx.commit()?;
         self.ensure_default_account_if_missing()?;
         Ok(())
@@ -2337,6 +2757,194 @@ fn validate_and_normalize_benchmark_series(
     })
 }
 
+fn validate_and_normalize_cash_flow(
+    record: &StoredCashFlow,
+) -> Result<StoredCashFlow, StorageError> {
+    let id = record.id.trim().to_string();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(
+            "cash flow id must be 1..=64 ASCII alphanumeric/underscore/dash characters".to_string(),
+        ));
+    }
+    let account_id = if record.account_id.trim().is_empty() {
+        DEFAULT_ACCOUNT_ID.to_string()
+    } else {
+        record.account_id.trim().to_string()
+    };
+    if account_id.len() > 64
+        || !account_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(
+            "invalid cash flow account_id".to_string(),
+        ));
+    }
+    let flow_type = record.flow_type.trim().to_ascii_lowercase();
+    if !matches!(
+        flow_type.as_str(),
+        "dividend" | "deposit" | "withdrawal" | "fee"
+    ) {
+        return Err(StorageError::InvalidInput(format!(
+            "unsupported cash flow type '{}': expected dividend|deposit|withdrawal|fee",
+            record.flow_type
+        )));
+    }
+    let symbol = match record.symbol.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            let sym = raw.to_ascii_uppercase();
+            if sym.len() > 16
+                || !sym.as_bytes()[0].is_ascii_alphanumeric()
+                || !sym.bytes().all(|b| {
+                    b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')
+                })
+            {
+                return Err(StorageError::InvalidInput(format!(
+                    "invalid cash flow symbol '{raw}'"
+                )));
+            }
+            Some(sym)
+        }
+        _ => None,
+    };
+    let currency = record.currency.trim().to_ascii_uppercase();
+    if currency.len() < 3
+        || currency.len() > 5
+        || currency == "MULTI"
+        || !currency.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid cash flow currency '{}': single currency required",
+            record.currency
+        )));
+    }
+    if record.amount_micros <= 0 {
+        return Err(StorageError::InvalidInput(
+            "cash flow amount must be strictly positive".to_string(),
+        ));
+    }
+    let flow_date = record.flow_date.trim().to_string();
+    if flow_date.len() != 10 || NaiveDate::parse_from_str(&flow_date, "%Y-%m-%d").is_err() {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid cash flow date '{}': expected YYYY-MM-DD",
+            record.flow_date
+        )));
+    }
+    let note: String = record
+        .note
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let created_at = if record.created_at.trim().is_empty() {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    } else {
+        record.created_at.trim().to_string()
+    };
+
+    Ok(StoredCashFlow {
+        id,
+        account_id,
+        flow_type,
+        symbol,
+        currency,
+        amount_micros: record.amount_micros,
+        flow_date,
+        note,
+        created_at,
+    })
+}
+
+fn validate_and_normalize_watchlist_item(
+    item: &StoredWatchlistItem,
+) -> Result<StoredWatchlistItem, StorageError> {
+    let id = item.id.trim().to_string();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(
+            "watchlist id must be 1..=64 ASCII alphanumeric/underscore/dash characters".to_string(),
+        ));
+    }
+    let symbol = item.symbol.trim().to_ascii_uppercase();
+    if symbol.is_empty()
+        || symbol.len() > 16
+        || !symbol.as_bytes()[0].is_ascii_alphanumeric()
+        || !symbol
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid watchlist symbol '{}'",
+            item.symbol
+        )));
+    }
+    let currency = item.currency.trim().to_ascii_uppercase();
+    if currency.len() < 3
+        || currency.len() > 5
+        || currency == "MULTI"
+        || !currency.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "invalid watchlist currency '{}'",
+            item.currency
+        )));
+    }
+    if let Some(buy) = item.target_buy_micros {
+        if buy <= 0 {
+            return Err(StorageError::InvalidInput(
+                "target buy price must be strictly positive".to_string(),
+            ));
+        }
+    }
+    if let Some(sell) = item.target_sell_micros {
+        if sell <= 0 {
+            return Err(StorageError::InvalidInput(
+                "target sell price must be strictly positive".to_string(),
+            ));
+        }
+    }
+    if let (Some(buy), Some(sell)) = (item.target_buy_micros, item.target_sell_micros) {
+        if buy >= sell {
+            return Err(StorageError::InvalidInput(
+                "target buy price must be lower than target sell price".to_string(),
+            ));
+        }
+    }
+    let note: String = item
+        .note
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let updated_at = if item.updated_at.trim().is_empty() {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    } else {
+        item.updated_at.trim().to_string()
+    };
+
+    Ok(StoredWatchlistItem {
+        id,
+        symbol,
+        currency,
+        target_buy_micros: item.target_buy_micros,
+        target_sell_micros: item.target_sell_micros,
+        note,
+        enabled: item.enabled,
+        updated_at,
+    })
+}
+
 fn ensure_wave2_tables_on_conn(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS accounts (
@@ -2360,6 +2968,22 @@ fn ensure_wave2_tables_on_conn(conn: &Connection) -> Result<(), StorageError> {
             symbol TEXT PRIMARY KEY,
             currency TEXT NOT NULL,
             provider TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cash_flows (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            flow_date TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_flows_account_date
+            ON cash_flows (account_id, flow_date DESC);
+        CREATE TABLE IF NOT EXISTS watchlist_items (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL UNIQUE,
             updated_at_utc TEXT NOT NULL,
             ciphertext BLOB NOT NULL
         );",
@@ -2428,6 +3052,22 @@ fn initialize_schema_on_conn(
             symbol TEXT PRIMARY KEY,
             currency TEXT NOT NULL,
             provider TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cash_flows (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            flow_date TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            ciphertext BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_flows_account_date
+            ON cash_flows (account_id, flow_date DESC);
+        CREATE TABLE IF NOT EXISTS watchlist_items (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL UNIQUE,
             updated_at_utc TEXT NOT NULL,
             ciphertext BLOB NOT NULL
         );",
@@ -3575,5 +4215,166 @@ mod tests {
         assert_eq!(accounts_after_clear[0].id, DEFAULT_ACCOUNT_ID);
 
         cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn v020_encrypts_cash_flows_and_watchlist_with_aad_fhvault_backup_and_cascade_delete() {
+        let src_path = unique_temp_db("v020-src");
+        let dst_path = unique_temp_db("v020-dst");
+        let src_store = InMemoryKeyStore::new();
+        let dst_store = InMemoryKeyStore::new();
+
+        let mut db = EncryptedVaultDb::open(&src_path, &src_store, "in-memory-test").expect("open");
+
+        db.upsert_account(&StoredAccount {
+            id: "acct_futu".to_string(),
+            name: "Futu HK".to_string(),
+            broker: "Futu".to_string(),
+            account_type: "taxable".to_string(),
+            base_currency: "HKD".to_string(),
+            created_at: "2026-11-23T01:00:00.000Z".to_string(),
+        })
+        .expect("create acct_futu");
+
+        // Reject invalid inputs (non-positive amount, MULTI currency, buy >= sell)
+        assert!(db
+            .upsert_cash_flow(&StoredCashFlow {
+                id: "cf_bad_zero".into(),
+                account_id: DEFAULT_ACCOUNT_ID.into(),
+                flow_type: "dividend".into(),
+                symbol: Some("AAPL".into()),
+                currency: "USD".into(),
+                amount_micros: 0,
+                flow_date: "2026-11-23".into(),
+                note: String::new(),
+                created_at: String::new(),
+            })
+            .is_err());
+        assert!(db
+            .upsert_watchlist_item(&StoredWatchlistItem {
+                id: "wl_bad_order".into(),
+                symbol: "AAPL".into(),
+                currency: "USD".into(),
+                target_buy_micros: Some(250_000_000),
+                target_sell_micros: Some(200_000_000),
+                note: String::new(),
+                enabled: true,
+                updated_at: String::new(),
+            })
+            .is_err());
+
+        // Persist valid encrypted cash flows and watchlist items
+        let cf_usd = db
+            .upsert_cash_flow(&StoredCashFlow {
+                id: "cf_div_aapl".into(),
+                account_id: DEFAULT_ACCOUNT_ID.into(),
+                flow_type: "dividend".into(),
+                symbol: Some("aapl".into()),
+                currency: "usd".into(),
+                amount_micros: 125_500_000,
+                flow_date: "2026-11-20".into(),
+                note: "Q4-DIV-SECRET-NOTE".into(),
+                created_at: "2026-11-20T12:00:00.000Z".into(),
+            })
+            .expect("cf usd");
+        assert_eq!(cf_usd.symbol.as_deref(), Some("AAPL"));
+        assert_eq!(cf_usd.currency, "USD");
+
+        db.upsert_cash_flow(&StoredCashFlow {
+            id: "cf_div_hk".into(),
+            account_id: "acct_futu".into(),
+            flow_type: "deposit".into(),
+            symbol: None,
+            currency: "HKD".into(),
+            amount_micros: 50_000_000_000,
+            flow_date: "2026-11-21".into(),
+            note: "HKD-DEPOSIT-NOTE".into(),
+            created_at: "2026-11-21T12:00:00.000Z".into(),
+        })
+        .expect("cf hkd");
+
+        let wl_aapl = db
+            .upsert_watchlist_item(&StoredWatchlistItem {
+                id: "wl_aapl".into(),
+                symbol: "aapl".into(),
+                currency: "usd".into(),
+                target_buy_micros: Some(210_000_000),
+                target_sell_micros: Some(260_000_000),
+                note: "WATCH-SECRET-NOTE".into(),
+                enabled: true,
+                updated_at: "2026-11-23T02:00:00.000Z".into(),
+            })
+            .expect("wl aapl");
+        assert_eq!(wl_aapl.symbol, "AAPL");
+
+        db.upsert_watchlist_item(&StoredWatchlistItem {
+            id: "wl_hk".into(),
+            symbol: "00700.HK".into(),
+            currency: "HKD".into(),
+            target_buy_micros: Some(360_000_000),
+            target_sell_micros: None,
+            note: "TENCENT-TARGET".into(),
+            enabled: true,
+            updated_at: "2026-11-23T02:05:00.000Z".into(),
+        })
+        .expect("wl hk");
+
+        // Flush WAL and verify ZERO plaintext strings exist on disk
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
+        let raw_db = fs::read(&src_path).expect("read sqlite");
+        let raw_lossy = String::from_utf8_lossy(&raw_db);
+        assert!(!raw_lossy.contains("Q4-DIV-SECRET-NOTE"));
+        assert!(!raw_lossy.contains("WATCH-SECRET-NOTE"));
+        assert!(!raw_lossy.contains("125500000"));
+
+        // .fhvault backup payload roundtrip restores both cash_flows and watchlist_items
+        let backup = db.export_backup_payload().expect("export");
+        assert_eq!(backup.cash_flows.len(), 2);
+        assert_eq!(backup.watchlist_items.len(), 2);
+
+        let mut dst_db =
+            EncryptedVaultDb::open(&dst_path, &dst_store, "in-memory-test").expect("open dst");
+        let (_, summary) = dst_db
+            .restore_from_backup_payload(backup, &dst_store)
+            .expect("restore");
+        assert_eq!(summary.cash_flow_count, 2);
+        assert_eq!(summary.watchlist_count, 2);
+        assert_eq!(dst_db.load_all_cash_flows().expect("cfs").len(), 2);
+        assert_eq!(dst_db.list_watchlist_items().expect("wls").len(), 2);
+
+        // Cross-row AAD swap on cash_flows MUST fail decryption fail-closed
+        let swapped_blob: Vec<u8> = dst_db
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM cash_flows WHERE id = 'cf_div_hk'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("blob");
+        dst_db
+            .conn
+            .execute(
+                "UPDATE cash_flows SET ciphertext = ?1 WHERE id = 'cf_div_aapl'",
+                params![swapped_blob],
+            )
+            .expect("swap");
+        assert!(dst_db.load_all_cash_flows().is_err());
+
+        // Account deletion cascades cash_flows for acct_futu while preserving acct_default & watchlist
+        assert!(db.delete_account("acct_futu").expect("delete acct_futu"));
+        let remaining_cfs = db.load_all_cash_flows().expect("remaining cfs");
+        assert_eq!(remaining_cfs.len(), 1);
+        assert_eq!(remaining_cfs[0].id, "cf_div_aapl");
+        assert_eq!(db.list_watchlist_items().expect("wls kept").len(), 2);
+
+        // clear_all_workspace_data clears both cash_flows and watchlist_items
+        db.clear_all_workspace_data().expect("clear all");
+        assert!(db.load_all_cash_flows().expect("cfs empty").is_empty());
+        assert!(db.list_watchlist_items().expect("wls empty").is_empty());
+
+        cleanup_temp_db(&src_path);
+        cleanup_temp_db(&dst_path);
     }
 }

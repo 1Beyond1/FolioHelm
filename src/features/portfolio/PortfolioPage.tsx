@@ -8,7 +8,21 @@ import {
   ALL_ACCOUNTS_ID,
   DEFAULT_ACCOUNT_ID,
 } from "../../domain/accounts";
+import {
+  CASH_FLOW_STORE,
+  CASH_FLOW_TYPES,
+  cashFlowSignedDecimal,
+  computePnlAttribution,
+  summarizeCashFlowsForBucket,
+  type CashFlowType,
+} from "../../domain/cashFlows";
 import { MOCK_BROKER } from "../../domain/mockBroker";
+import {
+  buildPortfolioReportInputFromStores,
+  generatePortfolioCsvReport,
+  generatePortfolioMarkdownReport,
+} from "../../domain/portfolioReport";
+import { saveReportWithDialogOrBlob } from "../../domain/publicQuotes";
 import {
   aggregateNavSnapshotsByCurrency,
   decimalToMicros,
@@ -479,10 +493,12 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     const unsubBroker = MOCK_BROKER.subscribe(bump);
     const unsubAccounts = ACCOUNT_STORE.subscribe(bump);
     const unsubNav = NAV_STORE.subscribe(bump);
+    const unsubCashFlows = CASH_FLOW_STORE.subscribe(bump);
     return () => {
       unsubBroker();
       unsubAccounts();
       unsubNav();
+      unsubCashFlows();
     };
   }, []);
 
@@ -537,6 +553,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const [cfAmount, setCfAmount] = useState<string>("");
   const [cfNotice, setCfNotice] = useState<string | null>(null);
   const navRevision = NAV_STORE.getRevision();
+  const cashFlowRevision = CASH_FLOW_STORE.getRevision();
   const localNavSnapshots = useMemo(() => {
     if (!isLocalMode) return [];
     try {
@@ -546,6 +563,40 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLocalMode, activeBucket.currency, selectedAccountId, navRevision]);
+
+  // v0.2.0: Cash-flow & dividend ledger + per-symbol P&L attribution state
+  const [ledgerAccountId, setLedgerAccountId] = useState<string>(DEFAULT_ACCOUNT_ID);
+  const [ledgerFlowType, setLedgerFlowType] = useState<CashFlowType>("dividend");
+  const [ledgerSymbol, setLedgerSymbol] = useState<string>("");
+  const [ledgerCurrency, setLedgerCurrency] = useState<string>("");
+  const [ledgerAmount, setLedgerAmount] = useState<string>("");
+  const [ledgerDate, setLedgerDate] = useState<string>(() => todayUtcIsoDate());
+  const [ledgerNote, setLedgerNote] = useState<string>("");
+  const [ledgerBusy, setLedgerBusy] = useState<boolean>(false);
+  const [ledgerError, setLedgerError] = useState<string | null>(null);
+  const [ledgerStatus, setLedgerStatus] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState<boolean>(false);
+  const [reportFeedback, setReportFeedback] = useState<string | null>(null);
+
+  const allCashFlows = useMemo(
+    () => CASH_FLOW_STORE.getAll(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [cashFlowRevision],
+  );
+  const bucketCashFlows = useMemo(
+    () => CASH_FLOW_STORE.getFiltered(selectedAccountId, activeBucket.currency),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedAccountId, activeBucket.currency, cashFlowRevision],
+  );
+  const bucketCashFlowSummary = useMemo(
+    () => summarizeCashFlowsForBucket(allCashFlows, activeBucket.currency, selectedAccountId),
+    [allCashFlows, activeBucket.currency, selectedAccountId],
+  );
+  const pnlAttribution = useMemo(
+    () => computePnlAttribution(snapshot.holdings, allCashFlows, activeBucket.currency, language, selectedAccountId),
+    [snapshot.holdings, allCashFlows, activeBucket.currency, language, selectedAccountId],
+  );
+  const effectiveLedgerCurrency = ledgerCurrency || activeBucket.currency;
 
   // CSV import modal + F2 target account selector state
   const [importOpen, setImportOpen] = useState(false);
@@ -563,6 +614,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const [newAcctCurrency, setNewAcctCurrency] = useState("USD");
   const [newAcctError, setNewAcctError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const benchmarkReqSeqRef = useRef(0);
+  const csvPreviewSeqRef = useRef(0);
 
   // C4 + F2: Rebalance state scoped strictly to the active currency bucket (zero cross-currency FX)
   const rebalanceHoldings: readonly RebalanceHoldingInput[] = activeBucket.holdings;
@@ -770,6 +823,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   function handleSelectAccount(nextAccountId: string) {
+    benchmarkReqSeqRef.current += 1;
+    setBenchmarkLoading(false);
     ACCOUNT_STORE.setSelectedAccountId(nextAccountId);
     MOCK_BROKER.setSelectedAccountId(nextAccountId);
     setSelectedBenchmark(null);
@@ -777,6 +832,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   function handleSelectBucketCurrency(nextCurrency: string) {
+    benchmarkReqSeqRef.current += 1;
+    setBenchmarkLoading(false);
     setSelectedBucketCurrency(nextCurrency);
     setSelectedBenchmark(null);
     setBenchmarkNotice(null);
@@ -784,6 +841,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
 
   async function handleRefreshPortfolioBenchmark(symbol: string) {
     const epoch = getCurrentLockEpoch();
+    const reqSeq = ++benchmarkReqSeqRef.current;
     if (!MOCK_BROKER.isPublicQuotesEnabled()) {
       setBenchmarkNotice(
         chinese
@@ -796,9 +854,9 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     setBenchmarkNotice(null);
     try {
       const prefs = await loadWorkspacePreferences();
-      if (!isCurrentLockEpoch(epoch)) return;
+      if (!isCurrentLockEpoch(epoch) || benchmarkReqSeqRef.current !== reqSeq) return;
       const outcome = await NAV_STORE.syncBenchmarkHistory(symbol, prefs.quoteProvider);
-      if (!isCurrentLockEpoch(epoch)) return;
+      if (!isCurrentLockEpoch(epoch) || benchmarkReqSeqRef.current !== reqSeq) return;
       if (outcome.degradedReason) {
         setBenchmarkNotice(
           outcome.series
@@ -811,10 +869,10 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
         );
       }
     } catch (error) {
-      if (!isCurrentLockEpoch(epoch)) return;
+      if (!isCurrentLockEpoch(epoch) || benchmarkReqSeqRef.current !== reqSeq) return;
       setBenchmarkNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      if (isCurrentLockEpoch(epoch)) {
+      if (isCurrentLockEpoch(epoch) && benchmarkReqSeqRef.current === reqSeq) {
         setBenchmarkLoading(false);
       }
     }
@@ -861,6 +919,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   function resetImportModal() {
+    csvPreviewSeqRef.current += 1;
     setImportOpen(false);
     setPendingRawCsv("");
     setPendingFileName("");
@@ -872,6 +931,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function processCsvText(rawText: string, fileName: string, acctIdOverride?: string) {
+    const epoch = getCurrentLockEpoch();
+    const reqSeq = ++csvPreviewSeqRef.current;
     setCsvError(null);
     setCsvPreview(null);
     setPendingRawCsv(rawText);
@@ -880,8 +941,10 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     const targetAcct = ACCOUNT_STORE.getAccount(resolvedAcctId);
     try {
       const preview = await previewBrokerCsv(rawText, fileName, resolvedAcctId, targetAcct?.name);
+      if (!isCurrentLockEpoch(epoch) || csvPreviewSeqRef.current !== reqSeq) return;
       setCsvPreview(preview);
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch) || csvPreviewSeqRef.current !== reqSeq) return;
       setCsvError(error instanceof Error ? error.message : String(error));
     }
   }
@@ -914,13 +977,16 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function handleChooseCsvFile() {
+    const epoch = getCurrentLockEpoch();
     if (isTauriRuntime()) {
       try {
         const opened = await invokeDialogOpenCsvFile();
+        if (!isCurrentLockEpoch(epoch)) return;
         if (!opened) return;
         await processCsvText(opened.content, opened.fileName);
         return;
       } catch (error) {
+        if (!isCurrentLockEpoch(epoch)) return;
         setCsvError(error instanceof Error ? error.message : String(error));
         return;
       }
@@ -929,6 +995,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const epoch = getCurrentLockEpoch();
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
@@ -937,6 +1004,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       return;
     }
     const text = await file.text();
+    if (!isCurrentLockEpoch(epoch)) return;
     await processCsvText(text, file.name);
   }
 
@@ -971,9 +1039,12 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   }
 
   async function handleClearLocalPortfolio() {
+    const epoch = getCurrentLockEpoch();
     await clearPersistedLocalPortfolio();
+    if (!isCurrentLockEpoch(epoch)) return;
     MOCK_BROKER.clearLocalPortfolio();
     await saveWorkspacePreferences({ workspaceMode: "mock" });
+    if (!isCurrentLockEpoch(epoch)) return;
     setImportFeedback(null);
   }
 
@@ -984,6 +1055,125 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     }
     MOCK_BROKER.setWorkspaceMode(nextMode);
     void saveWorkspacePreferences({ workspaceMode: nextMode });
+  }
+
+  async function handleAddCashFlow() {
+    const epoch = getCurrentLockEpoch();
+    setLedgerError(null);
+    setLedgerStatus(null);
+    const targetAcct = selectedAccountId !== ALL_ACCOUNTS_ID ? selectedAccountId : ledgerAccountId;
+    const currencyToUse = (effectiveLedgerCurrency || activeBucketCurrency || "USD").toUpperCase();
+    setLedgerBusy(true);
+    try {
+      const saved = await CASH_FLOW_STORE.upsert({
+        accountId: targetAcct,
+        flowType: ledgerFlowType,
+        symbol: ledgerSymbol.trim() || null,
+        currency: currencyToUse,
+        amountDecimal: ledgerAmount,
+        flowDate: ledgerDate,
+        note: ledgerNote,
+      });
+      if (!isCurrentLockEpoch(epoch)) return;
+      setLedgerAmount("");
+      setLedgerSymbol("");
+      setLedgerNote("");
+      setLedgerStatus(
+        chinese
+          ? `已加密记录 ${saved.flowDate} · ${saved.currency} 现金流条目并写入 Ed25519 证据链。`
+          : `Encrypted ${saved.flowDate} (${saved.currency}) cash-flow entry saved & logged to Ed25519 evidence.`,
+      );
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setLedgerError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (isCurrentLockEpoch(epoch)) {
+        setLedgerBusy(false);
+      }
+    }
+  }
+
+  async function handleDeleteCashFlow(id: string) {
+    const epoch = getCurrentLockEpoch();
+    setLedgerError(null);
+    try {
+      const removed = await CASH_FLOW_STORE.remove(id);
+      if (!isCurrentLockEpoch(epoch)) return;
+      if (removed) {
+        setLedgerStatus(
+          chinese ? "已删除现金流条目并记录证据日志。" : "Cash-flow entry deleted and logged.",
+        );
+      }
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setLedgerError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleExportPortfolioReport(format: "md" | "csv") {
+    if (reportBusy) return;
+    const epoch = getCurrentLockEpoch();
+    setReportBusy(true);
+    setReportFeedback(null);
+    try {
+      const reportInput = buildPortfolioReportInputFromStores(language, selectedAccountId);
+      const serialized = format === "md"
+        ? generatePortfolioMarkdownReport(reportInput)
+        : generatePortfolioCsvReport(reportInput);
+      const dateStamp = todayUtcIsoDate();
+      const defaultName = `foliohelm-review-${dateStamp}.${format}`;
+      const outcome = await saveReportWithDialogOrBlob(defaultName, serialized, format);
+      if (!isCurrentLockEpoch(epoch)) return;
+      if (outcome.kind === "native-saved") {
+        setReportFeedback(
+          chinese
+            ? `已导出脱敏复盘报告至 ${outcome.path}`
+            : `Sanitized review report saved to ${outcome.path}`,
+        );
+      } else if (outcome.kind === "browser-download") {
+        setReportFeedback(
+          chinese
+            ? `已生成脱敏 ${format.toUpperCase()} 复盘报告（${defaultName}）。`
+            : `Generated sanitized ${format.toUpperCase()} review report (${defaultName}).`,
+        );
+      }
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setReportFeedback(
+        chinese
+          ? `导出报告失败：${error instanceof Error ? error.message : String(error)}`
+          : `Report export failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      if (isCurrentLockEpoch(epoch)) {
+        setReportBusy(false);
+      }
+    }
+  }
+
+  function flowTypeBadgeLabel(type: CashFlowType): string {
+    if (chinese) {
+      switch (type) {
+        case "dividend":
+          return "股息分红";
+        case "deposit":
+          return "资金入金";
+        case "withdrawal":
+          return "资金出金";
+        case "fee":
+          return "费用/税费";
+      }
+    }
+    switch (type) {
+      case "dividend":
+        return "Dividend";
+      case "deposit":
+        return "Deposit";
+      case "withdrawal":
+        return "Withdrawal";
+      case "fee":
+        return "Fee / Tax";
+    }
   }
 
   return (
@@ -1036,6 +1226,26 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             </label>
           )}
           <div className="fh-portfolio-actions">
+            <div className="fh-report-export-group" role="group" aria-label={chinese ? "导出复盘报告" : "Export review report"}>
+              <button
+                type="button"
+                className="fh-rebalance-util-btn"
+                data-testid="export-report-md"
+                disabled={reportBusy}
+                onClick={() => void handleExportPortfolioReport("md")}
+              >
+                {chinese ? "导出 Markdown 复盘" : "Export Markdown"}
+              </button>
+              <button
+                type="button"
+                className="fh-rebalance-util-btn"
+                data-testid="export-report-csv"
+                disabled={reportBusy}
+                onClick={() => void handleExportPortfolioReport("csv")}
+              >
+                {chinese ? "导出 CSV 报表" : "Export CSV"}
+              </button>
+            </div>
             <button
               type="button"
               className="fh-import-csv-button"
@@ -1058,6 +1268,13 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
           </div>
         </div>
       </header>
+
+      {reportFeedback && (
+        <section className="fh-import-feedback" role="status" data-testid="report-export-feedback">
+          <span>{reportFeedback}</span>
+          <button type="button" onClick={() => setReportFeedback(null)}>×</button>
+        </section>
+      )}
 
       {importFeedback && (
         <section className="fh-import-feedback" role="status" data-testid="csv-import-feedback">
@@ -1248,6 +1465,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                 benchmarkLoading={benchmarkLoading}
                 benchmarkNotice={benchmarkNotice}
                 onSelectBenchmark={(sym) => {
+                  benchmarkReqSeqRef.current += 1;
+                  setBenchmarkLoading(false);
                   setSelectedBenchmark(sym);
                   setBenchmarkNotice(null);
                 }}
@@ -1719,6 +1938,327 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             )}
           </div>
         )}
+      </section>
+
+      <section
+        className="fh-panel fh-attribution-panel"
+        data-testid="pnl-attribution-panel"
+        aria-labelledby="fh-attribution-title"
+      >
+        <div className="fh-panel-heading fh-holdings-heading">
+          <div>
+            <p className="fh-eyebrow">{chinese ? "按标的盈亏归因 · 纯 Decimal 精度" : "P&L attribution · Exact Decimal"}</p>
+            <h2 id="fh-attribution-title">
+              {chinese ? `按标的盈亏贡献榜 (${activeBucketCurrency})` : `P&L attribution by symbol (${activeBucketCurrency})`}
+            </h2>
+            <p>
+              {chinese
+                ? "汇总当前币种桶内各标的未实现盈亏与已登记股息分红，按总贡献从高到低排序（严格隔离币种，绝不跨币种混算）。"
+                : "Ranks holdings inside this currency bucket by unrealized P&L plus recorded dividends (strict currency isolation)."}
+            </p>
+          </div>
+          <div className="fh-attribution-totals" data-testid="pnl-attribution-totals">
+            <span>
+              {chinese ? "未实现盈亏" : "Unrealized"}:{" "}
+              <strong className={decimalToNumber(pnlAttribution.totalUnrealizedPnl) < 0 ? "fh-negative" : "fh-positive"}>
+                {formatMoney(decimalToNumber(pnlAttribution.totalUnrealizedPnl), language, true, activeBucketCurrency)}
+              </strong>
+            </span>
+            <span>
+              {chinese ? "累计分红" : "Dividends"}:{" "}
+              <strong className="fh-positive">
+                {formatMoney(decimalToNumber(pnlAttribution.totalDividends), language, true, activeBucketCurrency)}
+              </strong>
+            </span>
+            <span>
+              {chinese ? "综合贡献" : "Combined"}:{" "}
+              <strong className={decimalToNumber(pnlAttribution.combinedContribution) < 0 ? "fh-negative" : "fh-positive"}>
+                {formatMoney(decimalToNumber(pnlAttribution.combinedContribution), language, true, activeBucketCurrency)}
+              </strong>
+            </span>
+          </div>
+        </div>
+
+        {pnlAttribution.entries.length === 0 ? (
+          <p className="fh-ledger-empty" data-testid="pnl-attribution-empty">
+            {chinese
+              ? `当前 ${activeBucketCurrency} 币种桶暂无持仓可归因。`
+              : `No holdings in the ${activeBucketCurrency} bucket to attribute yet.`}
+          </p>
+        ) : (
+          <div className="fh-attribution-list" data-testid="pnl-attribution-list">
+            {pnlAttribution.entries.map((entry) => {
+              const contribNum = decimalToNumber(entry.totalContribution);
+              const unrealizedNum = decimalToNumber(entry.unrealizedPnl);
+              const divNum = decimalToNumber(entry.dividendsReceived);
+              const rocNum = decimalToNumber(entry.returnOnCostPct);
+              const widthPct = Math.max(4, Math.min(100, decimalToNumber(entry.barScalePct)));
+              return (
+                <div
+                  key={`${entry.symbol}:${entry.currency}`}
+                  className="fh-attribution-row"
+                  data-testid={`pnl-attribution-row-${entry.symbol}`}
+                >
+                  <button
+                    type="button"
+                    className="fh-attribution-symbol"
+                    onClick={() => onOpenInstrument(entry.symbol)}
+                  >
+                    <strong>{entry.symbol}</strong>
+                    <small title={entry.company}>{entry.company} · {entry.currency}</small>
+                  </button>
+                  <div className="fh-attribution-bar-track" aria-hidden="true">
+                    <div
+                      className={`fh-attribution-bar-fill ${contribNum < 0 ? "is-negative" : "is-positive"}`}
+                      style={{ width: `${widthPct}%` }}
+                    />
+                  </div>
+                  <div className="fh-attribution-metrics">
+                    <strong className={contribNum < 0 ? "fh-negative" : "fh-positive"}>
+                      {formatMoney(contribNum, language, true, entry.currency)}
+                    </strong>
+                    <small>
+                      {chinese ? "价差" : "Price"}: {formatMoney(unrealizedNum, language, true, entry.currency)}
+                      {divNum > 0
+                        ? ` · ${chinese ? "分红" : "Div"}: ${formatMoney(divNum, language, true, entry.currency)}`
+                        : ""}
+                      {" · "}
+                      {formatPercent(rocNum, language, true)}
+                    </small>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section
+        className="fh-panel fh-ledger-panel"
+        data-testid="cash-flow-ledger-panel"
+        aria-labelledby="fh-ledger-title"
+      >
+        <div className="fh-panel-heading fh-holdings-heading">
+          <div>
+            <p className="fh-eyebrow">{chinese ? "加密台账 · AES-256-GCM + Ed25519" : "Encrypted ledger · AES-256-GCM + Ed25519"}</p>
+            <h2 id="fh-ledger-title">
+              {chinese ? `分红与现金流台账 (${activeBucketCurrency})` : `Cash-flow & dividend ledger (${activeBucketCurrency})`}
+            </h2>
+            <p>
+              {chinese
+                ? "记录股息分红、资金出入金与税费；数据经 AES-256-GCM 加密落盘、纳入 .fhvault 离线备份，并按账户/币种桶独立汇总。"
+                : "Track dividends, deposits, withdrawals, and fees encrypted in SQLite, included in .fhvault backups, and isolated per account & currency bucket."}
+            </p>
+          </div>
+          <span className="fh-holdings-count" data-testid="cash-flow-count">
+            {bucketCashFlowSummary.entryCount}
+          </span>
+        </div>
+
+        <div className="fh-ledger-summary-grid" data-testid="cash-flow-summary">
+          <article className="fh-ledger-metric">
+            <span>{chinese ? "累计股息分红" : "Cumulative dividends"}</span>
+            <strong className="fh-positive" data-testid="cash-flow-total-dividends">
+              {formatMoney(decimalToNumber(bucketCashFlowSummary.totalDividends), language, false, activeBucketCurrency)}
+            </strong>
+          </article>
+          <article className="fh-ledger-metric">
+            <span>{chinese ? "累计入金" : "Total deposits"}</span>
+            <strong data-testid="cash-flow-total-deposits">
+              {formatMoney(decimalToNumber(bucketCashFlowSummary.totalDeposits), language, false, activeBucketCurrency)}
+            </strong>
+          </article>
+          <article className="fh-ledger-metric">
+            <span>{chinese ? "累计出金" : "Total withdrawals"}</span>
+            <strong data-testid="cash-flow-total-withdrawals">
+              {formatMoney(decimalToNumber(bucketCashFlowSummary.totalWithdrawals), language, false, activeBucketCurrency)}
+            </strong>
+          </article>
+          <article className="fh-ledger-metric">
+            <span>{chinese ? "费用 / 税费" : "Fees & taxes"}</span>
+            <strong className={decimalToNumber(bucketCashFlowSummary.totalFees) > 0 ? "fh-negative" : ""} data-testid="cash-flow-total-fees">
+              {formatMoney(decimalToNumber(bucketCashFlowSummary.totalFees), language, false, activeBucketCurrency)}
+            </strong>
+          </article>
+          <article className="fh-ledger-metric">
+            <span>{chinese ? "净现金流变动" : "Net cash impact"}</span>
+            <strong
+              className={decimalToNumber(bucketCashFlowSummary.netCashImpact) < 0 ? "fh-negative" : "fh-positive"}
+              data-testid="cash-flow-net-impact"
+            >
+              {formatMoney(decimalToNumber(bucketCashFlowSummary.netCashImpact), language, true, activeBucketCurrency)}
+            </strong>
+          </article>
+        </div>
+
+        <form
+          className="fh-ledger-form"
+          data-testid="cash-flow-ledger-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleAddCashFlow();
+          }}
+        >
+          {selectedAccountId === ALL_ACCOUNTS_ID && (
+            <label>
+              <span>{chinese ? "账户" : "Account"}</span>
+              <select
+                data-testid="cash-flow-account"
+                value={ledgerAccountId}
+                onChange={(event) => setLedgerAccountId(event.target.value)}
+              >
+                {accounts.map((acct) => (
+                  <option key={acct.id} value={acct.id}>{acct.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label>
+            <span>{chinese ? "类型" : "Type"}</span>
+            <select
+              data-testid="cash-flow-type"
+              value={ledgerFlowType}
+              onChange={(event) => setLedgerFlowType(event.target.value as CashFlowType)}
+            >
+              {CASH_FLOW_TYPES.map((t) => (
+                <option key={t} value={t}>{flowTypeBadgeLabel(t)}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>{chinese ? "标的（可选）" : "Symbol (optional)"}</span>
+            <input
+              type="text"
+              data-testid="cash-flow-symbol"
+              placeholder="e.g. AAPL"
+              value={ledgerSymbol}
+              onChange={(event) => setLedgerSymbol(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>{chinese ? "币种" : "Currency"}</span>
+            <select
+              data-testid="cash-flow-currency"
+              value={effectiveLedgerCurrency}
+              onChange={(event) => setLedgerCurrency(event.target.value)}
+            >
+              {["USD", "HKD", "CNY", "EUR", "GBP", "SGD"].map((curr) => (
+                <option key={curr} value={curr}>{curr}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>{chinese ? "金额（正数）" : "Amount (positive)"}</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              data-testid="cash-flow-amount"
+              placeholder="e.g. 125.50"
+              value={ledgerAmount}
+              onChange={(event) => setLedgerAmount(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>{chinese ? "日期" : "Date"}</span>
+            <input
+              type="date"
+              data-testid="cash-flow-date"
+              value={ledgerDate}
+              onChange={(event) => setLedgerDate(event.target.value)}
+            />
+          </label>
+          <label className="fh-ledger-note-field">
+            <span>{chinese ? "备注（可选）" : "Note (optional)"}</span>
+            <input
+              type="text"
+              data-testid="cash-flow-note"
+              placeholder={chinese ? "如 Q4 季度分红" : "e.g. Q4 quarterly dividend"}
+              value={ledgerNote}
+              onChange={(event) => setLedgerNote(event.target.value)}
+            />
+          </label>
+          <button
+            type="submit"
+            className="fh-import-csv-button"
+            data-testid="cash-flow-submit"
+            disabled={ledgerBusy}
+          >
+            {ledgerBusy
+              ? (chinese ? "保存中…" : "Saving…")
+              : (chinese ? "录入台账" : "Record entry")}
+          </button>
+        </form>
+
+        {ledgerError && (
+          <p className="fh-csv-error fh-ledger-feedback" role="alert" data-testid="cash-flow-error">
+            {ledgerError}
+          </p>
+        )}
+        {ledgerStatus && (
+          <p className="fh-nav-cf-notice fh-ledger-feedback" role="status" data-testid="cash-flow-status">
+            {ledgerStatus}
+          </p>
+        )}
+
+        <div className="fh-table-scroll">
+          <table className="fh-holdings-table fh-ledger-table" data-testid="cash-flow-table">
+            <thead>
+              <tr>
+                <th scope="col">{chinese ? "日期" : "Date"}</th>
+                <th scope="col">{chinese ? "类型" : "Type"}</th>
+                <th scope="col">{chinese ? "标的" : "Symbol"}</th>
+                <th scope="col">{chinese ? "账户" : "Account"}</th>
+                <th scope="col" className="fh-number-cell">{chinese ? "金额" : "Amount"}</th>
+                <th scope="col">{chinese ? "备注" : "Note"}</th>
+                <th scope="col" className="fh-action-cell">{chinese ? "操作" : "Action"}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bucketCashFlows.map((cf) => {
+                const signedDec = cashFlowSignedDecimal(cf);
+                const signedNum = decimalToNumber(signedDec);
+                const acctName = accounts.find((a) => a.id === cf.accountId)?.name ?? cf.accountId;
+                return (
+                  <tr key={cf.id} data-testid={`cash-flow-row-${cf.id}`}>
+                    <td>{cf.flowDate}</td>
+                    <td>
+                      <span className={`fh-flow-badge fh-flow-badge--${cf.flowType}`}>
+                        {flowTypeBadgeLabel(cf.flowType)}
+                      </span>
+                    </td>
+                    <td>{cf.symbol ?? "—"}</td>
+                    <td>{acctName}</td>
+                    <td className={`fh-number-cell ${signedNum < 0 ? "fh-negative" : "fh-positive"}`}>
+                      {formatMoney(signedNum, language, true, cf.currency)}
+                    </td>
+                    <td className="fh-ledger-note-cell">{cf.note || "—"}</td>
+                    <td className="fh-action-cell">
+                      <button
+                        type="button"
+                        className="fh-rebalance-util-btn"
+                        data-testid={`cash-flow-delete-${cf.id}`}
+                        onClick={() => void handleDeleteCashFlow(cf.id)}
+                      >
+                        {chinese ? "删除" : "Delete"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {bucketCashFlows.length === 0 && (
+                <tr className="fh-empty-row">
+                  <td colSpan={7}>
+                    <p className="fh-ledger-empty" data-testid="cash-flow-empty">
+                      {chinese
+                        ? `当前 ${activeBucketCurrency} 币种桶尚无分红或出入金记录，可在上方表单快速录入。`
+                        : `No cash-flow or dividend entries in ${activeBucketCurrency} yet. Use the form above to add one.`}
+                    </p>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <aside className="fh-data-quality" data-testid="portfolio-data-quality" role="note">

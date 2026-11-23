@@ -89,6 +89,13 @@ export function slugifyAccountId(name: string, existingIds: ReadonlySet<string>)
   return `acct_${Date.now()}`;
 }
 
+const accountDeleteHooks = new Set<(accountId: string) => void>();
+
+export function registerAccountDeleteHook(hook: (accountId: string) => void): () => void {
+  accountDeleteHooks.add(hook);
+  return () => accountDeleteHooks.delete(hook);
+}
+
 class AccountStore {
   private accounts = new Map<string, BrokerAccountProfile>([
     [DEFAULT_ACCOUNT_ID, createDefaultAccount()],
@@ -279,6 +286,13 @@ class AccountStore {
     // across MOCK_BROKER, NAV_STORE, and browser localStorage.
     MOCK_BROKER.removeLocalAccount(trimmed);
     NAV_STORE.removeAccountSnapshots(trimmed);
+    for (const hook of [...accountDeleteHooks]) {
+      try {
+        hook(trimmed);
+      } catch {
+        // Ignore hook cleanup errors.
+      }
+    }
     if (!isTauriRuntime()) {
       this.persistBrowserState();
       const remainingSnapshots = this.getAllAccountSnapshots();

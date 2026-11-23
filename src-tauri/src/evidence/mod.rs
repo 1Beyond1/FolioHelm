@@ -11,6 +11,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub const EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const GENESIS_HASH: [u8; 32] = [0; 32];
@@ -983,8 +984,8 @@ pub struct EvidenceJournal {
 
 impl EvidenceJournal {
     pub fn new_random() -> Result<Self, EvidenceError> {
-        let mut seed = [0_u8; 32];
-        getrandom::fill(&mut seed).map_err(|_| EvidenceError::RandomnessUnavailable)?;
+        let mut seed = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(&mut *seed).map_err(|_| EvidenceError::RandomnessUnavailable)?;
         Ok(Self::from_signing_key(SigningKey::from_bytes(&seed)))
     }
 
@@ -1190,11 +1191,19 @@ impl EvidenceJournal {
     }
 
     pub fn export(&self) -> Result<String, EvidenceError> {
+        self.export_for_mode("mock")
+    }
+
+    pub fn export_for_mode(&self, workspace_mode: &str) -> Result<String, EvidenceError> {
         let head = verify_chain(&self.entries)?;
+        let normalized_mode = match workspace_mode.trim() {
+            "local-csv" => "local-csv",
+            _ => "mock",
+        };
         let bundle = EvidenceExportBundleDto {
             format: SIGNED_EVIDENCE_BUNDLE_FORMAT.to_string(),
             schema_version: EVIDENCE_SCHEMA_VERSION,
-            mode: "mock".to_string(),
+            mode: normalized_mode.to_string(),
             exported_at_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             signer_public_key: head.signer_public_key.map(|pk| encode_hex(&pk)),
             records: self.list(),
@@ -1744,5 +1753,25 @@ mod tests {
             EvidenceJournal::from_persisted(device_key(), bad_head_entries).err(),
             Some(EvidenceError::PayloadHashMismatch)
         );
+    }
+
+    #[test]
+    fn p2_export_for_mode_emits_real_workspace_mode_and_roundtrips() {
+        let mut journal = EvidenceJournal::from_signing_key(device_key());
+        journal
+            .append(AppendEvidenceRequest {
+                kind: "portfolio_import".into(),
+                payload: BTreeMap::from([("mode".into(), "local-csv".into())]),
+                app_version: Some("0.2.0".into()),
+                occurred_at_utc: Some("2026-11-23T08:00:00Z".into()),
+                account_ref: Some("acct_local_csv".into()),
+                intent_id: Some("snap-1".into()),
+            })
+            .expect("append");
+        let exported = journal.export_for_mode("local-csv").expect("export");
+        assert!(exported.contains("\"mode\": \"local-csv\""));
+        let (_, verification) = journal.parse_import_bundle(&exported).expect("reimport");
+        assert!(verification.valid);
+        assert_eq!(verification.sequence, 1);
     }
 }

@@ -9,10 +9,12 @@ import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
   invokeDialogSaveFhvaultFile,
   invokeDialogSaveJsonFile,
+  invokeDialogSaveReportFile,
   invokeQuotesFetchPublic,
   invokeQuotesLoadCached,
   isTauriRuntime,
 } from "./tauriBridge";
+import { WATCHLIST_STORE } from "./watchlist";
 
 export type PublicQuoteProviderChoice = "stooq" | "yahoo";
 
@@ -54,6 +56,11 @@ export async function refreshPublicQuotes(
       } catch {
         // Ignore single-account read errors while collecting symbol list.
       }
+    }
+  }
+  for (const item of WATCHLIST_STORE.getAll()) {
+    if (item.enabled && item.symbol.trim()) {
+      symbolSet.add(item.symbol.trim().toUpperCase());
     }
   }
   const symbols = [...symbolSet].slice(0, 50);
@@ -202,6 +209,28 @@ export async function saveFhvaultWithDialogOrBlob(
   }
 
   const blob = new Blob([serialized], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = defaultFileName;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return { kind: "browser-download" };
+}
+
+export async function saveReportWithDialogOrBlob(
+  defaultFileName: string,
+  content: string,
+  format: "md" | "csv",
+): Promise<SaveJsonOutcome> {
+  if (isTauriRuntime()) {
+    const savedPath = await invokeDialogSaveReportFile(defaultFileName, content, format);
+    if (!savedPath) return { kind: "canceled" };
+    return { kind: "native-saved", path: savedPath };
+  }
+
+  const mime = format === "md" ? "text/markdown;charset=utf-8" : "text/csv;charset=utf-8";
+  const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

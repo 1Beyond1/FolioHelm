@@ -1,6 +1,7 @@
 import { readStored, removeStored, writeStored } from "../platform/storage";
 import { ACCOUNT_STORE, DEFAULT_ACCOUNT_ID } from "./accounts";
 import { AUTOMATION_CONTROLLER, normalizeAutomationState } from "./automation";
+import { CASH_FLOW_STORE } from "./cashFlows";
 import type { BrokerOrder, BrokerOrderEvent, WorkspaceMode } from "./contracts";
 import { loadPersistedAccountPortfolios, recordNavSnapshotsForPortfolio } from "./csvImport";
 import { price, quantity } from "./decimal";
@@ -8,6 +9,7 @@ import { MOCK_BROKER } from "./mockBroker";
 import { NAV_STORE } from "./nav";
 import { hydrateCachedPublicQuotes, type PublicQuoteProviderChoice } from "./publicQuotes";
 import { advanceLockEpoch, getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
+import { WATCHLIST_STORE } from "./watchlist";
 import {
   invokeVaultLoadPaperOrders,
   invokeVaultLoadSetting,
@@ -142,17 +144,29 @@ export async function loadWorkspacePreferences(): Promise<WorkspacePreferences> 
   return normalizeWorkspacePreferences(raw);
 }
 
-export async function saveWorkspacePreferences(
+let workspacePrefsWriteQueue: Promise<void> = Promise.resolve();
+
+export function saveWorkspacePreferences(
   patch: Partial<WorkspacePreferences>,
 ): Promise<WorkspacePreferences> {
   const epoch = getCurrentLockEpoch();
-  const current = await loadWorkspacePreferences();
-  const next = normalizeWorkspacePreferences({ ...current, ...patch });
-  await saveEncryptedSetting(WORKSPACE_PREFS_KEY, next, WORKSPACE_PREFS_KEY);
-  if (isCurrentLockEpoch(epoch) && typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent<WorkspacePreferences>(WORKSPACE_PREFS_CHANGED_EVENT, { detail: next }));
-  }
-  return next;
+  const run = workspacePrefsWriteQueue.then(async () => {
+    if (!isCurrentLockEpoch(epoch)) {
+      return { ...DEFAULT_WORKSPACE_PREFERENCES };
+    }
+    const current = await loadWorkspacePreferences();
+    if (!isCurrentLockEpoch(epoch)) {
+      return { ...DEFAULT_WORKSPACE_PREFERENCES };
+    }
+    const next = normalizeWorkspacePreferences({ ...current, ...patch });
+    await saveEncryptedSetting(WORKSPACE_PREFS_KEY, next, WORKSPACE_PREFS_KEY);
+    if (isCurrentLockEpoch(epoch) && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent<WorkspacePreferences>(WORKSPACE_PREFS_CHANGED_EVENT, { detail: next }));
+    }
+    return next;
+  });
+  workspacePrefsWriteQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 const ORDER_EVENT_KINDS = new Set<BrokerOrderEvent["kind"]>([
@@ -286,6 +300,8 @@ export function purgeAllFrontendSensitiveMemory(): void {
   AUTOMATION_CONTROLLER.purgeSensitiveMemory();
   ACCOUNT_STORE.purgeSensitiveMemory();
   NAV_STORE.purgeSensitiveMemory();
+  CASH_FLOW_STORE.purgeSensitiveMemory();
+  WATCHLIST_STORE.purgeSensitiveMemory();
 }
 
 /**
@@ -311,6 +327,8 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
     await Promise.all([
       ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => []),
       NAV_STORE.hydrateFromVault().catch(() => {}),
+      CASH_FLOW_STORE.hydrateFromVault().catch(() => []),
+      WATCHLIST_STORE.hydrateFromVault().catch(() => []),
     ]);
     if (!isCurrentLockEpoch(epoch)) return staleResult();
     const persistedPortfolios = await loadPersistedAccountPortfolios().catch(() => []);
@@ -364,10 +382,12 @@ export async function hydrateWorkspaceFromVault(): Promise<VaultHydrationResult>
   });
   if (!isCurrentLockEpoch(epoch)) return staleResult();
 
-  // Completely replace accounts, NAV snapshots, and cached benchmarks from encrypted SQLite.
+  // Completely replace accounts, NAV snapshots, cached benchmarks, cash flows, and watchlist from encrypted SQLite.
   const [hydratedAccounts] = await Promise.all([
     ACCOUNT_STORE.hydrateAccountsFromVault().catch(() => ACCOUNT_STORE.getAccounts()),
     NAV_STORE.hydrateFromVault().catch(() => {}),
+    CASH_FLOW_STORE.hydrateFromVault().catch(() => []),
+    WATCHLIST_STORE.hydrateFromVault().catch(() => []),
   ]);
   if (!isCurrentLockEpoch(epoch)) return staleResult();
 

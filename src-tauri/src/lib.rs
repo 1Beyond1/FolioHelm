@@ -37,9 +37,9 @@ use quotes::{
 };
 use serde::Serialize;
 use storage::{
-    atomic_write_bytes, AppLockBackoffState, CachedPublicQuote, EncryptedVaultDb,
-    PortfolioSaveOutcome, StoredAccount, StoredBenchmarkSeries, StoredNavSnapshot,
-    StoredPaperOrder, StoredPortfolioSnapshot, VaultBackupPayload, VaultRestoreSummaryDto,
+    atomic_write_bytes, AppLockBackoffState, CachedPublicQuote, EncryptedVaultDb, StoredAccount,
+    StoredBenchmarkSeries, StoredCashFlow, StoredNavSnapshot, StoredPaperOrder,
+    StoredPortfolioSnapshot, StoredWatchlistItem, VaultBackupPayload, VaultRestoreSummaryDto,
     VaultStatusDto, STORAGE_SCHEMA_VERSION,
 };
 use tauri::{AppHandle, Manager, State};
@@ -858,13 +858,16 @@ impl VaultRuntimeState {
             db.export_backup_payload()
                 .map_err(|error| error.to_string())
         })?;
-        tokio::task::spawn_blocking(move || {
+        let encrypted = tokio::task::spawn_blocking(move || {
             let plaintext =
                 Zeroizing::new(serde_json::to_vec(&payload).map_err(|error| error.to_string())?);
             encrypt_fhvault_backup(&pass, &plaintext).map_err(|error| error.to_string())
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())??;
+        // Re-check lock state after Argon2id/AES-GCM finishes so mid-flight lock discards output.
+        self.ensure_unlocked()?;
+        Ok(encrypted)
     }
 
     pub fn restore_fhvault_backup(
@@ -916,12 +919,23 @@ impl VaultRuntimeState {
             return Err("Vault must be unlocked before restoring a .fhvault backup".to_string());
         };
 
-        let (restored_journal, summary) = db
-            .restore_from_backup_payload(payload, self.key_store.as_ref())
-            .map_err(|error| error.to_string())?;
-        **journal = restored_journal;
-        cache.reload_from_db(db);
-        Ok(summary)
+        match db.restore_from_backup_payload(payload, self.key_store.as_ref()) {
+            Ok((restored_journal, summary)) => {
+                **journal = restored_journal;
+                cache.reload_from_db(db);
+                Ok(summary)
+            }
+            Err(storage::StorageError::RollbackLockRequired(reason)) => {
+                // Fail-Closed P1-5: rollback failed to reopen/verify original DB; drop placeholder
+                // connection & all key material immediately and transition into ErrorLocked.
+                cache.clear();
+                *guard = VaultSession::ErrorLocked {
+                    reason: reason.clone(),
+                };
+                Err(reason)
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -954,8 +968,31 @@ fn evidence_verify(state: State<'_, VaultRuntimeState>) -> Result<EvidenceVerifi
 }
 
 #[tauri::command]
-fn evidence_export(state: State<'_, VaultRuntimeState>) -> Result<String, String> {
-    state.with_unlocked(|_, journal| journal.export().map_err(|error| error.to_string()))
+fn evidence_export(
+    state: State<'_, VaultRuntimeState>,
+    workspace_mode: Option<String>,
+) -> Result<String, String> {
+    state.with_unlocked(|db, journal| {
+        let resolved_mode = match workspace_mode.as_deref() {
+            Some("local-csv") => "local-csv".to_string(),
+            Some("mock") => "mock".to_string(),
+            _ => db
+                .load_setting("workspace_preferences")
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|val| {
+                    val.get("workspaceMode")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|m| matches!(m.as_str(), "mock" | "local-csv"))
+                .unwrap_or_else(|| "mock".to_string()),
+        };
+        journal
+            .export_for_mode(&resolved_mode)
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[tauri::command]
@@ -1039,17 +1076,6 @@ async fn vault_restore_backup(
     state
         .restore_fhvault_backup_async(raw_backup, passphrase)
         .await
-}
-
-#[tauri::command]
-fn vault_save_portfolio(
-    state: State<'_, VaultRuntimeState>,
-    snapshot: StoredPortfolioSnapshot,
-) -> Result<PortfolioSaveOutcome, String> {
-    state.with_unlocked(|db, _| {
-        db.save_portfolio_snapshot(&snapshot)
-            .map_err(|error| error.to_string())
-    })
 }
 
 #[tauri::command]
@@ -1726,13 +1752,20 @@ fn quotes_load_cached(
 }
 
 #[tauri::command]
-async fn dialog_open_csv_file(app: AppHandle) -> Result<Option<OpenedTextFileDto>, String> {
+async fn dialog_open_csv_file(
+    state: State<'_, VaultRuntimeState>,
+    app: AppHandle,
+) -> Result<Option<OpenedTextFileDto>, String> {
+    state.ensure_unlocked()?;
     tauri::async_runtime::spawn_blocking(move || {
         let picked = app
             .dialog()
             .file()
             .add_filter("Brokerage CSV", &["csv", "txt"])
             .blocking_pick_file();
+
+        // Fail-Closed P1-2: re-check lock state after blocking dialog returns.
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
 
         let Some(file_path) = picked else {
             return Ok(None);
@@ -1742,6 +1775,7 @@ async fn dialog_open_csv_file(app: AppHandle) -> Result<Option<OpenedTextFileDto
             .map_err(|_| "selected CSV path is not a local filesystem path".to_string())?;
         let raw_bytes = read_bounded_file_bytes(&path, MAX_CSV_BYTES, "CSV")?;
         let content = decode_csv_bytes(&raw_bytes)?;
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1755,10 +1789,12 @@ async fn dialog_open_csv_file(app: AppHandle) -> Result<Option<OpenedTextFileDto
 
 #[tauri::command]
 async fn dialog_save_json_file(
+    state: State<'_, VaultRuntimeState>,
     app: AppHandle,
     default_file_name: String,
     content: String,
 ) -> Result<Option<String>, String> {
+    state.ensure_unlocked()?;
     if content.len() > MAX_EXPORT_BYTES {
         return Err("Export payload exceeds the 20 MB safety limit".to_string());
     }
@@ -1783,6 +1819,62 @@ async fn dialog_save_json_file(
             .add_filter("JSON files", &["json"])
             .blocking_save_file();
 
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
+
+        let Some(file_path) = picked else {
+            return Ok(None);
+        };
+        let path = file_path
+            .into_path()
+            .map_err(|_| "selected save destination is not a local filesystem path".to_string())?;
+        atomic_write_bytes(&path, content.as_bytes()).map_err(|error| error.to_string())?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn dialog_save_report_file(
+    state: State<'_, VaultRuntimeState>,
+    app: AppHandle,
+    default_file_name: String,
+    content: String,
+    format: String,
+) -> Result<Option<String>, String> {
+    state.ensure_unlocked()?;
+    if content.len() > MAX_EXPORT_BYTES {
+        return Err("Report export payload exceeds the 20 MB safety limit".to_string());
+    }
+    let (ext, filter_label) = match format.trim().to_ascii_lowercase().as_str() {
+        "md" | "markdown" => ("md", "Markdown Report"),
+        "csv" => ("csv", "CSV Report"),
+        _ => return Err("unsupported report format (expected 'md' or 'csv')".to_string()),
+    };
+    let safe_name: String = default_file_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        .take(80)
+        .collect();
+    let expected_suffix = format!(".{ext}");
+    let final_name = if safe_name.is_empty() {
+        format!("foliohelm-portfolio-report.{ext}")
+    } else if safe_name.to_ascii_lowercase().ends_with(&expected_suffix) {
+        safe_name
+    } else {
+        format!("{safe_name}.{ext}")
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .set_file_name(&final_name)
+            .add_filter(filter_label, &[ext])
+            .blocking_save_file();
+
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
+
         let Some(file_path) = picked else {
             return Ok(None);
         };
@@ -1798,10 +1890,12 @@ async fn dialog_save_json_file(
 
 #[tauri::command]
 async fn dialog_save_fhvault_file(
+    state: State<'_, VaultRuntimeState>,
     app: AppHandle,
     default_file_name: String,
     content: String,
 ) -> Result<Option<String>, String> {
+    state.ensure_unlocked()?;
     if content.len() > MAX_FHVAULT_BYTES {
         return Err("Encrypted backup exceeds the 20 MB safety limit".to_string());
     }
@@ -1826,6 +1920,8 @@ async fn dialog_save_fhvault_file(
             .add_filter("FolioHelm Encrypted Backup", &["fhvault"])
             .blocking_save_file();
 
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
+
         let Some(file_path) = picked else {
             return Ok(None);
         };
@@ -1840,13 +1936,19 @@ async fn dialog_save_fhvault_file(
 }
 
 #[tauri::command]
-async fn dialog_open_fhvault_file(app: AppHandle) -> Result<Option<OpenedTextFileDto>, String> {
+async fn dialog_open_fhvault_file(
+    state: State<'_, VaultRuntimeState>,
+    app: AppHandle,
+) -> Result<Option<OpenedTextFileDto>, String> {
+    state.ensure_unlocked()?;
     tauri::async_runtime::spawn_blocking(move || {
         let picked = app
             .dialog()
             .file()
             .add_filter("FolioHelm Encrypted Backup", &["fhvault", "json"])
             .blocking_pick_file();
+
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
 
         let Some(file_path) = picked else {
             return Ok(None);
@@ -1857,6 +1959,7 @@ async fn dialog_open_fhvault_file(app: AppHandle) -> Result<Option<OpenedTextFil
         let raw_bytes = read_bounded_file_bytes(&path, MAX_FHVAULT_BYTES, ".fhvault backup")?;
         let content_raw = String::from_utf8(raw_bytes)
             .map_err(|_| "Selected .fhvault backup is not valid UTF-8".to_string())?;
+        app.state::<VaultRuntimeState>().ensure_unlocked()?;
         let content = content_raw
             .strip_prefix('\u{feff}')
             .unwrap_or(&content_raw)
@@ -1870,6 +1973,163 @@ async fn dialog_open_fhvault_file(app: AppHandle) -> Result<Option<OpenedTextFil
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn vault_list_cash_flows(
+    state: State<'_, VaultRuntimeState>,
+    account_id: Option<String>,
+    currency: Option<String>,
+) -> Result<Vec<StoredCashFlow>, String> {
+    state.with_unlocked(|db, _| {
+        db.list_cash_flows(account_id.as_deref(), currency.as_deref())
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+fn vault_upsert_cash_flow(
+    state: State<'_, VaultRuntimeState>,
+    record: StoredCashFlow,
+) -> Result<StoredCashFlow, String> {
+    state.with_unlocked(|db, journal| {
+        let saved = db
+            .upsert_cash_flow(&record)
+            .map_err(|error| error.to_string())?;
+        let mut payload = BTreeMap::from([
+            ("action".to_string(), "cash_flow_upserted".to_string()),
+            ("cashFlowId".to_string(), saved.id.clone()),
+            ("accountId".to_string(), saved.account_id.clone()),
+            ("flowType".to_string(), saved.flow_type.clone()),
+            ("currency".to_string(), saved.currency.clone()),
+            ("amountMicros".to_string(), saved.amount_micros.to_string()),
+            ("flowDate".to_string(), saved.flow_date.clone()),
+        ]);
+        if let Some(ref sym) = saved.symbol {
+            payload.insert("symbol".to_string(), sym.clone());
+        }
+        let (signed, _) = journal
+            .prepare_append(AppendEvidenceRequest {
+                kind: "state_changed".to_string(),
+                payload,
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                occurred_at_utc: None,
+                account_ref: Some("acct_local_csv".to_string()),
+                intent_id: Some(saved.id.clone()),
+            })
+            .map_err(|error| error.to_string())?;
+        db.insert_evidence_entry(&signed)
+            .map_err(|error| error.to_string())?;
+        journal.commit_prepared(signed);
+        Ok(saved)
+    })
+}
+
+#[tauri::command]
+fn vault_delete_cash_flow(state: State<'_, VaultRuntimeState>, id: String) -> Result<bool, String> {
+    state.with_unlocked(|db, journal| {
+        let deleted = db
+            .delete_cash_flow(&id)
+            .map_err(|error| error.to_string())?;
+        if deleted {
+            let trimmed = id.trim().to_string();
+            let (signed, _) = journal
+                .prepare_append(AppendEvidenceRequest {
+                    kind: "state_changed".to_string(),
+                    payload: BTreeMap::from([
+                        ("action".to_string(), "cash_flow_deleted".to_string()),
+                        ("cashFlowId".to_string(), trimmed.clone()),
+                    ]),
+                    app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    occurred_at_utc: None,
+                    account_ref: Some("acct_local_csv".to_string()),
+                    intent_id: Some(trimmed),
+                })
+                .map_err(|error| error.to_string())?;
+            db.insert_evidence_entry(&signed)
+                .map_err(|error| error.to_string())?;
+            journal.commit_prepared(signed);
+        }
+        Ok(deleted)
+    })
+}
+
+#[tauri::command]
+fn vault_list_watchlist(
+    state: State<'_, VaultRuntimeState>,
+) -> Result<Vec<StoredWatchlistItem>, String> {
+    state.with_unlocked(|db, _| db.list_watchlist_items().map_err(|error| error.to_string()))
+}
+
+#[tauri::command]
+fn vault_upsert_watchlist_item(
+    state: State<'_, VaultRuntimeState>,
+    item: StoredWatchlistItem,
+) -> Result<StoredWatchlistItem, String> {
+    state.with_unlocked(|db, journal| {
+        let saved = db
+            .upsert_watchlist_item(&item)
+            .map_err(|error| error.to_string())?;
+        let mut payload = BTreeMap::from([
+            ("action".to_string(), "watchlist_upserted".to_string()),
+            ("watchlistId".to_string(), saved.id.clone()),
+            ("symbol".to_string(), saved.symbol.clone()),
+            ("currency".to_string(), saved.currency.clone()),
+            ("enabled".to_string(), saved.enabled.to_string()),
+        ]);
+        if let Some(buy) = saved.target_buy_micros {
+            payload.insert("targetBuyMicros".to_string(), buy.to_string());
+        }
+        if let Some(sell) = saved.target_sell_micros {
+            payload.insert("targetSellMicros".to_string(), sell.to_string());
+        }
+        let (signed, _) = journal
+            .prepare_append(AppendEvidenceRequest {
+                kind: "state_changed".to_string(),
+                payload,
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                occurred_at_utc: None,
+                account_ref: Some("acct_local_watchlist".to_string()),
+                intent_id: Some(saved.id.clone()),
+            })
+            .map_err(|error| error.to_string())?;
+        db.insert_evidence_entry(&signed)
+            .map_err(|error| error.to_string())?;
+        journal.commit_prepared(signed);
+        Ok(saved)
+    })
+}
+
+#[tauri::command]
+fn vault_delete_watchlist_item(
+    state: State<'_, VaultRuntimeState>,
+    id: String,
+) -> Result<bool, String> {
+    state.with_unlocked(|db, journal| {
+        let deleted = db
+            .delete_watchlist_item(&id)
+            .map_err(|error| error.to_string())?;
+        if deleted {
+            let trimmed = id.trim().to_string();
+            let (signed, _) = journal
+                .prepare_append(AppendEvidenceRequest {
+                    kind: "state_changed".to_string(),
+                    payload: BTreeMap::from([
+                        ("action".to_string(), "watchlist_deleted".to_string()),
+                        ("watchlistId".to_string(), trimmed.clone()),
+                    ]),
+                    app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    occurred_at_utc: None,
+                    account_ref: Some("acct_local_watchlist".to_string()),
+                    intent_id: Some(trimmed),
+                })
+                .map_err(|error| error.to_string())?;
+            db.insert_evidence_entry(&signed)
+                .map_err(|error| error.to_string())?;
+            journal.commit_prepared(signed);
+        }
+        Ok(deleted)
+    })
 }
 
 #[tauri::command]
@@ -1925,13 +2185,18 @@ pub fn run() {
             vault_set_lock_passphrase,
             vault_export_backup,
             vault_restore_backup,
-            vault_save_portfolio,
             vault_load_portfolio,
             vault_load_account_portfolios,
             vault_clear_portfolio,
             vault_list_accounts,
             vault_save_account,
             vault_delete_account,
+            vault_list_cash_flows,
+            vault_upsert_cash_flow,
+            vault_delete_cash_flow,
+            vault_list_watchlist,
+            vault_upsert_watchlist_item,
+            vault_delete_watchlist_item,
             vault_save_paper_order,
             vault_load_paper_orders,
             vault_save_setting,
@@ -1947,6 +2212,7 @@ pub fn run() {
             benchmark_load_cached,
             dialog_open_csv_file,
             dialog_save_json_file,
+            dialog_save_report_file,
             dialog_save_fhvault_file,
             dialog_open_fhvault_file,
             vault_clear_all,
@@ -2679,5 +2945,118 @@ mod tests {
         if let Some(parent) = db_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[tokio::test]
+    async fn p1_2_and_p1_5_export_lock_guard_and_restore_rollback_failure_error_locked() {
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        use vault::{VaultError, DEVICE_SIGNING_SEED_ACCOUNT};
+
+        struct CorruptingFailKeyStore {
+            inner: InMemoryKeyStore,
+            fail_seed_write_and_delete_backup: StdAtomicBool,
+            db_dir: PathBuf,
+        }
+
+        impl KeyStore for CorruptingFailKeyStore {
+            fn get_secret(
+                &self,
+                service: &str,
+                account: &str,
+            ) -> Result<Option<Zeroizing<String>>, VaultError> {
+                self.inner.get_secret(service, account)
+            }
+
+            fn set_secret(
+                &self,
+                service: &str,
+                account: &str,
+                secret: &str,
+            ) -> Result<(), VaultError> {
+                if account == DEVICE_SIGNING_SEED_ACCOUNT
+                    && self
+                        .fail_seed_write_and_delete_backup
+                        .load(Ordering::Acquire)
+                {
+                    // Simulate severe I/O failure during rollback where the pre-restore backup file
+                    // cannot be renamed back so the original vault cannot be reopened.
+                    if let Ok(entries) = fs::read_dir(&self.db_dir) {
+                        for entry in entries.flatten() {
+                            if entry
+                                .file_name()
+                                .to_string_lossy()
+                                .contains(".pre-restore-")
+                            {
+                                let _ = fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                    return Err(VaultError::KeyStoreUnavailable(
+                        "simulated keyring failure during restore".into(),
+                    ));
+                }
+                self.inner.set_secret(service, account, secret)
+            }
+
+            fn delete_secret(&self, service: &str, account: &str) -> Result<(), VaultError> {
+                self.inner.delete_secret(service, account)
+            }
+        }
+
+        // Source backup with real workspace_preferences = "local-csv"
+        let src_path = temp_vault_path("p1-src");
+        let src_store = Arc::new(InMemoryKeyStore::new());
+        let src = VaultRuntimeState::open_with_store(&src_path, src_store, "in-memory-test");
+        src.with_unlocked(|db, _| {
+            db.save_setting("workspace_preferences", r#"{"workspaceMode":"local-csv"}"#)
+                .map_err(|e| e.to_string())
+        })
+        .expect("save pref");
+
+        // Verify export_fhvault_backup_async rejects when locked (P1-2)
+        src.lock_session("manual", Some("local-csv")).expect("lock");
+        assert!(src
+            .export_fhvault_backup_async("Valid-Passphrase-2026!".to_string())
+            .await
+            .is_err());
+        src.unlock_session(None).expect("unlock");
+
+        let backup_payload = src
+            .with_unlocked(|db, _| db.export_backup_payload().map_err(|e| e.to_string()))
+            .expect("export payload");
+
+        // Destination state whose rollback cannot reopen the original vault -> MUST transition to ErrorLocked (P1-5)
+        let dst_path = temp_vault_path("p1-5-rollback");
+        let dst_dir = dst_path.parent().expect("parent").to_path_buf();
+        let faulty_store = Arc::new(CorruptingFailKeyStore {
+            inner: InMemoryKeyStore::new(),
+            fail_seed_write_and_delete_backup: StdAtomicBool::new(false),
+            db_dir: dst_dir.clone(),
+        });
+        let dst = VaultRuntimeState::open_with_store(
+            &dst_path,
+            Arc::clone(&faulty_store) as Arc<dyn KeyStore>,
+            "in-memory-test",
+        );
+        assert!(dst.status().expect("status").unlocked);
+
+        faulty_store
+            .fail_seed_write_and_delete_backup
+            .store(true, Ordering::Release);
+        let err = dst
+            .apply_restored_payload(backup_payload)
+            .expect_err("rollback failure must error");
+        assert!(err.contains("rollback"));
+
+        // Must be Fail-Closed ErrorLocked, NEVER left Unlocked with placeholder in-memory DB!
+        let status = dst.status().expect("error-locked status");
+        assert!(!status.unlocked);
+        assert_eq!(status.lock_state, "error-locked");
+        assert!(dst.with_unlocked(|_, _| Ok(())).is_err());
+
+        if let Some(parent) = src_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+        let _ = fs::remove_dir_all(&dst_dir);
     }
 }

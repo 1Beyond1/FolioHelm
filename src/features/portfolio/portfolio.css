@@ -1322,3 +1322,224 @@
   color: var(--fh-text);
   font-size: 12px;
 }
+
+.fh-report-export-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fh-attribution-panel,
+.fh-ledger-panel {
+  max-width: 1440px;
+  margin: 12px auto 0;
+  padding: 24px;
+}
+
+.fh-attribution-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--fh-muted-strong);
+}
+
+.fh-attribution-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.fh-attribution-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 200px) 1fr minmax(190px, auto);
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--fh-line);
+  border-radius: 12px;
+  background: var(--fh-surface-raised);
+}
+
+.fh-attribution-symbol {
+  display: grid;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fh-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.fh-attribution-symbol strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.fh-attribution-symbol small {
+  color: var(--fh-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fh-attribution-symbol:hover strong {
+  color: var(--fh-lime);
+}
+
+.fh-attribution-bar-track {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--fh-surface-soft);
+  overflow: hidden;
+}
+
+.fh-attribution-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 220ms ease;
+}
+
+.fh-attribution-bar-fill.is-positive {
+  background: var(--fh-lime);
+}
+
+.fh-attribution-bar-fill.is-negative {
+  background: var(--fh-red);
+}
+
+.fh-attribution-metrics {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fh-attribution-metrics strong {
+  font-size: 13px;
+}
+
+.fh-attribution-metrics small {
+  color: var(--fh-muted);
+  font-size: 11px;
+}
+
+.fh-ledger-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.fh-ledger-metric {
+  padding: 12px 14px;
+  border: 1px solid var(--fh-line);
+  border-radius: 12px;
+  background: var(--fh-surface-raised);
+}
+
+.fh-ledger-metric span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--fh-muted);
+  font-size: 11px;
+}
+
+.fh-ledger-metric strong {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.fh-ledger-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  align-items: end;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--fh-line);
+  border-radius: 14px;
+  background: var(--fh-surface-soft);
+}
+
+.fh-ledger-form label {
+  display: grid;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--fh-muted-strong);
+}
+
+.fh-ledger-form input,
+.fh-ledger-form select {
+  padding: 7px 10px;
+  border: 1px solid var(--fh-line-strong);
+  border-radius: 8px;
+  background: var(--fh-surface);
+  color: var(--fh-text);
+  font-size: 12px;
+}
+
+.fh-ledger-feedback {
+  margin: 10px 0 0;
+}
+
+.fh-ledger-table {
+  margin-top: 16px;
+}
+
+.fh-ledger-note-cell {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fh-muted-strong);
+}
+
+.fh-ledger-empty {
+  margin: 12px 0;
+  color: var(--fh-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.fh-flow-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  border: 1px solid var(--fh-line-strong);
+  background: var(--fh-surface-raised);
+  color: var(--fh-text);
+}
+
+.fh-flow-badge--dividend {
+  border-color: color-mix(in srgb, var(--fh-lime) 45%, transparent);
+  background: var(--fh-lime-soft);
+  color: var(--fh-lime);
+}
+
+.fh-flow-badge--deposit {
+  border-color: color-mix(in srgb, #60a5fa 45%, transparent);
+  color: #60a5fa;
+}
+
+.fh-flow-badge--withdrawal,
+.fh-flow-badge--fee {
+  border-color: color-mix(in srgb, var(--fh-red) 45%, transparent);
+  color: var(--fh-red);
+}
+
+@media (max-width: 820px) {
+  .fh-attribution-row {
+    grid-template-columns: 1fr;
+  }
+
+  .fh-attribution-metrics {
+    justify-items: start;
+  }
+}

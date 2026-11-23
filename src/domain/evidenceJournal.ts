@@ -125,7 +125,7 @@ export interface EvidenceVerification {
 export interface EvidenceExportBundle {
   format: "foliohelm-local-evidence";
   schemaVersion: number;
-  mode: "mock";
+  mode: "mock" | "local-csv";
   exportedAtUtc: string;
   records: LocalEvidenceRecord[];
 }
@@ -341,7 +341,7 @@ export function listEvidence(): Promise<LocalEvidenceRecord[]> {
 async function appendEvidenceNow(
   kind: LocalEvidenceKind,
   payload: Record<string, string>,
-  appVersion = "0.1.0-mock",
+  appVersion = "0.2.0-mock",
   occurredAtUtc = new Date().toISOString(),
 ): Promise<LocalEvidenceRecord> {
   rejectSensitiveFields(payload);
@@ -386,15 +386,15 @@ async function appendEvidenceNow(
 export function appendEvidence(
   kind: LocalEvidenceKind,
   payload: Record<string, string>,
-  appVersion = "0.1.0-mock",
+  appVersion = "0.2.0-mock",
   occurredAtUtc = new Date().toISOString(),
 ): Promise<LocalEvidenceRecord> {
   return enqueueJournalOperation(() => appendEvidenceNow(kind, payload, appVersion, occurredAtUtc));
 }
 
-async function exportEvidenceNow(): Promise<string> {
+async function exportEvidenceNow(workspaceMode?: "mock" | "local-csv"): Promise<string> {
   if (isTauriRuntime()) {
-    return invokeEvidenceExport();
+    return invokeEvidenceExport(workspaceMode);
   }
 
   const records = storedRecords();
@@ -404,7 +404,7 @@ async function exportEvidenceNow(): Promise<string> {
   const bundle: EvidenceExportBundle = {
     format: "foliohelm-local-evidence",
     schemaVersion: SCHEMA_VERSION,
-    mode: "mock",
+    mode: workspaceMode === "local-csv" ? "local-csv" : "mock",
     exportedAtUtc: new Date().toISOString(),
     records: [...records],
   };
@@ -412,8 +412,8 @@ async function exportEvidenceNow(): Promise<string> {
 }
 
 /** Wait for pending appends before taking an evidence snapshot for export. */
-export function exportEvidence(): Promise<string> {
-  return enqueueJournalOperation(exportEvidenceNow);
+export function exportEvidence(workspaceMode?: "mock" | "local-csv"): Promise<string> {
+  return enqueueJournalOperation(() => exportEvidenceNow(workspaceMode));
 }
 
 async function importEvidenceNow(serialized: string): Promise<EvidenceVerification> {

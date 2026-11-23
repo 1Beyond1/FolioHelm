@@ -58,7 +58,32 @@ export interface TauriVaultRestoreSummary {
   accountCount?: number;
   navSnapshotCount?: number;
   benchmarkCount?: number;
+  cashFlowCount?: number;
+  watchlistCount?: number;
   signerPublicKey: string;
+}
+
+export interface TauriStoredCashFlow {
+  id: string;
+  accountId: string;
+  flowType: "dividend" | "deposit" | "withdrawal" | "fee";
+  symbol: string | null;
+  currency: string;
+  amountMicros: string;
+  flowDate: string;
+  note: string;
+  createdAt: string;
+}
+
+export interface TauriStoredWatchlistItem {
+  id: string;
+  symbol: string;
+  currency: string;
+  targetBuyMicros: string | null;
+  targetSellMicros: string | null;
+  note: string;
+  enabled: boolean;
+  updatedAt: string;
 }
 
 export interface TauriStoredAccount {
@@ -291,8 +316,10 @@ export function invokeEvidenceVerify(): Promise<TauriEvidenceVerification> {
   return invoke<TauriEvidenceVerification>("evidence_verify");
 }
 
-export function invokeEvidenceExport(): Promise<string> {
-  return invoke<string>("evidence_export");
+export function invokeEvidenceExport(workspaceMode?: "mock" | "local-csv"): Promise<string> {
+  return workspaceMode !== undefined
+    ? invoke<string>("evidence_export", { workspaceMode })
+    : invoke<string>("evidence_export");
 }
 
 export function invokeEvidenceImport(serialized: string): Promise<TauriEvidenceVerification> {
@@ -357,6 +384,40 @@ export function invokeVaultSaveAccount(account: TauriStoredAccount): Promise<Tau
 
 export function invokeVaultDeleteAccount(accountId: string): Promise<boolean> {
   return invoke<boolean>("vault_delete_account", { accountId });
+}
+
+export function invokeVaultListCashFlows(
+  accountId?: string,
+  currency?: string,
+): Promise<TauriStoredCashFlow[] | null> {
+  return invoke<TauriStoredCashFlow[] | null>("vault_list_cash_flows", {
+    accountId: accountId ?? null,
+    currency: currency ?? null,
+  });
+}
+
+export function invokeVaultUpsertCashFlow(
+  record: TauriStoredCashFlow,
+): Promise<TauriStoredCashFlow> {
+  return invoke<TauriStoredCashFlow>("vault_upsert_cash_flow", { record });
+}
+
+export function invokeVaultDeleteCashFlow(id: string): Promise<boolean> {
+  return invoke<boolean>("vault_delete_cash_flow", { id });
+}
+
+export function invokeVaultListWatchlist(): Promise<TauriStoredWatchlistItem[] | null> {
+  return invoke<TauriStoredWatchlistItem[] | null>("vault_list_watchlist");
+}
+
+export function invokeVaultUpsertWatchlistItem(
+  item: TauriStoredWatchlistItem,
+): Promise<TauriStoredWatchlistItem> {
+  return invoke<TauriStoredWatchlistItem>("vault_upsert_watchlist_item", { item });
+}
+
+export function invokeVaultDeleteWatchlistItem(id: string): Promise<boolean> {
+  return invoke<boolean>("vault_delete_watchlist_item", { id });
 }
 
 export function invokeVaultClearPortfolio(): Promise<boolean> {
@@ -476,6 +537,14 @@ export function invokeDialogSaveJsonFile(
   content: string,
 ): Promise<string | null> {
   return invoke<string | null>("dialog_save_json_file", { defaultFileName, content });
+}
+
+export function invokeDialogSaveReportFile(
+  defaultFileName: string,
+  content: string,
+  format: "md" | "csv",
+): Promise<string | null> {
+  return invoke<string | null>("dialog_save_report_file", { defaultFileName, content, format });
 }
 
 export function invokeDialogSaveFhvaultFile(

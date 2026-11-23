@@ -59,6 +59,7 @@ export interface SettingsPageProps {
   idleLockMinutes?: number;
   onIdleLockMinutesChange?: (minutes: number) => void;
   onLockSession?: (trigger: "manual" | "idle") => void;
+  onVaultStatusChange?: (status: TauriVaultStatus) => void;
 }
 
 type ProtectionKey = "maxOrderValue" | "priceDeviation" | "autoLock" | "accountAllowlist";
@@ -345,6 +346,7 @@ export function SettingsPage({
   idleLockMinutes = 15,
   onIdleLockMinutesChange,
   onLockSession,
+  onVaultStatusChange,
 }: SettingsPageProps) {
   const copy = COPY[language];
   const chinese = language === "zh";
@@ -438,11 +440,13 @@ export function SettingsPage({
 
   useEffect(() => {
     let active = true;
+    const mountEpoch = getCurrentLockEpoch();
 
     const loadVaultProtections = async (idleMinutesOverride?: number) => {
+      const epoch = getCurrentLockEpoch();
       try {
         const rawStored = await loadEncryptedSetting<unknown>(PROTECTIONS_SETTING_KEY, {}, "protections");
-        if (!active) return;
+        if (!active || !isCurrentLockEpoch(epoch)) return;
         const stored = rawStored && typeof rawStored === "object" && !Array.isArray(rawStored)
           ? rawStored as Partial<Record<ProtectionKey, boolean>>
           : {};
@@ -463,7 +467,7 @@ export function SettingsPage({
     if (isTauriRuntime()) {
       void loadWorkspacePreferences()
         .then((prefs) => {
-          if (!active) return;
+          if (!active || !isCurrentLockEpoch(mountEpoch)) return;
           setQuoteProvider(prefs.quoteProvider);
           setPublicQuotesEnabled(MOCK_BROKER.isPublicQuotesEnabled());
           if (prefs.idleLockMinutes > 0) {
@@ -473,12 +477,17 @@ export function SettingsPage({
           void loadVaultProtections(prefs.idleLockMinutes);
         })
         .catch(() => {
-          void loadVaultProtections();
+          if (active && isCurrentLockEpoch(mountEpoch)) {
+            void loadVaultProtections();
+          }
         });
 
       void invokeVaultStatus()
         .then((status) => {
-          if (active) setVaultStatus(status);
+          if (active && isCurrentLockEpoch(mountEpoch)) {
+            setVaultStatus(status);
+            onVaultStatusChange?.(status);
+          }
         })
         .catch(() => undefined);
     }
@@ -486,7 +495,10 @@ export function SettingsPage({
     const onVaultHydrated = (event: Event) => {
       const detail = (event as CustomEvent<VaultHydrationResult>).detail;
       if (!active || !detail) return;
-      if (detail.status) setVaultStatus(detail.status);
+      if (detail.status) {
+        setVaultStatus(detail.status);
+        onVaultStatusChange?.(detail.status);
+      }
       setPublicQuotesEnabled(MOCK_BROKER.isPublicQuotesEnabled());
       if (detail.preferences) {
         setQuoteProvider(detail.preferences.quoteProvider);
@@ -505,7 +517,7 @@ export function SettingsPage({
       active = false;
       window.removeEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     };
-  }, [onIdleLockMinutesChange]);
+  }, [onIdleLockMinutesChange, onVaultStatusChange]);
 
   useEffect(() => {
     onModalStateChange(settingsModalOpen);
@@ -513,20 +525,27 @@ export function SettingsPage({
   }, [onModalStateChange, settingsModalOpen]);
 
   async function handleVerifyEvidence(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     try {
       const result = await verifyEvidence();
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus(result.valid
         ? { kind: "valid", count: result.sequence }
         : { kind: "invalid", reason: result.reason });
     } catch {
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus({ kind: "invalid" });
     }
   }
 
   async function handleExportEvidence(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     try {
-      const serialized = await exportEvidence();
-      const outcome = await saveJsonWithDialogOrBlob("foliohelm-evidence-mock.json", serialized);
+      const mode = MOCK_BROKER.getWorkspaceMode();
+      const serialized = await exportEvidence(mode);
+      if (!isCurrentLockEpoch(epoch)) return;
+      const outcome = await saveJsonWithDialogOrBlob(`foliohelm-evidence-${mode}.json`, serialized);
+      if (!isCurrentLockEpoch(epoch)) return;
       if (outcome.kind === "native-saved") {
         setExportPathNote(copy.savedToPath(outcome.path));
       } else {
@@ -534,13 +553,16 @@ export function SettingsPage({
       }
       await handleVerifyEvidence();
     } catch {
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus({ kind: "invalid" });
     }
   }
 
   async function handleExportDiagnostics(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     try {
       const verification = await verifyEvidence();
+      if (!isCurrentLockEpoch(epoch)) return;
       const diagnostics = {
         format: "foliohelm-safety-diagnostics",
         schemaVersion: 1,
@@ -565,10 +587,12 @@ export function SettingsPage({
         "foliohelm-safety-diagnostics.json",
         JSON.stringify(diagnostics, null, 2),
       );
+      if (!isCurrentLockEpoch(epoch)) return;
       if (outcome.kind === "native-saved") {
         setExportPathNote(copy.savedToPath(outcome.path));
       }
     } catch {
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus({ kind: "invalid" });
     }
   }
@@ -641,6 +665,7 @@ export function SettingsPage({
   }
 
   async function handleImportEvidence(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
@@ -654,9 +679,13 @@ export function SettingsPage({
       return;
     }
     try {
-      const result = await importEvidence(await file.text());
+      const text = await file.text();
+      if (!isCurrentLockEpoch(epoch)) return;
+      const result = await importEvidence(text);
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus({ kind: "valid", count: result.sequence });
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
       setEvidenceStatus({ kind: "invalid", reason: error instanceof Error ? error.message : undefined });
     }
   }
@@ -672,15 +701,18 @@ export function SettingsPage({
   }
 
   async function handlePickFhvaultFile(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     setBackupModalError(null);
     if (isTauriRuntime()) {
       try {
         const opened = await invokeDialogOpenFhvaultFile();
+        if (!isCurrentLockEpoch(epoch)) return;
         if (!opened) return;
         setBackupFileName(opened.fileName);
         setBackupRawContent(opened.content);
         return;
       } catch (error) {
+        if (!isCurrentLockEpoch(epoch)) return;
         setBackupModalError(error instanceof Error ? error.message : String(error));
         return;
       }
@@ -689,6 +721,7 @@ export function SettingsPage({
   }
 
   async function handleFhvaultFileInputChange(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
@@ -698,8 +731,10 @@ export function SettingsPage({
       );
       return;
     }
+    const rawText = await file.text();
+    if (!isCurrentLockEpoch(epoch)) return;
     setBackupFileName(file.name);
-    setBackupRawContent(await file.text());
+    setBackupRawContent(rawText);
   }
 
   async function handleExportFhvaultSubmit(): Promise<void> {
@@ -722,13 +757,22 @@ export function SettingsPage({
       );
       return;
     }
+    const epoch = getCurrentLockEpoch();
     setBackupBusy(true);
     const pass = backupPassphrase;
     setBackupPassphrase("");
     setBackupPassphraseConfirm("");
     try {
       const encryptedJson = await invokeVaultExportBackup(pass);
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       const outcome = await saveFhvaultWithDialogOrBlob("foliohelm-vault-backup.fhvault", encryptedJson);
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       if (outcome.kind === "native-saved") {
         setBackupStatusMessage(
           chinese ? `已使用 Argon2id + AES-256-GCM 加密导出至 ${outcome.path}` : `Encrypted backup saved to ${outcome.path}`,
@@ -740,6 +784,10 @@ export function SettingsPage({
       }
       closeBackupModal();
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
       setBackupModalError(error instanceof Error ? error.message : String(error));
       setBackupBusy(false);
     }
@@ -780,7 +828,10 @@ export function SettingsPage({
         closeBackupModal();
         return;
       }
-      if (hydrated.status) setVaultStatus(hydrated.status);
+      if (hydrated.status) {
+        setVaultStatus(hydrated.status);
+        onVaultStatusChange?.(hydrated.status);
+      }
       setBackupStatusMessage(
         chinese
           ? `已验签并原子恢复金库（${summary.portfolioCount} 份持仓快照、${summary.paperOrderCount} 笔纸上订单、${summary.evidenceCount} 条签名证据）。`
@@ -832,6 +883,7 @@ export function SettingsPage({
         return;
       }
     }
+    const epoch = getCurrentLockEpoch();
     setLockPassBusy(true);
     const cur = currentLockPass || null;
     const next = removeExisting ? null : newLockPass;
@@ -840,7 +892,13 @@ export function SettingsPage({
     setConfirmLockPass("");
     try {
       const updated = await invokeVaultSetLockPassphrase(cur, next);
+      if (!isCurrentLockEpoch(epoch)) {
+        onVaultStatusChange?.(updated);
+        closeLockPassModal();
+        return;
+      }
       setVaultStatus(updated);
+      onVaultStatusChange?.(updated);
       setLockPassMessage(
         removeExisting
           ? (chinese ? "已清除自定义锁屏口令（锁屏仍会擦除内存密钥）。" : "Custom lock passphrase removed (locking still wipes in-memory keys).")
@@ -848,30 +906,39 @@ export function SettingsPage({
       );
       closeLockPassModal();
     } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) {
+        closeLockPassModal();
+        return;
+      }
       setLockPassError(error instanceof Error ? error.message : String(error));
       setLockPassBusy(false);
     }
   }
 
   async function clearLocalData(): Promise<void> {
+    const epoch = getCurrentLockEpoch();
     const mode = MOCK_BROKER.getWorkspaceMode();
     await appendEvidence("state_changed", {
       mode,
       action: "local_data_reset_requested",
     }).catch(() => undefined);
+    if (!isCurrentLockEpoch(epoch)) return;
     let preferencesCleared = false;
     const cleared = await clearEvidence(() => {
       preferencesCleared = clearFolioHelmStored();
       return preferencesCleared;
     });
+    if (!isCurrentLockEpoch(epoch)) return;
     if (!cleared || !preferencesCleared) {
       setEvidenceStatus({ kind: "invalid", clearFailed: true });
       return;
     }
     if (isTauriRuntime()) {
       await invokeVaultClearAll().catch(() => undefined);
+      if (!isCurrentLockEpoch(epoch)) return;
     }
     await clearPersistedLocalPortfolio().catch(() => undefined);
+    if (!isCurrentLockEpoch(epoch)) return;
     MOCK_BROKER.reset();
     AUTOMATION_CONTROLLER.replaceState(DEFAULT_AUTOMATION_STATE);
     onLanguageChange(detectInitialLanguage());
@@ -879,6 +946,7 @@ export function SettingsPage({
     onMockScenarioChange?.("healthy");
     setProtections({ ...INITIAL_PROTECTIONS });
     setLocalIdleMinutes(DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes);
+    onIdleLockMinutesChange?.(DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes);
     lastNonZeroIdleMinutesRef.current = DEFAULT_WORKSPACE_PREFERENCES.idleLockMinutes;
     setPublicQuotesEnabled(false);
     setQuoteStatusMessage(null);
@@ -1351,7 +1419,7 @@ export function SettingsPage({
           <span className="settings-badge">Apache-2.0</span>
         </div>
         <dl className="settings-about-list">
-          <div><dt>{copy.version}</dt><dd>0.1.0</dd></div>
+          <div><dt>{copy.version}</dt><dd>0.2.0</dd></div>
           <div><dt>{copy.connection}</dt><dd>{language === "zh" ? "未连接券商" : "No brokerage connection"}</dd></div>
           <div><dt>{copy.apiGate}</dt><dd>{copy.apiGateValue}</dd></div>
         </dl>

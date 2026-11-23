@@ -949,7 +949,7 @@ fn parse_tabular_csv(
         if is_transaction_row {
             let action_raw =
                 find_cell(headers, row, &["action", "side", "transaction type"]).unwrap_or("");
-            let action = sanitize_text_cell(action_raw, "Action", warnings);
+            let mut action = sanitize_text_cell(action_raw, "Action", warnings);
             let date_raw =
                 find_cell(headers, row, &["date", "trade date", "settlement date"]).unwrap_or("");
             let date_sanitized = sanitize_text_cell(date_raw, "Date", warnings);
@@ -979,6 +979,13 @@ fn parse_tabular_csv(
             } else {
                 parse_decimal_fixed(qty_raw, row_num, "Quantity")?
             };
+            let action_lower = action.to_lowercase();
+            if qty_fixed < 0
+                && !is_reverse_split_action(&action_lower)
+                && (action_lower.contains("split") || action_lower.contains("拆股"))
+            {
+                action = format!("{action} (Reverse Split)");
+            }
             let price_fixed = if price_raw.trim().is_empty() || is_na_placeholder(price_raw) {
                 0
             } else {
@@ -1188,9 +1195,23 @@ fn accumulate_holding(
     Ok(())
 }
 
+fn is_reverse_split_action(lower: &str) -> bool {
+    lower.contains("reverse split")
+        || lower.contains("reverse-split")
+        || lower.contains("rev split")
+        || lower.contains("share consolidation")
+        || lower.contains("consolidation")
+        || lower.contains("合股")
+        || lower.contains("并股")
+        || lower.contains("缩股")
+}
+
 fn tx_action_replay_rank(action: &str) -> u8 {
-    let lower = action.to_ascii_lowercase();
-    if lower.contains("split") || lower.contains("拆股") || lower.contains("合股") {
+    let lower = action.to_lowercase();
+    if is_reverse_split_action(&lower) {
+        // Distinct rank so reverse splits / consolidations NEVER enter the forward-split add path.
+        6
+    } else if lower.contains("split") || lower.contains("拆股") {
         0
     } else if lower.contains("reinvest")
         || lower.contains("buy")
@@ -1354,6 +1375,15 @@ fn replay_transactions_into_holdings(
 
     for (_, tx) in chronological {
         let rank = tx_action_replay_rank(&tx.action);
+        if rank == 6 {
+            // REVERSE SPLIT / CONSOLIDATION: never add shares; emit an explicit warning
+            // so the user imports a broker Positions CSV for exact post-consolidation shares.
+            warnings.push(format!(
+                "Reverse split / share consolidation for {} ({}) skipped in transaction replay to prevent share inflation; import a broker Positions CSV for exact post-consolidation share count",
+                tx.symbol, tx.action
+            ));
+            continue;
+        }
         let qty = parse_decimal_fixed(&tx.quantity, 0, "Quantity").unwrap_or(0);
         let price = parse_decimal_fixed(&tx.price, 0, "Price").unwrap_or(0);
         if qty <= 0 {
@@ -1741,21 +1771,21 @@ fn looks_like_option_symbol(raw: &str) -> bool {
         .unwrap_or(stripped);
 
     // Format 1: Compact OCC / Futu / Fidelity option symbol (e.g. AAPL261218C250000, AAPL261218C250, TCH261218C400000)
-    if !stripped.contains(' ') && stripped.len() >= 11 {
+    if !stripped.contains(' ') && stripped.is_ascii() && stripped.len() >= 11 {
         let bytes = stripped.as_bytes();
         // Look for 6 digits (YYMMDD) followed by C or P followed by 1..=8 digits (optional decimal)
         for pos in 1..bytes.len().saturating_sub(7) {
             if bytes[pos..pos + 6].iter().all(u8::is_ascii_digit)
                 && matches!(bytes[pos + 6], b'C' | b'P')
             {
-                let root = &stripped[..pos];
-                let strike = &stripped[pos + 7..];
+                let root = &bytes[..pos];
+                let strike = &bytes[pos + 7..];
                 if !root.is_empty()
                     && root.len() <= 6
-                    && root.bytes().all(|b| b.is_ascii_alphanumeric())
+                    && root.iter().all(u8::is_ascii_alphanumeric)
                     && !strike.is_empty()
                     && strike.len() <= 10
-                    && strike.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    && strike.iter().all(|b| b.is_ascii_digit() || *b == b'.')
                 {
                     return true;
                 }
@@ -1771,12 +1801,13 @@ fn looks_like_option_symbol(raw: &str) -> bool {
             let last = *tokens.last().unwrap_or(&"");
             let ends_with_cp = matches!(last, "C" | "P" | "CALL" | "PUT");
             let has_date_token = tokens.iter().any(|t| {
-                (t.contains('/') && t.len() >= 8)
-                    || (t.len() == 7
-                        && t[0..2].bytes().all(|b| b.is_ascii_digit())
-                        && t[2..5].bytes().all(|b| b.is_ascii_alphabetic())
-                        && t[5..7].bytes().all(|b| b.is_ascii_digit()))
-                    || ((t.len() == 6 || t.len() == 8) && t.bytes().all(|b| b.is_ascii_digit()))
+                let tb = t.as_bytes();
+                (t.contains('/') && t.is_ascii() && tb.len() >= 8)
+                    || (tb.len() == 7
+                        && tb[0..2].iter().all(u8::is_ascii_digit)
+                        && tb[2..5].iter().all(u8::is_ascii_alphabetic)
+                        && tb[5..7].iter().all(u8::is_ascii_digit))
+                    || ((tb.len() == 6 || tb.len() == 8) && tb.iter().all(u8::is_ascii_digit))
             });
             if ends_with_cp && has_date_token {
                 return true;
@@ -2739,5 +2770,48 @@ Cash Report,Data,Ending Cash,EUR,1000.00
             Some("1000.00")
         );
         assert!(ibkr.warnings.iter().any(|w| w.contains("option")));
+    }
+
+    #[test]
+    fn p1_1_non_ascii_symbols_never_panic_in_option_detection() {
+        // Multi-byte UTF-8 tokens with byte length == 7 (e.g. "腾讯A" = 7 bytes) used to panic on t[0..2].
+        assert!(!looks_like_option_symbol("腾讯A 250 C"));
+        assert!(!looks_like_option_symbol("中文字 2026 C"));
+        assert!(!looks_like_option_symbol("腾讯控股 250 CALL"));
+        assert!(!looks_like_option_symbol("中国平安261218C50"));
+        assert!(!looks_like_option_symbol("¥100 2026 P"));
+        // Valid ASCII option symbols still detect accurately.
+        assert!(looks_like_option_symbol("AAPL 18DEC26 250 C"));
+        assert!(looks_like_option_symbol("AAPL261218C250000"));
+        assert!(looks_like_option_symbol("NVDA 20261218 140.0 CALL"));
+    }
+
+    #[test]
+    fn p2_reverse_split_and_negative_split_never_inflate_shares_in_replay() {
+        let csv = r#"Date,Action,Symbol,Description,Quantity,Price,Fees & Comm,Amount
+01/05/2026,Buy,ACME,ACME CORP,100,$10.00,$0.00,-$1000.00
+02/01/2026,Reverse Split,ACME,ACME CORP,50,$0.00,$0.00,$0.00
+02/15/2026,合股,ACME,ACME CORP,20,$0.00,$0.00,$0.00
+03/01/2026,Stock Split,ACME,ACME CORP,-30,$0.00,$0.00,$0.00
+"#;
+        let preview = parse_and_preview_csv(csv, "reverse-split.csv", false).expect("parse");
+        let acme = preview
+            .snapshot
+            .holdings
+            .iter()
+            .find(|h| h.symbol == "ACME")
+            .expect("ACME holding");
+        // Must NEVER add 50 + 20 + 30 to inflate shares to 200.
+        assert_eq!(acme.quantity, "100");
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .filter(|w| w.contains("Reverse split / share consolidation"))
+                .count()
+                >= 3,
+            "expected explicit warnings for all reverse splits, got: {:?}",
+            preview.warnings
+        );
     }
 }

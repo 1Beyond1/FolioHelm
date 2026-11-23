@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Language } from "../../types";
+import type { TradePrefill } from "../../domain/contracts";
+import { decimalToNumber } from "../../domain/decimal";
 import { MOCK_BROKER } from "../../domain/mockBroker";
+import { getCurrentLockEpoch, isCurrentLockEpoch } from "../../domain/sessionEpoch";
+import {
+  evaluateWatchlistItem,
+  microsToDisplayDecimal,
+  WATCHLIST_STORE,
+  type EvaluatedWatchlistItem,
+  type WatchlistAlertStatus,
+  type WatchlistItem,
+} from "../../domain/watchlist";
 import {
   chartLinePath,
   companyForLanguage,
@@ -16,7 +27,7 @@ import "./markets.css";
 export interface MarketsPageProps {
   language: Language;
   onOpenInstrument: (symbol: string) => void;
-  onOpenTrade: (symbol: string) => void;
+  onOpenTrade: (symbol: string, prefill?: TradePrefill) => void;
 }
 
 type MoverMode = "gainers" | "losers";
@@ -67,7 +78,147 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
   const [query, setQuery] = useState("");
   const [moverMode, setMoverMode] = useState<MoverMode>("gainers");
   const [, setBrokerTick] = useState(0);
-  useEffect(() => MOCK_BROKER.subscribe(() => setBrokerTick((v) => v + 1)), []);
+  useEffect(() => {
+    const bump = () => setBrokerTick((v) => v + 1);
+    const unsubBroker = MOCK_BROKER.subscribe(bump);
+    const unsubWatchlist = WATCHLIST_STORE.subscribe(bump);
+    return () => {
+      unsubBroker();
+      unsubWatchlist();
+    };
+  }, []);
+
+  // v0.2.0: Local encrypted Watchlist & Price Target Alerts state
+  const [editingWatchId, setEditingWatchId] = useState<string | null>(null);
+  const [watchSymbol, setWatchSymbol] = useState("");
+  const [watchCurrency, setWatchCurrency] = useState("USD");
+  const [watchBuyTarget, setWatchBuyTarget] = useState("");
+  const [watchSellTarget, setWatchSellTarget] = useState("");
+  const [watchNote, setWatchNote] = useState("");
+  const [watchBusy, setWatchBusy] = useState(false);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const [watchStatusMsg, setWatchStatusMsg] = useState<string | null>(null);
+
+  const brokerSnapshot = MOCK_BROKER.getSnapshot();
+  const watchlistRevision = WATCHLIST_STORE.getRevision();
+  const evaluatedWatchlist = useMemo<EvaluatedWatchlistItem[]>(() => {
+    return WATCHLIST_STORE.getAll().map((item) => evaluateWatchlistItem(item, brokerSnapshot));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brokerSnapshot, watchlistRevision]);
+
+  const triggeredAlertCount = evaluatedWatchlist.filter(
+    (entry) => entry.status === "buy-triggered" || entry.status === "sell-triggered",
+  ).length;
+
+  function resetWatchlistForm() {
+    setEditingWatchId(null);
+    setWatchSymbol("");
+    setWatchCurrency("USD");
+    setWatchBuyTarget("");
+    setWatchSellTarget("");
+    setWatchNote("");
+    setWatchError(null);
+  }
+
+  function startEditWatchlistItem(item: WatchlistItem) {
+    setEditingWatchId(item.id);
+    setWatchSymbol(item.symbol);
+    setWatchCurrency(item.currency);
+    setWatchBuyTarget(microsToDisplayDecimal(item.targetBuyMicros) ?? "");
+    setWatchSellTarget(microsToDisplayDecimal(item.targetSellMicros) ?? "");
+    setWatchNote(item.note);
+    setWatchError(null);
+    setWatchStatusMsg(null);
+  }
+
+  async function handleSaveWatchlistItem() {
+    const epoch = getCurrentLockEpoch();
+    setWatchError(null);
+    setWatchStatusMsg(null);
+    setWatchBusy(true);
+    try {
+      const saved = await WATCHLIST_STORE.upsert({
+        id: editingWatchId ?? undefined,
+        symbol: watchSymbol,
+        currency: watchCurrency,
+        targetBuyDecimal: watchBuyTarget || null,
+        targetSellDecimal: watchSellTarget || null,
+        note: watchNote,
+        enabled: true,
+      });
+      if (!isCurrentLockEpoch(epoch)) return;
+      const wasEditing = editingWatchId !== null;
+      resetWatchlistForm();
+      setWatchStatusMsg(
+        wasEditing
+          ? (chinese ? `已更新自选目标价：${saved.symbol} (${saved.currency})。` : `Updated watchlist target for ${saved.symbol} (${saved.currency}).`)
+          : (chinese ? `已加密保存至本地自选表：${saved.symbol} (${saved.currency})。` : `Saved ${saved.symbol} (${saved.currency}) to encrypted local watchlist.`),
+      );
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setWatchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (isCurrentLockEpoch(epoch)) {
+        setWatchBusy(false);
+      }
+    }
+  }
+
+  async function handleToggleWatchlistItem(id: string) {
+    const epoch = getCurrentLockEpoch();
+    setWatchError(null);
+    try {
+      await WATCHLIST_STORE.toggleEnabled(id);
+      if (!isCurrentLockEpoch(epoch)) return;
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setWatchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleDeleteWatchlistItem(id: string) {
+    const epoch = getCurrentLockEpoch();
+    setWatchError(null);
+    try {
+      const deleted = await WATCHLIST_STORE.remove(id);
+      if (!isCurrentLockEpoch(epoch)) return;
+      if (deleted && editingWatchId === id) {
+        resetWatchlistForm();
+      }
+    } catch (error) {
+      if (!isCurrentLockEpoch(epoch)) return;
+      setWatchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function alertStatusLabel(status: WatchlistAlertStatus): string {
+    if (chinese) {
+      switch (status) {
+        case "buy-triggered":
+          return "触达买入目标";
+        case "sell-triggered":
+          return "触达卖出目标";
+        case "watching":
+          return "监控中";
+        case "disabled":
+          return "已暂停";
+        case "no-price":
+          return "暂无报价";
+      }
+    }
+    switch (status) {
+      case "buy-triggered":
+        return "Buy target hit";
+      case "sell-triggered":
+        return "Sell target hit";
+      case "watching":
+        return "Watching";
+      case "disabled":
+        return "Paused";
+      case "no-price":
+        return "No price";
+    }
+  }
 
   const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
   const marketSecurities = getMarketSecurities();
@@ -381,6 +532,276 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
           <p className="markets-movers-note">{moversNoteText}</p>
         </aside>
       </div>
+
+      <section
+        className="markets-card markets-targets-card"
+        data-testid="watchlist-targets-panel"
+        aria-labelledby="markets-targets-title"
+      >
+        <div className="markets-section-heading markets-card-heading">
+          <div>
+            <span className="markets-kicker">
+              {chinese ? "本地加密自选与目标价预警 · 只读提示" : "Encrypted local watchlist & price targets · Read-only"}
+            </span>
+            <h2 id="markets-targets-title">
+              {chinese ? "自选观察表与目标价预警" : "Watchlist & price target alerts"}
+            </h2>
+            <p>
+              {chinese
+                ? "添加任意标的及买入/卖出目标价，按同币种本地持仓价或延迟公开行情实时比对；触发后仅高亮只读提示并可一键打开纸上模拟单人工复核，绝不自动下单。"
+                : "Configure buy/sell price targets for any symbol in its native currency. Triggered alerts highlight read-only and prefill a manual paper trade ticket — never auto-executing."}
+            </p>
+          </div>
+          <div className="markets-targets-badges">
+            <span className="markets-card-count" data-testid="watchlist-item-count">
+              {evaluatedWatchlist.length} {chinese ? "项观察" : "watched"}
+            </span>
+            {triggeredAlertCount > 0 && (
+              <span className="markets-alert-count-badge" data-testid="watchlist-triggered-count">
+                {chinese ? `${triggeredAlertCount} 项已触达目标价` : `${triggeredAlertCount} target alert(s) hit`}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <form
+          className="markets-targets-form"
+          data-testid="watchlist-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleSaveWatchlistItem();
+          }}
+        >
+          <label>
+            <span>{chinese ? "标的代码" : "Symbol"}</span>
+            <input
+              type="text"
+              data-testid="watchlist-symbol-input"
+              placeholder="e.g. AAPL, 00700.HK"
+              value={watchSymbol}
+              onChange={(event) => setWatchSymbol(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>{chinese ? "币种" : "Currency"}</span>
+            <select
+              data-testid="watchlist-currency-select"
+              value={watchCurrency}
+              onChange={(event) => setWatchCurrency(event.target.value)}
+            >
+              {["USD", "HKD", "CNY", "EUR", "GBP", "SGD"].map((curr) => (
+                <option key={curr} value={curr}>{curr}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>{chinese ? "买入目标价 (≤)" : "Target buy (≤)"}</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              data-testid="watchlist-buy-input"
+              placeholder="e.g. 210.00"
+              value={watchBuyTarget}
+              onChange={(event) => setWatchBuyTarget(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>{chinese ? "卖出目标价 (≥)" : "Target sell (≥)"}</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              data-testid="watchlist-sell-input"
+              placeholder="e.g. 250.00"
+              value={watchSellTarget}
+              onChange={(event) => setWatchSellTarget(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>{chinese ? "备注（可选）" : "Note (optional)"}</span>
+            <input
+              type="text"
+              data-testid="watchlist-note-input"
+              placeholder={chinese ? "如 回踩均线关注" : "e.g. Support level watch"}
+              value={watchNote}
+              onChange={(event) => setWatchNote(event.target.value)}
+            />
+          </label>
+          <div className="markets-targets-form-actions">
+            <button
+              type="submit"
+              className="markets-trade-button markets-targets-submit"
+              data-testid="watchlist-submit"
+              disabled={watchBusy}
+            >
+              {editingWatchId
+                ? (chinese ? "保存修改" : "Save changes")
+                : (chinese ? "添加观察" : "Add target")}
+            </button>
+            {editingWatchId && (
+              <button
+                type="button"
+                className="markets-secondary-button"
+                data-testid="watchlist-cancel-edit"
+                onClick={resetWatchlistForm}
+              >
+                {chinese ? "取消" : "Cancel"}
+              </button>
+            )}
+          </div>
+        </form>
+
+        {watchError && (
+          <p className="markets-targets-error" role="alert" data-testid="watchlist-error">
+            {watchError}
+          </p>
+        )}
+        {watchStatusMsg && (
+          <p className="markets-targets-status" role="status" data-testid="watchlist-status">
+            {watchStatusMsg}
+          </p>
+        )}
+
+        <div className="markets-table-wrap">
+          <table className="markets-table markets-targets-table" data-testid="watchlist-table">
+            <thead>
+              <tr>
+                <th scope="col">{copy.symbol}</th>
+                <th scope="col" className="markets-number-cell">{copy.price}</th>
+                <th scope="col" className="markets-number-cell">{chinese ? "买入目标 (≤)" : "Target buy (≤)"}</th>
+                <th scope="col" className="markets-number-cell">{chinese ? "卖出目标 (≥)" : "Target sell (≥)"}</th>
+                <th scope="col">{chinese ? "预警状态" : "Alert status"}</th>
+                <th scope="col">{chinese ? "备注" : "Note"}</th>
+                <th scope="col" className="markets-action-cell">{copy.action}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {evaluatedWatchlist.map((entry) => {
+                const { item } = entry;
+                const isHit = entry.status === "buy-triggered" || entry.status === "sell-triggered";
+                const suggestedSide = entry.status === "sell-triggered" ? "sell" : "buy";
+                const suggestedLimit = entry.status === "sell-triggered"
+                  ? (entry.targetSellDecimal ?? entry.currentPrice ?? undefined)
+                  : (entry.targetBuyDecimal ?? entry.currentPrice ?? undefined);
+
+                return (
+                  <tr
+                    key={item.id}
+                    className={isHit ? "markets-target-row-hit" : undefined}
+                    data-testid={`watchlist-row-${item.symbol}`}
+                    data-alert-status={entry.status}
+                  >
+                    <td>
+                      <div className="markets-target-symbol-cell">
+                        <button
+                          type="button"
+                          className="markets-symbol-button"
+                          onClick={() => onOpenInstrument(item.symbol)}
+                          aria-label={`${copy.openInstrument}: ${item.symbol}`}
+                        >
+                          <strong>{item.symbol}</strong>
+                          <ArrowIcon />
+                        </button>
+                        <span className="markets-currency-pill">{item.currency}</span>
+                      </div>
+                    </td>
+                    <td className="markets-number-cell markets-price-cell">
+                      {entry.currentPrice !== null ? (
+                        <div>
+                          <div>{formatPrice(decimalToNumber(entry.currentPrice), language, item.currency)}</div>
+                          <small className="markets-target-source">
+                            {entry.priceSource === "public-delayed"
+                              ? (chinese ? "延迟行情" : "Delayed")
+                              : entry.priceSource === "holding-baseline"
+                                ? (chinese ? "持仓基准" : "Holding")
+                                : (chinese ? "演示报价" : "Demo")}
+                          </small>
+                        </div>
+                      ) : "—"}
+                    </td>
+                    <td className="markets-number-cell">
+                      {entry.targetBuyDecimal !== null
+                        ? formatPrice(decimalToNumber(entry.targetBuyDecimal), language, item.currency)
+                        : "—"}
+                    </td>
+                    <td className="markets-number-cell">
+                      {entry.targetSellDecimal !== null
+                        ? formatPrice(decimalToNumber(entry.targetSellDecimal), language, item.currency)
+                        : "—"}
+                    </td>
+                    <td>
+                      <span
+                        className={`markets-alert-badge markets-alert-badge--${entry.status}`}
+                        data-testid={`watchlist-badge-${item.symbol}`}
+                      >
+                        {alertStatusLabel(entry.status)}
+                      </span>
+                    </td>
+                    <td className="markets-company-cell" title={item.note}>
+                      {item.note || "—"}
+                    </td>
+                    <td className="markets-action-cell">
+                      <div className="markets-target-actions">
+                        <button
+                          type="button"
+                          className="markets-trade-button"
+                          data-testid={`watchlist-review-trade-${item.symbol}`}
+                          onClick={() =>
+                            onOpenTrade(item.symbol, {
+                              symbol: item.symbol,
+                              side: suggestedSide,
+                              orderType: suggestedLimit ? "limit" : "market",
+                              limitPrice: suggestedLimit,
+                              currency: item.currency,
+                            })
+                          }
+                        >
+                          {chinese ? "人工复核单" : "Review ticket"}
+                        </button>
+                        <button
+                          type="button"
+                          className="markets-secondary-button"
+                          data-testid={`watchlist-toggle-${item.symbol}`}
+                          onClick={() => void handleToggleWatchlistItem(item.id)}
+                        >
+                          {item.enabled ? (chinese ? "暂停" : "Pause") : (chinese ? "启用" : "Resume")}
+                        </button>
+                        <button
+                          type="button"
+                          className="markets-secondary-button"
+                          data-testid={`watchlist-edit-${item.symbol}`}
+                          onClick={() => startEditWatchlistItem(item)}
+                        >
+                          {chinese ? "编辑" : "Edit"}
+                        </button>
+                        <button
+                          type="button"
+                          className="markets-secondary-button"
+                          data-testid={`watchlist-delete-${item.symbol}`}
+                          onClick={() => void handleDeleteWatchlistItem(item.id)}
+                        >
+                          {chinese ? "删除" : "Delete"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+              {evaluatedWatchlist.length === 0 && (
+                <tr>
+                  <td className="markets-empty-cell" colSpan={7} data-testid="watchlist-empty">
+                    <strong>{chinese ? "尚未添加自选观察标的" : "No watchlist targets yet"}</strong>
+                    <span>
+                      {chinese
+                        ? "在上方输入代码与买入/卖出目标价，即可在本地加密监控并接收只读价格提醒。"
+                        : "Enter any ticker and optional buy/sell target prices above to monitor alerts locally."}
+                    </span>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </main>
   );
 }

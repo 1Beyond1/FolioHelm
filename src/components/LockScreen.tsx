@@ -10,6 +10,7 @@ export interface LockScreenProps {
   retryAfterSeconds: number;
   retryNonce?: number;
   errorMessage: string | null;
+  locking?: boolean;
   unlocking: boolean;
   onUnlock: (passphrase: string) => Promise<void>;
 }
@@ -24,6 +25,7 @@ const COPY = {
     passphrasePlaceholder: "Enter passphrase to unlock",
     noPassphraseHint: "No custom passphrase is set. Click unlock to re-verify your OS Credential Manager key and resume.",
     unlock: "Unlock vault",
+    locking: "Locking…",
     unlocking: "Verifying…",
     backoff: (seconds: number) => `Too many failed attempts. Wait ${seconds}s before retrying.`,
     lockedAt: "Locked at",
@@ -38,6 +40,7 @@ const COPY = {
     passphrasePlaceholder: "请输入解锁口令",
     noPassphraseHint: "尚未配置自定义锁屏口令。点击解锁将重新校验操作系统凭证密钥并恢复会话。",
     unlock: "解锁金库",
+    locking: "正在锁定…",
     unlocking: "正在校验…",
     backoff: (seconds: number) => `失败次数过多，请等待 ${seconds} 秒后重试。`,
     lockedAt: "锁定时间",
@@ -53,6 +56,7 @@ export function LockScreen({
   retryAfterSeconds,
   retryNonce = 0,
   errorMessage,
+  locking = false,
   unlocking,
   onUnlock,
 }: LockScreenProps) {
@@ -75,7 +79,7 @@ export function LockScreen({
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (unlocking || countdown > 0) return;
+    if (locking || unlocking || countdown > 0) return;
     const current = passphrase;
     setPassphrase("");
     await onUnlock(current);
@@ -116,7 +120,7 @@ export function LockScreen({
                 autoComplete="current-password"
                 autoFocus
                 value={passphrase}
-                disabled={unlocking || countdown > 0}
+                disabled={locking || unlocking || countdown > 0}
                 onChange={(event) => setPassphrase(event.target.value)}
               />
             </label>
@@ -140,9 +144,9 @@ export function LockScreen({
             type="submit"
             className="app-lock-submit"
             data-testid="app-lock-unlock-button"
-            disabled={unlocking || countdown > 0 || (hasPassphrase && passphrase.length === 0)}
+            disabled={locking || unlocking || countdown > 0 || (hasPassphrase && passphrase.length === 0)}
           >
-            {unlocking ? copy.unlocking : copy.unlock}
+            {locking ? copy.locking : unlocking ? copy.unlocking : copy.unlock}
           </button>
         </form>
 
