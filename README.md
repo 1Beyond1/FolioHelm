@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 FolioHelm is a local-first, security-first Windows desktop portfolio and paper-trading workbench built with **Tauri 2, Rust, React, and TypeScript**.
 
-> **Honest capability boundary**: FolioHelm currently operates in two strictly isolated local modes — **Mock Demo** and **Local Portfolio (CSV + Paper)** — with zero brokerage write capability. Direct Charles Schwab OAuth login and live order execution remain intentionally disabled pending official [API Gate](docs/api-gate.md) approval.
+> FolioHelm runs in two isolated local modes — **Mock Demo** and **Local Portfolio (CSV + Paper)** — keeping all portfolio data on your machine. Live brokerage OAuth and order execution are planned once [API Gate](docs/api-gate.md) review is completed.
 
 ## What's Implemented
 
@@ -19,29 +19,28 @@ FolioHelm is a local-first, security-first Windows desktop portfolio and paper-t
 - **Safe Multi-Broker CSV Import, Multi-Currency Fail-Safe Isolation & Full-Site Local Portfolio**:
   - Supports **Charles Schwab**, **Interactive Brokers (IBKR)**, **Fidelity**, **Vanguard**, **Futu (富途)**, **Tiger (老虎)**, and **Standard Portfolio CSV**.
   - Enforces a 5 MB / 10,000-row safety limit, neutralizes spreadsheet formula injection (`=`, `+`, `-`, `@` prefixes), validates ticker format and non-negative share quantities, calculates cost basis and P&L with **exact `Decimal` / fixed-point arithmetic** (never IEEE-754 floats), and computes deterministic SHA-256 fingerprints for **idempotent deduplication**.
-  - **Multi-Currency Fail-Safe Isolation**: when a CSV spans multiple settlement currencies (e.g., USD + HKD), FolioHelm isolates per-currency subtotals and explicitly refuses to sum cross-currency totals or compute cross-currency weights without verified FX rates.
-  - **Full-Site Arbitrary-Ticker Support**: imported non-demo holdings (e.g., `VOO`, `QQQ`, `BRK.B`, `00700.HK`) work seamlessly across Home, Search (`Ctrl+K`), Markets, Instrument Detail, Portfolio, Paper Trade, and Orders without ever fabricating mock price charts, stats, or market news.
+  - **Multi-Currency Isolation**: when a CSV spans multiple settlement currencies (e.g., USD + HKD), FolioHelm isolates per-currency subtotals and computes allocation and rebalance plans per currency bucket without mixing currencies.
+  - **Full-Site Arbitrary-Ticker Support**: imported non-demo holdings (e.g., `VOO`, `QQQ`, `BRK.B`, `00700.HK`) work seamlessly across Home, Search (`Ctrl+K`), Markets, Instrument Detail, Portfolio, Paper Trade, and Orders using real imported positions, cached quotes, and local NAV history.
 - **Target Allocation & Read-Only Rebalance Calculator (Pure Decimal)**:
   - Multi-holding allocation donut plus an encrypted-persisted target-weight planner strictly validating that holdings + cash sum to exactly **100%**.
-  - Supports both **Full Rebalance** and **Cash-Only Buy** (zero-sell) modes using pure exact `Decimal` math, with single-row one-click prefill into the 4-step paper trade ticket (**batch auto-execution is permanently disabled**).
+  - Supports both **Full Rebalance** and **Cash-Only Buy** (zero-sell) modes using pure exact `Decimal` math, with single-row one-click prefill into the 4-step paper trade ticket (manual single-order review only; no batch auto-execution).
 - **Hardened Optional Delayed Public Quotes (Off by Default)**:
   - Disabled by default for local-first operation. When explicitly enabled in **Settings**, the Rust backend fetches unauthenticated, delayed read-only quotes exclusively from HTTPS-allowlisted hosts (`stooq.com` and `query1.finance.yahoo.com`) with `url.port().is_none()`, redirects disabled, **zero `f64`** (`i128` fixed-point parsing), a 512 KiB streamed HTTP body cap, bounded 4-way concurrency with a 20s batch timeout, encrypted cache persistence, and automatic offline fallback to cached or CSV baseline prices.
-  - Every public quote view is clearly marked **"Delayed read-only public quotes · Not for live order execution"**.
 - **Native Desktop File Dialogs & Strict CSP**:
   - Uses controlled Rust `tauri-plugin-dialog` commands for opening brokerage CSVs and saving evidence bundles or safety diagnostics (gracefully falling back to browser file inputs and deferred-revoke Blob downloads in browser previews).
   - Preserves a strict WebView Content Security Policy without exposing external network origins or unrestricted filesystem access to the frontend.
 - **Interactive Workbench**:
   - Global symbol search (`Ctrl+K`), market/instrument explorer, portfolio allocation & return views, annual investing activity/return heatmap, working/filled/canceled/rejected/unknown order timelines with reconciliation, and a 4-step simulated trade workflow (`Ticket → Safety check → Mock preview → Demo receipt`).
 
-### Not Yet Implemented (API Gate Bounded)
+### Roadmap
 
-- Direct Charles Schwab OAuth / live API connection
-- Real-time brokerage execution quotes and live order submission
-- Remote notary service deployment (local Ed25519 checkpoint/receipt primitives exist in Rust; no remote notary calls are enabled)
+- Charles Schwab OAuth and live brokerage API integration (pending [API Gate](docs/api-gate.md))
+- Real-time execution quotes and live order submission
+- Optional remote notary checkpoint integration (local Ed25519 checkpoint/receipt primitives already exist in Rust)
 
 ## Interface Preview
 
-Screenshots from the local workbench (16:9; demo figures shown are fictional):
+Local workbench preview:
 
 ![Home](docs/images/home-16x9.jpg)
 
