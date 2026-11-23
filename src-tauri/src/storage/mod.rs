@@ -716,6 +716,519 @@ fn recover_interrupted_restore(
     Ok(())
 }
 
+struct StagedBackupRestore {
+    verified_journal: EvidenceJournal,
+    summary: VaultRestoreSummaryDto,
+    staging_file_name: String,
+    backup_file_name: String,
+    staging_path: PathBuf,
+    backup_path: PathBuf,
+}
+
+/// Shared cryptographic validation, AES-256-GCM re-encryption, and sibling SQLite staging
+/// helper used by both normal (`Unlocked`) restore and disaster-recovery (`ErrorLocked`) restore.
+fn validate_and_stage_backup_payload(
+    db_path: &Path,
+    payload: &VaultBackupPayload,
+    db_master_key: &[u8; 32],
+    preserved_verifier: Option<&AppLockVerifier>,
+    preserved_backoff: &AppLockBackoffState,
+) -> Result<StagedBackupRestore, StorageError> {
+    if payload.schema_version != STORAGE_SCHEMA_VERSION {
+        return Err(StorageError::Integrity(format!(
+            "unsupported backup schema version {}",
+            payload.schema_version
+        )));
+    }
+
+    let restored_signing_key = decode_signing_key_hex(&payload.device_signing_seed_hex)?;
+    let verified_journal = EvidenceJournal::from_persisted(
+        restored_signing_key.clone(),
+        payload.evidence_entries.clone(),
+    )
+    .map_err(|error| {
+        StorageError::Integrity(format!(
+            "backup evidence chain failed cryptographic verification: {error}"
+        ))
+    })?;
+
+    // Pre-validate all record constraints and unique keys before writing anything.
+    let mut seen_evidence_seq = BTreeSet::new();
+    let mut seen_evidence_ids = BTreeSet::new();
+    for entry in &payload.evidence_entries {
+        if !seen_evidence_seq.insert(entry.event.sequence) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate evidence sequence {}",
+                entry.event.sequence
+            )));
+        }
+        if !seen_evidence_ids.insert(entry.event.event_id.as_str()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate evidence event_id '{}'",
+                entry.event.event_id
+            )));
+        }
+    }
+
+    let mut seen_portfolio_ids = BTreeSet::new();
+    let mut seen_portfolio_fps = BTreeSet::new();
+    for snapshot in &payload.portfolio_snapshots {
+        if snapshot.id.trim().is_empty() || snapshot.fingerprint.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "backup contains portfolio snapshot with empty id or fingerprint".to_string(),
+            ));
+        }
+        if !seen_portfolio_ids.insert(snapshot.id.as_str()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate portfolio snapshot id '{}'",
+                snapshot.id
+            )));
+        }
+        if !seen_portfolio_fps.insert(snapshot.fingerprint.as_str()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate portfolio snapshot fingerprint '{}'",
+                snapshot.fingerprint
+            )));
+        }
+    }
+
+    let mut seen_order_ids = BTreeSet::new();
+    for order in &payload.paper_orders {
+        if order.id.trim().is_empty()
+            || !matches!(order.workspace_mode.as_str(), "mock" | "local-csv")
+        {
+            return Err(StorageError::InvalidInput(
+                "backup contains invalid paper order".to_string(),
+            ));
+        }
+        if !seen_order_ids.insert(order.id.as_str()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate paper order id '{}'",
+                order.id
+            )));
+        }
+    }
+
+    let mut seen_quote_symbols = BTreeSet::new();
+    for quote in &payload.quote_cache {
+        if quote.symbol.trim().is_empty() {
+            return Err(StorageError::InvalidInput(
+                "backup contains quote cache entry with empty symbol".to_string(),
+            ));
+        }
+        if !seen_quote_symbols.insert(quote.symbol.as_str()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate quote cache symbol '{}'",
+                quote.symbol
+            )));
+        }
+    }
+
+    for key in payload.settings.keys() {
+        if key.trim().is_empty() || key.len() > 128 {
+            return Err(StorageError::InvalidInput(
+                "backup contains invalid setting key".to_string(),
+            ));
+        }
+    }
+
+    let mut seen_account_ids = BTreeSet::new();
+    let mut normalized_accounts = Vec::with_capacity(payload.accounts.len());
+    for account in &payload.accounts {
+        let norm = validate_and_normalize_account(account)?;
+        if !seen_account_ids.insert(norm.id.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate account id '{}'",
+                norm.id
+            )));
+        }
+        normalized_accounts.push(norm);
+    }
+
+    let mut seen_nav_ids = BTreeSet::new();
+    let mut normalized_nav_snapshots = Vec::with_capacity(payload.nav_snapshots.len());
+    for snap in &payload.nav_snapshots {
+        let norm = validate_and_normalize_nav_snapshot(snap)?;
+        let record_id = norm.record_id();
+        if !seen_nav_ids.insert(record_id.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate nav snapshot '{record_id}'"
+            )));
+        }
+        normalized_nav_snapshots.push((record_id, norm));
+    }
+
+    let mut seen_bench_symbols = BTreeSet::new();
+    let mut normalized_benchmarks = Vec::with_capacity(payload.benchmark_history.len());
+    for series in &payload.benchmark_history {
+        let norm = validate_and_normalize_benchmark_series(series)?;
+        if !seen_bench_symbols.insert(norm.symbol.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate benchmark symbol '{}'",
+                norm.symbol
+            )));
+        }
+        normalized_benchmarks.push(norm);
+    }
+
+    let mut seen_cash_flow_ids = BTreeSet::new();
+    let mut normalized_cash_flows = Vec::with_capacity(payload.cash_flows.len());
+    for cf in &payload.cash_flows {
+        let norm = validate_and_normalize_cash_flow(cf)?;
+        if !seen_cash_flow_ids.insert(norm.id.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate cash flow id '{}'",
+                norm.id
+            )));
+        }
+        normalized_cash_flows.push(norm);
+    }
+
+    let mut seen_watchlist_ids = BTreeSet::new();
+    let mut seen_watchlist_symbols = BTreeSet::new();
+    let mut normalized_watchlist = Vec::with_capacity(payload.watchlist_items.len());
+    for item in &payload.watchlist_items {
+        let norm = validate_and_normalize_watchlist_item(item)?;
+        if !seen_watchlist_ids.insert(norm.id.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate watchlist id '{}'",
+                norm.id
+            )));
+        }
+        if !seen_watchlist_symbols.insert(norm.symbol.clone()) {
+            return Err(StorageError::InvalidInput(format!(
+                "backup contains duplicate watchlist symbol '{}'",
+                norm.symbol
+            )));
+        }
+        normalized_watchlist.push(norm);
+    }
+
+    // Pre-encrypt every restored record under `db_master_key`.
+    let mut encrypted_evidence = Vec::with_capacity(payload.evidence_entries.len());
+    for entry in &payload.evidence_entries {
+        let seq = i64::try_from(entry.event.sequence)
+            .map_err(|_| StorageError::InvalidInput("evidence sequence overflow".to_string()))?;
+        let aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            "evidence_entries",
+            &entry.event.sequence.to_string(),
+        );
+        let plaintext = Zeroizing::new(serde_json::to_vec(entry)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_evidence.push((
+            seq,
+            entry.event.event_id.clone(),
+            entry.event.occurred_at_utc.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_portfolios = Vec::with_capacity(payload.portfolio_snapshots.len());
+    for snapshot in &payload.portfolio_snapshots {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &snapshot.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(snapshot)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_portfolios.push((
+            snapshot.id.clone(),
+            snapshot.fingerprint.clone(),
+            snapshot.source_format.clone(),
+            snapshot.imported_at_utc.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_orders = Vec::with_capacity(payload.paper_orders.len());
+    for order in &payload.paper_orders {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(order)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_orders.push((
+            order.id.clone(),
+            order.workspace_mode.clone(),
+            order.submitted_at.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_quotes = Vec::with_capacity(payload.quote_cache.len());
+    for quote in &payload.quote_cache {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "quote_cache", &quote.symbol);
+        let plaintext = Zeroizing::new(serde_json::to_vec(quote)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_quotes.push((
+            quote.symbol.clone(),
+            quote.provider.clone(),
+            quote.as_of_utc.clone(),
+            ciphertext,
+        ));
+    }
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut encrypted_settings = Vec::with_capacity(payload.settings.len());
+    for (key, value_json) in &payload.settings {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "app_settings", key);
+        let ciphertext = encrypt_record(db_master_key, &aad, value_json.as_bytes())?;
+        encrypted_settings.push((key.clone(), now.clone(), ciphertext));
+    }
+
+    let mut encrypted_accounts = Vec::with_capacity(normalized_accounts.len());
+    for account in &normalized_accounts {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &account.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(account)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_accounts.push((account.id.clone(), account.created_at.clone(), ciphertext));
+    }
+
+    let mut encrypted_nav_snapshots = Vec::with_capacity(normalized_nav_snapshots.len());
+    for (record_id, snap) in &normalized_nav_snapshots {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", record_id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(snap)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_nav_snapshots.push((
+            record_id.clone(),
+            snap.date.clone(),
+            snap.account_id.clone(),
+            snap.currency.clone(),
+            snap.updated_at.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_benchmarks = Vec::with_capacity(normalized_benchmarks.len());
+    for series in &normalized_benchmarks {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &series.symbol);
+        let plaintext = Zeroizing::new(serde_json::to_vec(series)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_benchmarks.push((
+            series.symbol.clone(),
+            series.currency.clone(),
+            series.provider.clone(),
+            series.as_of_utc.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_cash_flows = Vec::with_capacity(normalized_cash_flows.len());
+    for cf in &normalized_cash_flows {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &cf.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(cf)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_cash_flows.push((
+            cf.id.clone(),
+            cf.account_id.clone(),
+            cf.flow_date.clone(),
+            cf.currency.clone(),
+            cf.created_at.clone(),
+            ciphertext,
+        ));
+    }
+
+    let mut encrypted_watchlist = Vec::with_capacity(normalized_watchlist.len());
+    for item in &normalized_watchlist {
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "watchlist_items", &item.id);
+        let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
+        let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+        encrypted_watchlist.push((
+            item.id.clone(),
+            item.symbol.clone(),
+            item.updated_at.clone(),
+            ciphertext,
+        ));
+    }
+
+    // Build and verify an independent staging SQLite file in the same directory.
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| StorageError::Vault(VaultError::RandomnessUnavailable))?;
+    let suffix = encode_hex(&nonce);
+    let base_name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("foliohelm-vault.sqlite");
+    let staging_file_name = format!("{base_name}.restore-staging-{suffix}");
+    let backup_file_name = format!("{base_name}.pre-restore-{suffix}");
+    let staging_path = db_path.with_file_name(&staging_file_name);
+    let backup_path = db_path.with_file_name(&backup_file_name);
+
+    let stage_result: Result<(), StorageError> = (|| {
+        let mut staging_conn = Connection::open(&staging_path)?;
+        configure_connection(&staging_conn)?;
+        initialize_schema_on_conn(&mut staging_conn, db_master_key)?;
+
+        let tx = staging_conn.transaction()?;
+        if let Some(verifier) = preserved_verifier {
+            let plaintext = Zeroizing::new(serde_json::to_vec(verifier)?);
+            let aad = build_aad(
+                STORAGE_SCHEMA_VERSION,
+                "vault_meta",
+                APP_LOCK_VERIFIER_META_KEY,
+            );
+            let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                params![APP_LOCK_VERIFIER_META_KEY, ciphertext],
+            )?;
+        }
+        if preserved_backoff.failed_attempts > 0 || preserved_backoff.locked_until_unix.is_some() {
+            let plaintext = Zeroizing::new(serde_json::to_vec(preserved_backoff)?);
+            let aad = build_aad(
+                STORAGE_SCHEMA_VERSION,
+                "vault_meta",
+                APP_LOCK_BACKOFF_META_KEY,
+            );
+            let ciphertext = encrypt_record(db_master_key, &aad, &plaintext)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
+                params![APP_LOCK_BACKOFF_META_KEY, ciphertext],
+            )?;
+        }
+
+        for (seq, event_id, occurred_at_utc, ciphertext) in &encrypted_evidence {
+            tx.execute(
+                "INSERT INTO evidence_entries (sequence, event_id, occurred_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![seq, event_id, occurred_at_utc, ciphertext],
+            )?;
+        }
+        for (id, fingerprint, source_format, imported_at_utc, ciphertext) in &encrypted_portfolios {
+            tx.execute(
+                "INSERT INTO portfolio_snapshots (id, fingerprint, source_format, imported_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, fingerprint, source_format, imported_at_utc, ciphertext],
+            )?;
+        }
+        for (id, workspace_mode, submitted_at_utc, ciphertext) in &encrypted_orders {
+            tx.execute(
+                "INSERT INTO paper_orders (id, workspace_mode, submitted_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, workspace_mode, submitted_at_utc, ciphertext],
+            )?;
+        }
+        for (symbol, provider, as_of_utc, ciphertext) in &encrypted_quotes {
+            tx.execute(
+                "INSERT INTO quote_cache (symbol, provider, as_of_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![symbol, provider, as_of_utc, ciphertext],
+            )?;
+        }
+        for (key, updated_at_utc, ciphertext) in &encrypted_settings {
+            tx.execute(
+                "INSERT INTO app_settings (setting_key, updated_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3)",
+                params![key, updated_at_utc, ciphertext],
+            )?;
+        }
+        for (id, created_at_utc, ciphertext) in &encrypted_accounts {
+            tx.execute(
+                "INSERT INTO accounts (id, created_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3)",
+                params![id, created_at_utc, ciphertext],
+            )?;
+        }
+        for (record_id, date, account_id, currency, updated_at_utc, ciphertext) in
+            &encrypted_nav_snapshots
+        {
+            tx.execute(
+                "INSERT INTO nav_snapshots
+                    (record_id, date, account_id, currency, updated_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    record_id,
+                    date,
+                    account_id,
+                    currency,
+                    updated_at_utc,
+                    ciphertext
+                ],
+            )?;
+        }
+        for (symbol, currency, provider, updated_at_utc, ciphertext) in &encrypted_benchmarks {
+            tx.execute(
+                "INSERT INTO benchmark_history
+                    (symbol, currency, provider, updated_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![symbol, currency, provider, updated_at_utc, ciphertext],
+            )?;
+        }
+        for (id, account_id, flow_date, currency, created_at_utc, ciphertext) in
+            &encrypted_cash_flows
+        {
+            tx.execute(
+                "INSERT INTO cash_flows
+                    (id, account_id, flow_date, currency, created_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    account_id,
+                    flow_date,
+                    currency,
+                    created_at_utc,
+                    ciphertext
+                ],
+            )?;
+        }
+        for (id, symbol, updated_at_utc, ciphertext) in &encrypted_watchlist {
+            tx.execute(
+                "INSERT INTO watchlist_items
+                    (id, symbol, updated_at_utc, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, symbol, updated_at_utc, ciphertext],
+            )?;
+        }
+        tx.commit()?;
+
+        // Re-read and cryptographically verify staging DB canary + full Ed25519 chain.
+        verify_connection_schema_and_canary(&staging_conn, db_master_key)?;
+        let staged_entries = load_evidence_entries_from_conn(&staging_conn, db_master_key)?;
+        let _ = EvidenceJournal::from_persisted(restored_signing_key.clone(), staged_entries)
+            .map_err(|error| {
+                StorageError::Integrity(format!(
+                    "staged restore database failed Ed25519 verification: {error}"
+                ))
+            })?;
+
+        // Flush WAL into main staging file before closing so a single atomic rename suffices.
+        staging_conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode = DELETE;",
+        )?;
+        drop(staging_conn);
+        for sidecar in sqlite_sidecar_paths(&staging_path) {
+            let _ = fs::remove_file(sidecar);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = stage_result {
+        remove_sqlite_files(&staging_path);
+        return Err(error);
+    }
+
+    let summary = VaultRestoreSummaryDto {
+        evidence_count: encrypted_evidence.len(),
+        portfolio_count: encrypted_portfolios.len(),
+        paper_order_count: encrypted_orders.len(),
+        quote_count: encrypted_quotes.len(),
+        setting_count: encrypted_settings.len(),
+        account_count: encrypted_accounts.len(),
+        nav_snapshot_count: encrypted_nav_snapshots.len(),
+        benchmark_count: encrypted_benchmarks.len(),
+        cash_flow_count: encrypted_cash_flows.len(),
+        watchlist_count: encrypted_watchlist.len(),
+        signer_public_key: verified_journal.signer_public_key_hex(),
+    };
+
+    Ok(StagedBackupRestore {
+        verified_journal,
+        summary,
+        staging_file_name,
+        backup_file_name,
+        staging_path,
+        backup_path,
+    })
+}
+
 impl EncryptedVaultDb {
     /// Open or initialize the encrypted SQLite database at `db_path`.
     pub fn open(
@@ -1893,489 +2406,18 @@ impl EncryptedVaultDb {
         payload: VaultBackupPayload,
         key_store: &dyn KeyStore,
     ) -> Result<(EvidenceJournal, VaultRestoreSummaryDto), StorageError> {
-        if payload.schema_version != STORAGE_SCHEMA_VERSION {
-            return Err(StorageError::Integrity(format!(
-                "unsupported backup schema version {}",
-                payload.schema_version
-            )));
-        }
-
-        let restored_signing_key = decode_signing_key_hex(&payload.device_signing_seed_hex)?;
-        let verified_journal = EvidenceJournal::from_persisted(
-            restored_signing_key.clone(),
-            payload.evidence_entries.clone(),
-        )
-        .map_err(|error| {
-            StorageError::Integrity(format!(
-                "backup evidence chain failed cryptographic verification: {error}"
-            ))
-        })?;
-
-        // Pre-validate all record constraints and unique keys before writing anything.
-        let mut seen_evidence_seq = BTreeSet::new();
-        let mut seen_evidence_ids = BTreeSet::new();
-        for entry in &payload.evidence_entries {
-            if !seen_evidence_seq.insert(entry.event.sequence) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate evidence sequence {}",
-                    entry.event.sequence
-                )));
-            }
-            if !seen_evidence_ids.insert(entry.event.event_id.as_str()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate evidence event_id '{}'",
-                    entry.event.event_id
-                )));
-            }
-        }
-
-        let mut seen_portfolio_ids = BTreeSet::new();
-        let mut seen_portfolio_fps = BTreeSet::new();
-        for snapshot in &payload.portfolio_snapshots {
-            if snapshot.id.trim().is_empty() || snapshot.fingerprint.trim().is_empty() {
-                return Err(StorageError::InvalidInput(
-                    "backup contains portfolio snapshot with empty id or fingerprint".to_string(),
-                ));
-            }
-            if !seen_portfolio_ids.insert(snapshot.id.as_str()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate portfolio snapshot id '{}'",
-                    snapshot.id
-                )));
-            }
-            if !seen_portfolio_fps.insert(snapshot.fingerprint.as_str()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate portfolio snapshot fingerprint '{}'",
-                    snapshot.fingerprint
-                )));
-            }
-        }
-
-        let mut seen_order_ids = BTreeSet::new();
-        for order in &payload.paper_orders {
-            if order.id.trim().is_empty()
-                || !matches!(order.workspace_mode.as_str(), "mock" | "local-csv")
-            {
-                return Err(StorageError::InvalidInput(
-                    "backup contains invalid paper order".to_string(),
-                ));
-            }
-            if !seen_order_ids.insert(order.id.as_str()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate paper order id '{}'",
-                    order.id
-                )));
-            }
-        }
-
-        let mut seen_quote_symbols = BTreeSet::new();
-        for quote in &payload.quote_cache {
-            if quote.symbol.trim().is_empty() {
-                return Err(StorageError::InvalidInput(
-                    "backup contains quote cache entry with empty symbol".to_string(),
-                ));
-            }
-            if !seen_quote_symbols.insert(quote.symbol.as_str()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate quote cache symbol '{}'",
-                    quote.symbol
-                )));
-            }
-        }
-
-        for key in payload.settings.keys() {
-            if key.trim().is_empty() || key.len() > 128 {
-                return Err(StorageError::InvalidInput(
-                    "backup contains invalid setting key".to_string(),
-                ));
-            }
-        }
-
-        let mut seen_account_ids = BTreeSet::new();
-        let mut normalized_accounts = Vec::with_capacity(payload.accounts.len());
-        for account in &payload.accounts {
-            let norm = validate_and_normalize_account(account)?;
-            if !seen_account_ids.insert(norm.id.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate account id '{}'",
-                    norm.id
-                )));
-            }
-            normalized_accounts.push(norm);
-        }
-
-        let mut seen_nav_ids = BTreeSet::new();
-        let mut normalized_nav_snapshots = Vec::with_capacity(payload.nav_snapshots.len());
-        for snap in &payload.nav_snapshots {
-            let norm = validate_and_normalize_nav_snapshot(snap)?;
-            let record_id = norm.record_id();
-            if !seen_nav_ids.insert(record_id.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate nav snapshot '{record_id}'"
-                )));
-            }
-            normalized_nav_snapshots.push((record_id, norm));
-        }
-
-        let mut seen_bench_symbols = BTreeSet::new();
-        let mut normalized_benchmarks = Vec::with_capacity(payload.benchmark_history.len());
-        for series in &payload.benchmark_history {
-            let norm = validate_and_normalize_benchmark_series(series)?;
-            if !seen_bench_symbols.insert(norm.symbol.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate benchmark symbol '{}'",
-                    norm.symbol
-                )));
-            }
-            normalized_benchmarks.push(norm);
-        }
-
-        let mut seen_cash_flow_ids = BTreeSet::new();
-        let mut normalized_cash_flows = Vec::with_capacity(payload.cash_flows.len());
-        for cf in &payload.cash_flows {
-            let norm = validate_and_normalize_cash_flow(cf)?;
-            if !seen_cash_flow_ids.insert(norm.id.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate cash flow id '{}'",
-                    norm.id
-                )));
-            }
-            normalized_cash_flows.push(norm);
-        }
-
-        let mut seen_watchlist_ids = BTreeSet::new();
-        let mut seen_watchlist_symbols = BTreeSet::new();
-        let mut normalized_watchlist = Vec::with_capacity(payload.watchlist_items.len());
-        for item in &payload.watchlist_items {
-            let norm = validate_and_normalize_watchlist_item(item)?;
-            if !seen_watchlist_ids.insert(norm.id.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate watchlist id '{}'",
-                    norm.id
-                )));
-            }
-            if !seen_watchlist_symbols.insert(norm.symbol.clone()) {
-                return Err(StorageError::InvalidInput(format!(
-                    "backup contains duplicate watchlist symbol '{}'",
-                    norm.symbol
-                )));
-            }
-            normalized_watchlist.push(norm);
-        }
-
         // Preserve local device App Lock configuration across backup restore.
         let preserved_verifier = self.load_app_lock_verifier()?;
         let preserved_backoff = self.load_app_lock_backoff()?;
 
-        // Pre-encrypt every restored record with this device's db_master_key.
-        let mut encrypted_evidence = Vec::with_capacity(payload.evidence_entries.len());
-        for entry in &payload.evidence_entries {
-            let seq = i64::try_from(entry.event.sequence).map_err(|_| {
-                StorageError::InvalidInput("evidence sequence overflow".to_string())
-            })?;
-            let aad = build_aad(
-                STORAGE_SCHEMA_VERSION,
-                "evidence_entries",
-                &entry.event.sequence.to_string(),
-            );
-            let plaintext = Zeroizing::new(serde_json::to_vec(entry)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_evidence.push((
-                seq,
-                entry.event.event_id.clone(),
-                entry.event.occurred_at_utc.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_portfolios = Vec::with_capacity(payload.portfolio_snapshots.len());
-        for snapshot in &payload.portfolio_snapshots {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "portfolio_snapshots", &snapshot.id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(snapshot)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_portfolios.push((
-                snapshot.id.clone(),
-                snapshot.fingerprint.clone(),
-                snapshot.source_format.clone(),
-                snapshot.imported_at_utc.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_orders = Vec::with_capacity(payload.paper_orders.len());
-        for order in &payload.paper_orders {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "paper_orders", &order.id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(order)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_orders.push((
-                order.id.clone(),
-                order.workspace_mode.clone(),
-                order.submitted_at.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_quotes = Vec::with_capacity(payload.quote_cache.len());
-        for quote in &payload.quote_cache {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "quote_cache", &quote.symbol);
-            let plaintext = Zeroizing::new(serde_json::to_vec(quote)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_quotes.push((
-                quote.symbol.clone(),
-                quote.provider.clone(),
-                quote.as_of_utc.clone(),
-                ciphertext,
-            ));
-        }
-
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let mut encrypted_settings = Vec::with_capacity(payload.settings.len());
-        for (key, value_json) in &payload.settings {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "app_settings", key);
-            let ciphertext =
-                encrypt_record(self.keys.db_master_key(), &aad, value_json.as_bytes())?;
-            encrypted_settings.push((key.clone(), now.clone(), ciphertext));
-        }
-
-        let mut encrypted_accounts = Vec::with_capacity(normalized_accounts.len());
-        for account in &normalized_accounts {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "accounts", &account.id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(account)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_accounts.push((account.id.clone(), account.created_at.clone(), ciphertext));
-        }
-
-        let mut encrypted_nav_snapshots = Vec::with_capacity(normalized_nav_snapshots.len());
-        for (record_id, snap) in &normalized_nav_snapshots {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", record_id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(snap)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_nav_snapshots.push((
-                record_id.clone(),
-                snap.date.clone(),
-                snap.account_id.clone(),
-                snap.currency.clone(),
-                snap.updated_at.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_benchmarks = Vec::with_capacity(normalized_benchmarks.len());
-        for series in &normalized_benchmarks {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "benchmark_history", &series.symbol);
-            let plaintext = Zeroizing::new(serde_json::to_vec(series)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_benchmarks.push((
-                series.symbol.clone(),
-                series.currency.clone(),
-                series.provider.clone(),
-                series.as_of_utc.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_cash_flows = Vec::with_capacity(normalized_cash_flows.len());
-        for cf in &normalized_cash_flows {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &cf.id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(cf)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_cash_flows.push((
-                cf.id.clone(),
-                cf.account_id.clone(),
-                cf.flow_date.clone(),
-                cf.currency.clone(),
-                cf.created_at.clone(),
-                ciphertext,
-            ));
-        }
-
-        let mut encrypted_watchlist = Vec::with_capacity(normalized_watchlist.len());
-        for item in &normalized_watchlist {
-            let aad = build_aad(STORAGE_SCHEMA_VERSION, "watchlist_items", &item.id);
-            let plaintext = Zeroizing::new(serde_json::to_vec(item)?);
-            let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-            encrypted_watchlist.push((
-                item.id.clone(),
-                item.symbol.clone(),
-                item.updated_at.clone(),
-                ciphertext,
-            ));
-        }
-
-        // Build and verify an independent staging SQLite file in the same directory.
-        let mut nonce = [0_u8; 8];
-        getrandom::fill(&mut nonce)
-            .map_err(|_| StorageError::Vault(VaultError::RandomnessUnavailable))?;
-        let suffix = encode_hex(&nonce);
-        let base_name = self
-            .db_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("foliohelm-vault.sqlite");
-        let staging_file_name = format!("{base_name}.restore-staging-{suffix}");
-        let backup_file_name = format!("{base_name}.pre-restore-{suffix}");
-        let staging_path = self.db_path.with_file_name(&staging_file_name);
-        let backup_path = self.db_path.with_file_name(&backup_file_name);
+        let staged = validate_and_stage_backup_payload(
+            &self.db_path,
+            &payload,
+            self.keys.db_master_key(),
+            preserved_verifier.as_ref(),
+            &preserved_backoff,
+        )?;
         let intent_path = restore_intent_path(&self.db_path);
-
-        let stage_result: Result<(), StorageError> = (|| {
-            let mut staging_conn = Connection::open(&staging_path)?;
-            configure_connection(&staging_conn)?;
-            initialize_schema_on_conn(&mut staging_conn, self.keys.db_master_key())?;
-
-            let tx = staging_conn.transaction()?;
-            if let Some(ref verifier) = preserved_verifier {
-                let plaintext = Zeroizing::new(serde_json::to_vec(verifier)?);
-                let aad = build_aad(
-                    STORAGE_SCHEMA_VERSION,
-                    "vault_meta",
-                    APP_LOCK_VERIFIER_META_KEY,
-                );
-                let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-                    params![APP_LOCK_VERIFIER_META_KEY, ciphertext],
-                )?;
-            }
-            if preserved_backoff.failed_attempts > 0
-                || preserved_backoff.locked_until_unix.is_some()
-            {
-                let plaintext = Zeroizing::new(serde_json::to_vec(&preserved_backoff)?);
-                let aad = build_aad(
-                    STORAGE_SCHEMA_VERSION,
-                    "vault_meta",
-                    APP_LOCK_BACKOFF_META_KEY,
-                );
-                let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO vault_meta (meta_key, meta_value) VALUES (?1, ?2)",
-                    params![APP_LOCK_BACKOFF_META_KEY, ciphertext],
-                )?;
-            }
-
-            for (seq, event_id, occurred_at_utc, ciphertext) in &encrypted_evidence {
-                tx.execute(
-                    "INSERT INTO evidence_entries (sequence, event_id, occurred_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, event_id, occurred_at_utc, ciphertext],
-                )?;
-            }
-            for (id, fingerprint, source_format, imported_at_utc, ciphertext) in
-                &encrypted_portfolios
-            {
-                tx.execute(
-                    "INSERT INTO portfolio_snapshots (id, fingerprint, source_format, imported_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, fingerprint, source_format, imported_at_utc, ciphertext],
-                )?;
-            }
-            for (id, workspace_mode, submitted_at_utc, ciphertext) in &encrypted_orders {
-                tx.execute(
-                    "INSERT INTO paper_orders (id, workspace_mode, submitted_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![id, workspace_mode, submitted_at_utc, ciphertext],
-                )?;
-            }
-            for (symbol, provider, as_of_utc, ciphertext) in &encrypted_quotes {
-                tx.execute(
-                    "INSERT INTO quote_cache (symbol, provider, as_of_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![symbol, provider, as_of_utc, ciphertext],
-                )?;
-            }
-            for (key, updated_at_utc, ciphertext) in &encrypted_settings {
-                tx.execute(
-                    "INSERT INTO app_settings (setting_key, updated_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3)",
-                    params![key, updated_at_utc, ciphertext],
-                )?;
-            }
-            for (id, created_at_utc, ciphertext) in &encrypted_accounts {
-                tx.execute(
-                    "INSERT INTO accounts (id, created_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3)",
-                    params![id, created_at_utc, ciphertext],
-                )?;
-            }
-            for (record_id, date, account_id, currency, updated_at_utc, ciphertext) in
-                &encrypted_nav_snapshots
-            {
-                tx.execute(
-                    "INSERT INTO nav_snapshots
-                        (record_id, date, account_id, currency, updated_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        record_id,
-                        date,
-                        account_id,
-                        currency,
-                        updated_at_utc,
-                        ciphertext
-                    ],
-                )?;
-            }
-            for (symbol, currency, provider, updated_at_utc, ciphertext) in &encrypted_benchmarks {
-                tx.execute(
-                    "INSERT INTO benchmark_history
-                        (symbol, currency, provider, updated_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![symbol, currency, provider, updated_at_utc, ciphertext],
-                )?;
-            }
-            for (id, account_id, flow_date, currency, created_at_utc, ciphertext) in
-                &encrypted_cash_flows
-            {
-                tx.execute(
-                    "INSERT INTO cash_flows
-                        (id, account_id, flow_date, currency, created_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        id,
-                        account_id,
-                        flow_date,
-                        currency,
-                        created_at_utc,
-                        ciphertext
-                    ],
-                )?;
-            }
-            for (id, symbol, updated_at_utc, ciphertext) in &encrypted_watchlist {
-                tx.execute(
-                    "INSERT INTO watchlist_items
-                        (id, symbol, updated_at_utc, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![id, symbol, updated_at_utc, ciphertext],
-                )?;
-            }
-            tx.commit()?;
-
-            // Re-read and cryptographically verify staging DB canary + full Ed25519 chain.
-            verify_connection_schema_and_canary(&staging_conn, self.keys.db_master_key())?;
-            let staged_entries =
-                load_evidence_entries_from_conn(&staging_conn, self.keys.db_master_key())?;
-            let _ = EvidenceJournal::from_persisted(restored_signing_key.clone(), staged_entries)
-                .map_err(|error| {
-                StorageError::Integrity(format!(
-                    "staged restore database failed Ed25519 verification: {error}"
-                ))
-            })?;
-
-            // Flush WAL into main staging file before closing so a single atomic rename suffices.
-            staging_conn.execute_batch(
-                "PRAGMA wal_checkpoint(TRUNCATE);
-                 PRAGMA journal_mode = DELETE;",
-            )?;
-            drop(staging_conn);
-            for sidecar in sqlite_sidecar_paths(&staging_path) {
-                let _ = fs::remove_file(sidecar);
-            }
-            Ok(())
-        })();
-
-        if let Err(error) = stage_result {
-            remove_sqlite_files(&staging_path);
-            return Err(error);
-        }
 
         // Write encrypted crash-recovery intent BEFORE mutating live DB or OS keyring.
         let previous_seed_hex = self.keys.device_signing_seed_hex();
@@ -2383,8 +2425,8 @@ impl EncryptedVaultDb {
             schema_version: STORAGE_SCHEMA_VERSION,
             previous_seed_hex,
             target_seed_hex: payload.device_signing_seed_hex.clone(),
-            staging_file_name,
-            backup_file_name,
+            staging_file_name: staged.staging_file_name,
+            backup_file_name: staged.backup_file_name,
         };
         let intent_plaintext = Zeroizing::new(serde_json::to_vec(&intent)?);
         let intent_aad = build_aad(
@@ -2395,7 +2437,7 @@ impl EncryptedVaultDb {
         let intent_ciphertext =
             encrypt_record(self.keys.db_master_key(), &intent_aad, &intent_plaintext)?;
         if let Err(error) = atomic_write_bytes(&intent_path, &intent_ciphertext) {
-            remove_sqlite_files(&staging_path);
+            remove_sqlite_files(&staged.staging_path);
             return Err(StorageError::Io(error));
         }
 
@@ -2406,7 +2448,7 @@ impl EncryptedVaultDb {
         );
         if let Err(error) = flush_res {
             let _ = configure_connection(&self.conn);
-            remove_sqlite_files(&staging_path);
+            remove_sqlite_files(&staged.staging_path);
             let _ = fs::remove_file(&intent_path);
             return Err(StorageError::Sqlite(error));
         }
@@ -2420,16 +2462,16 @@ impl EncryptedVaultDb {
 
         // Swap live DB -> backup, staging DB -> live DB.
         let swap_result: Result<(), StorageError> = (|| {
-            fs::rename(&self.db_path, &backup_path)?;
-            if let Err(error) = fs::rename(&staging_path, &self.db_path) {
-                let _ = fs::rename(&backup_path, &self.db_path);
+            fs::rename(&self.db_path, &staged.backup_path)?;
+            if let Err(error) = fs::rename(&staged.staging_path, &self.db_path) {
+                let _ = fs::rename(&staged.backup_path, &self.db_path);
                 return Err(StorageError::Io(error));
             }
             Ok(())
         })();
 
         if let Err(error) = swap_result {
-            remove_sqlite_files(&staging_path);
+            remove_sqlite_files(&staged.staging_path);
             return Err(self.try_reopen_original_after_rollback(error, &intent_path));
         }
 
@@ -2441,8 +2483,8 @@ impl EncryptedVaultDb {
             Ok(prev) => prev,
             Err(error) => {
                 remove_sqlite_files(&self.db_path);
-                let rename_res = fs::rename(&backup_path, &self.db_path);
-                remove_sqlite_files(&staging_path);
+                let rename_res = fs::rename(&staged.backup_path, &self.db_path);
+                remove_sqlite_files(&staged.staging_path);
                 if let Err(rename_err) = rename_res {
                     return Err(StorageError::RollbackLockRequired(format!(
                         "restore keyring update failed ({error}); rollback rename failed ({rename_err})"
@@ -2473,7 +2515,7 @@ impl EncryptedVaultDb {
         if let Err(error) = verify_reopened {
             let seed_res = self.keys.restore_signing_seed(key_store, previous_seed);
             remove_sqlite_files(&self.db_path);
-            let rename_res = fs::rename(&backup_path, &self.db_path);
+            let rename_res = fs::rename(&staged.backup_path, &self.db_path);
             if let Err(seed_err) = seed_res {
                 return Err(StorageError::RollbackLockRequired(format!(
                     "restore verification failed ({error}); rollback signing seed restore failed ({seed_err})"
@@ -2488,27 +2530,123 @@ impl EncryptedVaultDb {
         }
 
         // Clean up backup and crash-recovery intent once both DB and keyring are live & verified.
-        remove_sqlite_files(&backup_path);
-        remove_sqlite_files(&staging_path);
+        remove_sqlite_files(&staged.backup_path);
+        remove_sqlite_files(&staged.staging_path);
         let _ = fs::remove_file(&intent_path);
 
         // Smoothly guarantee default account exists even when restoring a legacy v1 backup.
         self.ensure_default_account_if_missing()?;
 
-        let summary = VaultRestoreSummaryDto {
-            evidence_count: encrypted_evidence.len(),
-            portfolio_count: encrypted_portfolios.len(),
-            paper_order_count: encrypted_orders.len(),
-            quote_count: encrypted_quotes.len(),
-            setting_count: encrypted_settings.len(),
-            account_count: encrypted_accounts.len(),
-            nav_snapshot_count: encrypted_nav_snapshots.len(),
-            benchmark_count: encrypted_benchmarks.len(),
-            cash_flow_count: encrypted_cash_flows.len(),
-            watchlist_count: encrypted_watchlist.len(),
-            signer_public_key: verified_journal.signer_public_key_hex(),
+        Ok((staged.verified_journal, staged.summary))
+    }
+
+    /// Disaster-recovery `.fhvault` restore when the vault is in `ErrorLocked`
+    /// (e.g., OS keyring cleared, canary/DB corrupted, or prior rollback failure).
+    ///
+    /// Guarantees:
+    /// - Validates schema, signing seed, full Ed25519 chain, and record uniqueness BEFORE
+    ///   touching any existing DB file or OS keyring entry.
+    /// - Stages & cryptographically verifies a brand-new encrypted SQLite database under a
+    ///   fresh AES-256 `db_master_key` + the backup's Ed25519 signing seed.
+    /// - Backs up any existing unreadable DB file before swapping, rolls back both disk and
+    ///   OS keyring on any failure so original ciphertext is never lost, and transitions
+    ///   cleanly into a live verified `EncryptedVaultDb` only after full post-swap checks pass.
+    pub fn restore_from_error_locked(
+        db_path: &Path,
+        payload: VaultBackupPayload,
+        key_store: &dyn KeyStore,
+        key_provider: impl Into<String>,
+    ) -> Result<(Self, EvidenceJournal, VaultRestoreSummaryDto), StorageError> {
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let recovery_keys = VaultKeyMaterial::for_recovery(&payload.device_signing_seed_hex)?;
+        let staged = validate_and_stage_backup_payload(
+            db_path,
+            &payload,
+            recovery_keys.db_master_key(),
+            None,
+            &AppLockBackoffState::default(),
+        )?;
+
+        let had_existing_db = db_path.exists();
+        let swap_result: Result<(), StorageError> = (|| {
+            if had_existing_db {
+                fs::rename(db_path, &staged.backup_path)?;
+                for sidecar in sqlite_sidecar_paths(db_path) {
+                    let _ = fs::remove_file(sidecar);
+                }
+            }
+            if let Err(error) = fs::rename(&staged.staging_path, db_path) {
+                if had_existing_db {
+                    let _ = fs::rename(&staged.backup_path, db_path);
+                }
+                return Err(StorageError::Io(error));
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = swap_result {
+            remove_sqlite_files(&staged.staging_path);
+            return Err(error);
+        }
+
+        let prev_keyring = match recovery_keys.persist_to_key_store(key_store) {
+            Ok(prev) => prev,
+            Err(error) => {
+                remove_sqlite_files(db_path);
+                if had_existing_db {
+                    let _ = fs::rename(&staged.backup_path, db_path);
+                }
+                remove_sqlite_files(&staged.staging_path);
+                return Err(StorageError::Vault(error));
+            }
         };
-        Ok((verified_journal, summary))
+
+        let reopen_res: Result<Connection, StorageError> = (|| {
+            let conn = Connection::open(db_path)?;
+            configure_connection(&conn)?;
+            verify_connection_schema_and_canary(&conn, recovery_keys.db_master_key())?;
+            let entries = load_evidence_entries_from_conn(&conn, recovery_keys.db_master_key())?;
+            let _ = EvidenceJournal::from_persisted(recovery_keys.signing_key(), entries).map_err(
+                |error| {
+                    StorageError::Integrity(format!(
+                        "recovered database failed post-swap verification: {error}"
+                    ))
+                },
+            )?;
+            Ok(conn)
+        })();
+
+        let conn = match reopen_res {
+            Ok(conn) => conn,
+            Err(error) => {
+                VaultKeyMaterial::rollback_key_store(key_store, prev_keyring);
+                remove_sqlite_files(db_path);
+                if had_existing_db {
+                    let _ = fs::rename(&staged.backup_path, db_path);
+                }
+                remove_sqlite_files(&staged.staging_path);
+                return Err(error);
+            }
+        };
+
+        remove_sqlite_files(&staged.backup_path);
+        remove_sqlite_files(&staged.staging_path);
+        let _ = fs::remove_file(restore_intent_path(db_path));
+
+        let mut db = Self {
+            db_path: db_path.to_path_buf(),
+            conn,
+            keys: recovery_keys,
+            key_provider: key_provider.into(),
+        };
+        db.ensure_default_account_if_missing()?;
+
+        Ok((db, staged.verified_journal, staged.summary))
     }
 
     /// Reopen and cryptographically verify the original database file after a failed

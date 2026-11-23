@@ -99,12 +99,14 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
   const [watchError, setWatchError] = useState<string | null>(null);
   const [watchStatusMsg, setWatchStatusMsg] = useState<string | null>(null);
 
+  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
+  const activeWorkspaceMode = isLocalMode ? "local-csv" : "mock";
   const brokerSnapshot = MOCK_BROKER.getSnapshot();
   const watchlistRevision = WATCHLIST_STORE.getRevision();
   const evaluatedWatchlist = useMemo<EvaluatedWatchlistItem[]>(() => {
-    return WATCHLIST_STORE.getAll().map((item) => evaluateWatchlistItem(item, brokerSnapshot));
+    return WATCHLIST_STORE.getAll(activeWorkspaceMode).map((item) => evaluateWatchlistItem(item, brokerSnapshot));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [brokerSnapshot, watchlistRevision]);
+  }, [activeWorkspaceMode, brokerSnapshot, watchlistRevision]);
 
   const triggeredAlertCount = evaluatedWatchlist.filter(
     (entry) => entry.status === "buy-triggered" || entry.status === "sell-triggered",
@@ -137,22 +139,29 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
     setWatchStatusMsg(null);
     setWatchBusy(true);
     try {
-      const saved = await WATCHLIST_STORE.upsert({
-        id: editingWatchId ?? undefined,
-        symbol: watchSymbol,
-        currency: watchCurrency,
-        targetBuyDecimal: watchBuyTarget || null,
-        targetSellDecimal: watchSellTarget || null,
-        note: watchNote,
-        enabled: true,
-      });
+      const saved = await WATCHLIST_STORE.upsert(
+        {
+          id: editingWatchId ?? undefined,
+          symbol: watchSymbol,
+          currency: watchCurrency,
+          targetBuyDecimal: watchBuyTarget || null,
+          targetSellDecimal: watchSellTarget || null,
+          note: watchNote,
+          enabled: true,
+        },
+        { mode: activeWorkspaceMode, language },
+      );
       if (!isCurrentLockEpoch(epoch)) return;
       const wasEditing = editingWatchId !== null;
       resetWatchlistForm();
       setWatchStatusMsg(
-        wasEditing
-          ? (chinese ? `已更新自选目标价：${saved.symbol} (${saved.currency})。` : `Updated watchlist target for ${saved.symbol} (${saved.currency}).`)
-          : (chinese ? `已加密保存至本地自选表：${saved.symbol} (${saved.currency})。` : `Saved ${saved.symbol} (${saved.currency}) to encrypted local watchlist.`),
+        isLocalMode
+          ? (wasEditing
+              ? (chinese ? `已更新自选目标价：${saved.symbol} (${saved.currency})。` : `Updated watchlist target for ${saved.symbol} (${saved.currency}).`)
+              : (chinese ? `已加密保存至本地自选表：${saved.symbol} (${saved.currency})。` : `Saved ${saved.symbol} (${saved.currency}) to encrypted local watchlist.`))
+          : (wasEditing
+              ? (chinese ? `已在 Mock 沙盒更新自选目标价：${saved.symbol} (${saved.currency})（仅内存，不写入真实金库）。` : `Updated Mock sandbox target for ${saved.symbol} (${saved.currency}) (memory-only).`)
+              : (chinese ? `已添加至 Mock 沙盒自选表：${saved.symbol} (${saved.currency})（仅内存，不写入真实金库）。` : `Added ${saved.symbol} (${saved.currency}) to Mock sandbox watchlist (memory-only).`)),
       );
     } catch (error) {
       if (!isCurrentLockEpoch(epoch)) return;
@@ -168,7 +177,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
     const epoch = getCurrentLockEpoch();
     setWatchError(null);
     try {
-      await WATCHLIST_STORE.toggleEnabled(id);
+      await WATCHLIST_STORE.toggleEnabled(id, { mode: activeWorkspaceMode, language });
       if (!isCurrentLockEpoch(epoch)) return;
     } catch (error) {
       if (!isCurrentLockEpoch(epoch)) return;
@@ -180,7 +189,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
     const epoch = getCurrentLockEpoch();
     setWatchError(null);
     try {
-      const deleted = await WATCHLIST_STORE.remove(id);
+      const deleted = await WATCHLIST_STORE.remove(id, activeWorkspaceMode);
       if (!isCurrentLockEpoch(epoch)) return;
       if (deleted && editingWatchId === id) {
         resetWatchlistForm();
@@ -220,7 +229,6 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
     }
   }
 
-  const isLocalMode = MOCK_BROKER.getWorkspaceMode() === "local-csv";
   const marketSecurities = getMarketSecurities();
   const degradedStatus = marketSecurities.some((security) => security.status === "offline")
     ? chinese ? { title: "数据源离线", note: "展示最近的本地快照" } : { title: "Data source offline", note: "Showing the latest local snapshot" }
@@ -541,15 +549,21 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
         <div className="markets-section-heading markets-card-heading">
           <div>
             <span className="markets-kicker">
-              {chinese ? "本地加密自选与目标价预警 · 只读提示" : "Encrypted local watchlist & price targets · Read-only"}
+              {isLocalMode
+                ? (chinese ? "本地加密自选与目标价预警 · 只读提示" : "Encrypted local watchlist & price targets · Read-only")
+                : (chinese ? "Mock 演示自选沙盒 · 仅内存不落盘" : "Mock demo watchlist sandbox · Memory-only")}
             </span>
             <h2 id="markets-targets-title">
               {chinese ? "自选观察表与目标价预警" : "Watchlist & price target alerts"}
             </h2>
             <p>
-              {chinese
-                ? "添加任意标的及买入/卖出目标价，按同币种本地持仓价或延迟公开行情实时比对；触发后仅高亮只读提示并可一键打开纸上模拟单人工复核，绝不自动下单。"
-                : "Configure buy/sell price targets for any symbol in its native currency. Triggered alerts highlight read-only and prefill a manual paper trade ticket — never auto-executing."}
+              {isLocalMode
+                ? (chinese
+                    ? "添加任意标的及买入/卖出目标价，按同币种本地持仓价或延迟公开行情实时比对；触发后仅高亮只读提示并可一键打开纸上模拟单人工复核，绝不自动下单。"
+                    : "Configure buy/sell price targets for any symbol in its native currency. Triggered alerts highlight read-only and prefill a manual paper trade ticket — never auto-executing.")
+                : (chinese
+                    ? "当前处于 Mock 演示模式：此处添加的自选目标价仅保存在内存沙盒中用于演示，与真实本地加密金库完全隔离。"
+                    : "Mock Demo mode: watchlist targets added here live in an isolated memory sandbox and never read or modify your encrypted SQLite vault.")}
             </p>
           </div>
           <div className="markets-targets-badges">
@@ -577,7 +591,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
             <input
               type="text"
               data-testid="watchlist-symbol-input"
-              placeholder="e.g. AAPL, 00700.HK"
+              placeholder={chinese ? "如 AAPL, 00700.HK" : "e.g. AAPL, 00700.HK"}
               value={watchSymbol}
               onChange={(event) => setWatchSymbol(event.target.value)}
             />
@@ -600,7 +614,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
               type="text"
               inputMode="decimal"
               data-testid="watchlist-buy-input"
-              placeholder="e.g. 210.00"
+              placeholder={chinese ? "如 210.00" : "e.g. 210.00"}
               value={watchBuyTarget}
               onChange={(event) => setWatchBuyTarget(event.target.value)}
             />
@@ -611,7 +625,7 @@ export function MarketsPage({ language, onOpenInstrument, onOpenTrade }: Markets
               type="text"
               inputMode="decimal"
               data-testid="watchlist-sell-input"
-              placeholder="e.g. 250.00"
+              placeholder={chinese ? "如 250.00" : "e.g. 250.00"}
               value={watchSellTarget}
               onChange={(event) => setWatchSellTarget(event.target.value)}
             />

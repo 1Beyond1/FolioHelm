@@ -16,6 +16,7 @@ import type { Language } from "../types";
 import { ACCOUNT_STORE, ALL_ACCOUNTS_ID } from "./accounts";
 import {
   CASH_FLOW_STORE,
+  MOCK_CASH_FLOW_ACCOUNT_ID,
   cashFlowSignedDecimal,
   computePnlAttribution,
   summarizeCashFlowsForBucket,
@@ -97,10 +98,21 @@ export function sanitizeSensitiveReportText(raw: string): string {
     "[REDACTED]",
   );
   text = text.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, "[REDACTED]");
+  // P2-5: Redact JWTs (header.payload.signature starting with eyJ) and known API token prefixes
+  text = text.replace(
+    /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b/g,
+    "[REDACTED]",
+  );
   text = text.replace(/\b(?:sk-[A-Za-z0-9]{17,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,})\b/g, "[REDACTED]");
 
   // Mask IBKR-style account identifiers (e.g. U1234567 -> U••••567)
   text = text.replace(/\b([UFD])(\d{3,})(\d{3})\b/g, "$1••••$3");
+
+  // P2-5: Mask prefixed / underscore-joined account IDs (e.g. acct_1234567890 -> acct_••••7890)
+  text = text.replace(
+    /\b((?:acct|account|acc|iban|card)[-_:#]+)(\d{2,})(\d{4})\b/gi,
+    "$1••••$3",
+  );
 
   // Mask hyphenated account numbers (e.g. 1234-5678 or 123-456-7890 -> ••••-5678)
   text = text.replace(/\b\d{3,6}-\d{3,6}(?:-\d{3,6})?\b/g, (match) => {
@@ -109,17 +121,28 @@ export function sanitizeSensitiveReportText(raw: string): string {
     return `••••-${tail.slice(-4)}`;
   });
 
-  // Mask long bare numeric account sequences (6+ digits -> •••• + last 4 digits)
-  text = text.replace(/\b\d{6,}\b/g, (match) => `••••${match.slice(-4)}`);
+  // P1-2: Mask long bare numeric account sequences (6+ integer digits -> •••• + last 4 digits)
+  // while preserving decimal currency amounts (e.g. 500000.00) and exchange-suffixed 6-digit
+  // tickers (e.g. 600519.SS, 000001.SZ, 510300.SS).
+  text = text.replace(
+    /(?<![.\d_])\b\d{6,}\b(?!\.\d|\.(?:SS|SZ|SH|HK|BJ|TW|KS|KQ|T|TO|L|DE|PA|SI)\b)/gi,
+    (match) => `••••${match.slice(-4)}`,
+  );
 
   return text;
 }
 
 /**
- * Escapes text for Markdown table cells (strips pipes/newlines and redacts sensitive numbers).
+ * Escapes text for Markdown table cells (strips pipes/newlines and optionally redacts sensitive numbers).
  */
-function escapeMdCell(raw: string): string {
-  return sanitizeSensitiveReportText(raw).replace(/\|/g, "\\|");
+function escapeMdCell(
+  raw: string,
+  options: { sanitizeSensitive?: boolean } = {},
+): string {
+  const cleaned = options.sanitizeSensitive === false
+    ? raw.replace(/[\u0000-\u001F\u007F]+/g, " ").replace(/\s+/g, " ").trim()
+    : sanitizeSensitiveReportText(raw);
+  return cleaned.replace(/\|/g, "\\|");
 }
 
 /**
@@ -244,7 +267,7 @@ export function generatePortfolioMarkdownReport(input: PortfolioReportInput): st
       lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
       for (const h of bucket.holdings) {
         lines.push(
-          `| ${escapeMdCell(h.symbol)} | ${escapeMdCell(h.company)} | ${decimal(h.quantity)} | ${formatFixedAmount(h.averageCost, 4)} | ${formatFixedAmount(h.lastPrice, 4)} | ${formatFixedAmount(h.marketValue)} | ${formatSignedFixedAmount(h.unrealizedPnl)} | ${formatFixedAmount(h.dividendsReceived)} | ${formatFixedAmount(h.weightPct)}% |`,
+          `| ${escapeMdCell(h.symbol, { sanitizeSensitive: false })} | ${escapeMdCell(h.company)} | ${decimal(h.quantity)} | ${formatFixedAmount(h.averageCost, 4)} | ${formatFixedAmount(h.lastPrice, 4)} | ${formatFixedAmount(h.marketValue)} | ${formatSignedFixedAmount(h.unrealizedPnl)} | ${formatFixedAmount(h.dividendsReceived)} | ${formatFixedAmount(h.weightPct)}% |`,
         );
       }
       lines.push("");
@@ -265,7 +288,7 @@ export function generatePortfolioMarkdownReport(input: PortfolioReportInput): st
       for (const cf of bucket.cashFlows) {
         const signed = cashFlowSignedDecimal(cf);
         lines.push(
-          `| ${escapeMdCell(cf.flowDate)} | ${formatFlowTypeLabel(cf.flowType, input.language)} | ${cf.symbol ? escapeMdCell(cf.symbol) : "—"} | ${formatSignedFixedAmount(signed)} ${curr} | ${cf.note ? escapeMdCell(cf.note) : "—"} |`,
+          `| ${escapeMdCell(cf.flowDate, { sanitizeSensitive: false })} | ${formatFlowTypeLabel(cf.flowType, input.language)} | ${cf.symbol ? escapeMdCell(cf.symbol, { sanitizeSensitive: false }) : "—"} | ${formatSignedFixedAmount(signed)} ${curr} | ${cf.note ? escapeMdCell(cf.note) : "—"} |`,
         );
       }
       lines.push("");
@@ -327,7 +350,10 @@ export function generatePortfolioCsvReport(input: PortfolioReportInput): string 
         escapeCsvCell(formatFixedAmount(bucket.totalEquity), { isNumeric: true, sanitizeSensitive: false }),
         escapeCsvCell(formatFixedAmount(bucket.pnlAttribution.totalUnrealizedPnl), { isNumeric: true, sanitizeSensitive: false }),
         escapeCsvCell("100.00", { isNumeric: true, sanitizeSensitive: false }),
-        escapeCsvCell(`Cash=${formatFixedAmount(bucket.cash)}; Dividends=${formatFixedAmount(bucket.cashFlowSummary.totalDividends)}; NetFlow=${formatFixedAmount(bucket.cashFlowSummary.netExternalFlow)}; ${twrNote}`),
+        escapeCsvCell(
+          `Cash=${formatFixedAmount(bucket.cash)}; Dividends=${formatFixedAmount(bucket.cashFlowSummary.totalDividends)}; NetFlow=${formatFixedAmount(bucket.cashFlowSummary.netExternalFlow)}; ${twrNote}`,
+          { sanitizeSensitive: false },
+        ),
       ].join(","),
     );
 
@@ -338,7 +364,7 @@ export function generatePortfolioCsvReport(input: PortfolioReportInput): string 
           escapeCsvCell(curr, { sanitizeSensitive: false }),
           escapeCsvCell(accountText),
           escapeCsvCell(input.generatedAtUtc.slice(0, 10), { sanitizeSensitive: false }),
-          escapeCsvCell(h.symbol),
+          escapeCsvCell(h.symbol, { sanitizeSensitive: false }),
           escapeCsvCell(h.company),
           escapeCsvCell("POSITION", { sanitizeSensitive: false }),
           escapeCsvCell(decimal(h.quantity), { isNumeric: true, sanitizeSensitive: false }),
@@ -351,6 +377,7 @@ export function generatePortfolioCsvReport(input: PortfolioReportInput): string 
             decimalCompare(h.dividendsReceived, ZERO) > 0
               ? `Dividends=${formatFixedAmount(h.dividendsReceived)}`
               : "",
+            { sanitizeSensitive: false },
           ),
         ].join(","),
       );
@@ -364,8 +391,8 @@ export function generatePortfolioCsvReport(input: PortfolioReportInput): string 
           escapeCsvCell(curr, { sanitizeSensitive: false }),
           escapeCsvCell(accountText),
           escapeCsvCell(cf.flowDate, { sanitizeSensitive: false }),
-          escapeCsvCell(cf.symbol ?? ""),
-          escapeCsvCell(formatFlowTypeLabel(cf.flowType, input.language)),
+          escapeCsvCell(cf.symbol ?? "", { sanitizeSensitive: false }),
+          escapeCsvCell(formatFlowTypeLabel(cf.flowType, input.language), { sanitizeSensitive: false }),
           escapeCsvCell(cf.flowType.toUpperCase(), { sanitizeSensitive: false }),
           "",
           "",
@@ -393,27 +420,28 @@ export function buildPortfolioReportInputFromStores(
 ): PortfolioReportInput {
   const workspaceMode = MOCK_BROKER.getWorkspaceMode();
   const snapshot = MOCK_BROKER.getSnapshot();
+  const scopedAccountId = workspaceMode === "mock" ? MOCK_CASH_FLOW_ACCOUNT_ID : selectedAccountId;
   const accounts = ACCOUNT_STORE.getAccounts();
   const accountLabel = workspaceMode === "mock"
     ? (language === "zh" ? "Mock 演示账户 (•••• 1234)" : "Mock Demo Account (•••• 1234)")
-    : selectedAccountId === ALL_ACCOUNTS_ID
+    : scopedAccountId === ALL_ACCOUNTS_ID
       ? (language === "zh" ? `全部本地账户 (${accounts.length})` : `All Local Accounts (${accounts.length})`)
-      : (accounts.find((a) => a.id === selectedAccountId)?.name ?? selectedAccountId);
+      : (accounts.find((a) => a.id === scopedAccountId)?.name ?? scopedAccountId);
 
   const currencyBuckets = extractCurrencyBuckets(snapshot, language);
-  const allCashFlows = CASH_FLOW_STORE.getAll();
+  const allCashFlows = CASH_FLOW_STORE.getAll(workspaceMode);
   const allNavSnapshots = NAV_STORE.getAllSnapshots();
 
   const buckets: ReportCurrencyBucket[] = currencyBuckets.map((bucket) => {
     const curr = bucket.currency.toUpperCase();
-    const bucketCashFlows = CASH_FLOW_STORE.getFiltered(selectedAccountId, curr);
-    const cashFlowSummary = summarizeCashFlowsForBucket(allCashFlows, curr, selectedAccountId);
+    const bucketCashFlows = CASH_FLOW_STORE.getFiltered(scopedAccountId, curr, workspaceMode);
+    const cashFlowSummary = summarizeCashFlowsForBucket(allCashFlows, curr, scopedAccountId);
     const pnlAttribution = computePnlAttribution(
       snapshot.holdings,
       allCashFlows,
       curr,
       language,
-      selectedAccountId,
+      scopedAccountId,
     );
     const dividendsBySymbol = new Map(
       pnlAttribution.entries.map((entry) => [entry.symbol, entry.dividendsReceived]),
@@ -473,7 +501,7 @@ export function buildPortfolioReportInputFromStores(
     language,
     workspaceMode,
     generatedAtUtc,
-    accountId: selectedAccountId,
+    accountId: scopedAccountId,
     accountLabel,
     buckets,
   };

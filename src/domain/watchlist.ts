@@ -12,7 +12,7 @@
  *   with Ed25519 evidence logging, `.fhvault` backup support, and Fail-Closed lock purge.
  */
 import { readStored, removeStored, writeStored } from "../platform/storage";
-import type { BrokerSnapshot } from "./contracts";
+import type { BrokerSnapshot, WorkspaceMode } from "./contracts";
 import {
   decimal,
   decimalDivide,
@@ -23,7 +23,7 @@ import {
   type DecimalString,
 } from "./decimal";
 import { appendEvidence } from "./evidenceJournal";
-import { registerBrokerResetHook } from "./mockBroker";
+import { MOCK_BROKER, registerBrokerResetHook } from "./mockBroker";
 import { decimalToMicros, microsToDecimal } from "./nav";
 import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
@@ -90,31 +90,48 @@ export function microsToDisplayDecimal(microsStr: string | null): DecimalString 
   try {
     const val = BigInt(microsStr);
     if (val <= 0n) return null;
-    return decimal(microsToDecimal(val, 4));
+    // P2-2: Preserve full 6-decimal micro-unit precision (normalized without trailing zeros).
+    return decimal(microsToDecimal(val, 6));
   } catch {
     return null;
   }
 }
 
-export function validateWatchlistInput(input: UpsertWatchlistInput): WatchlistItem {
+export function validateWatchlistInput(
+  input: UpsertWatchlistInput,
+  language: "en" | "zh" = "en",
+): WatchlistItem {
+  const zh = language === "zh";
   const symbol = input.symbol.trim().toUpperCase();
   if (!symbol || !SYMBOL_RE.test(symbol)) {
-    throw new Error(`Invalid watchlist symbol '${input.symbol}'`);
+    throw new Error(
+      zh ? `自选标的代码格式无效 '${input.symbol}'` : `Invalid watchlist symbol '${input.symbol}'`,
+    );
   }
   const currency = input.currency.trim().toUpperCase();
   if (!CURRENCY_RE.test(currency) || currency === "MULTI") {
-    throw new Error(`Invalid currency '${input.currency}'`);
+    throw new Error(
+      zh ? `币种无效 '${input.currency}'：需指定单一币种` : `Invalid currency '${input.currency}'`,
+    );
   }
 
   let targetBuyMicros: bigint | null = null;
   const rawBuy = input.targetBuyDecimal?.trim() ?? "";
   if (rawBuy) {
     if (!POSITIVE_DECIMAL_RE.test(rawBuy)) {
-      throw new Error("Target buy price must be a positive decimal (up to 6 decimal places)");
+      throw new Error(
+        zh
+          ? "买入目标价必须为正数（最多保留 6 位小数）"
+          : "Target buy price must be a positive decimal (up to 6 decimal places)",
+      );
     }
     const parsed = decimalToMicros(rawBuy);
     if (parsed <= 0n) {
-      throw new Error("Target buy price must be strictly greater than zero");
+      throw new Error(
+        zh
+          ? "买入目标价必须严格大于 0"
+          : "Target buy price must be strictly greater than zero",
+      );
     }
     targetBuyMicros = parsed;
   }
@@ -123,17 +140,29 @@ export function validateWatchlistInput(input: UpsertWatchlistInput): WatchlistIt
   const rawSell = input.targetSellDecimal?.trim() ?? "";
   if (rawSell) {
     if (!POSITIVE_DECIMAL_RE.test(rawSell)) {
-      throw new Error("Target sell price must be a positive decimal (up to 6 decimal places)");
+      throw new Error(
+        zh
+          ? "卖出目标价必须为正数（最多保留 6 位小数）"
+          : "Target sell price must be a positive decimal (up to 6 decimal places)",
+      );
     }
     const parsed = decimalToMicros(rawSell);
     if (parsed <= 0n) {
-      throw new Error("Target sell price must be strictly greater than zero");
+      throw new Error(
+        zh
+          ? "卖出目标价必须严格大于 0"
+          : "Target sell price must be strictly greater than zero",
+      );
     }
     targetSellMicros = parsed;
   }
 
   if (targetBuyMicros !== null && targetSellMicros !== null && targetBuyMicros >= targetSellMicros) {
-    throw new Error("Target buy price must be lower than target sell price");
+    throw new Error(
+      zh
+        ? "买入目标价必须低于卖出目标价"
+        : "Target buy price must be lower than target sell price",
+    );
   }
 
   const note = (input.note ?? "")
@@ -143,7 +172,7 @@ export function validateWatchlistInput(input: UpsertWatchlistInput): WatchlistIt
 
   const id = input.id?.trim() || generateWatchlistId();
   if (id.length > 64 || !/^[A-Za-z0-9_-]+$/.test(id)) {
-    throw new Error("Invalid watchlist ID");
+    throw new Error(zh ? "自选标的 ID 无效" : "Invalid watchlist ID");
   }
 
   return {
@@ -305,9 +334,16 @@ function sortWatchlistItems(items: WatchlistItem[]): WatchlistItem[] {
 }
 
 class WatchlistStore {
-  private items = new Map<string, WatchlistItem>();
+  /** Real local-csv encrypted vault watchlist items (persisted to SQLite / browser preview storage). */
+  private realItems = new Map<string, WatchlistItem>();
+  /** Ephemeral in-memory Mock Demo sandbox (NEVER persisted to SQLite, .fhvault, or localStorage). */
+  private mockItems = new Map<string, WatchlistItem>();
   private readonly listeners = new Set<() => void>();
   private revision = 0;
+
+  private resolveMode(mode?: WorkspaceMode): WorkspaceMode {
+    return mode ?? MOCK_BROKER.getWorkspaceMode();
+  }
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -329,15 +365,17 @@ class WatchlistStore {
     return this.revision;
   }
 
-  getAll(): WatchlistItem[] {
-    return sortWatchlistItems([...this.items.values()]);
+  getAll(mode?: WorkspaceMode): WatchlistItem[] {
+    const activeMode = this.resolveMode(mode);
+    const map = activeMode === "mock" ? this.mockItems : this.realItems;
+    return sortWatchlistItems([...map.values()]);
   }
 
   replaceAll(items: readonly WatchlistItem[]): void {
-    this.items.clear();
+    this.realItems.clear();
     for (const item of items) {
       if (item && typeof item.id === "string" && item.id.trim()) {
-        this.items.set(item.id, { ...item });
+        this.realItems.set(item.id, { ...item });
       }
     }
     this.notify();
@@ -350,47 +388,70 @@ class WatchlistStore {
       if (!isCurrentLockEpoch(epoch)) return [];
       const list = Array.isArray(loaded) ? loaded : [];
       this.replaceAll(list);
-      return this.getAll();
+      return this.getAll("local-csv");
     }
     if (!isCurrentLockEpoch(epoch)) return [];
     const saved = readStored<unknown>(BROWSER_WATCHLIST_KEY, []);
     const list = Array.isArray(saved) ? (saved as WatchlistItem[]) : [];
     this.replaceAll(list);
-    return this.getAll();
+    return this.getAll("local-csv");
   }
 
-  async upsert(input: UpsertWatchlistInput): Promise<WatchlistItem> {
+  async upsert(
+    input: UpsertWatchlistInput,
+    options?: { mode?: WorkspaceMode; language?: "en" | "zh" },
+  ): Promise<WatchlistItem> {
     const epoch = getCurrentLockEpoch();
-    // Reuse existing ID if symbol already exists and caller did not provide an explicit ID
+    const activeMode = this.resolveMode(options?.mode);
+    const language = options?.language ?? "en";
+    const targetMap = activeMode === "mock" ? this.mockItems : this.realItems;
+
+    // Reuse existing ID if symbol already exists within this workspace mode and caller did not provide an explicit ID
     const normalizedSymbol = input.symbol.trim().toUpperCase();
     const existingBySymbol = !input.id
-      ? [...this.items.values()].find((item) => item.symbol.toUpperCase() === normalizedSymbol)
+      ? [...targetMap.values()].find((item) => item.symbol.toUpperCase() === normalizedSymbol)
       : undefined;
-    const record = validateWatchlistInput({
-      ...input,
-      id: input.id ?? existingBySymbol?.id,
-    });
+    const record = validateWatchlistInput(
+      {
+        ...input,
+        id: input.id ?? existingBySymbol?.id,
+      },
+      language,
+    );
+
+    if (activeMode === "mock") {
+      // P1-1 strict isolation: Mock Demo sandbox stays purely in RAM and NEVER touches SQLite/.fhvault.
+      if (!isCurrentLockEpoch(epoch)) return record;
+      for (const [key, value] of [...this.mockItems.entries()]) {
+        if (value.symbol === record.symbol && key !== record.id) {
+          this.mockItems.delete(key);
+        }
+      }
+      this.mockItems.set(record.id, record);
+      this.notify();
+      return record;
+    }
 
     if (isTauriRuntime()) {
       const saved = await invokeVaultUpsertWatchlistItem(record);
       if (!isCurrentLockEpoch(epoch)) return saved;
-      for (const [key, value] of [...this.items.entries()]) {
+      for (const [key, value] of [...this.realItems.entries()]) {
         if (value.symbol === saved.symbol && key !== saved.id) {
-          this.items.delete(key);
+          this.realItems.delete(key);
         }
       }
-      this.items.set(saved.id, saved);
+      this.realItems.set(saved.id, saved);
       this.notify();
       return saved;
     }
 
     if (!isCurrentLockEpoch(epoch)) return record;
-    for (const [key, value] of [...this.items.entries()]) {
+    for (const [key, value] of [...this.realItems.entries()]) {
       if (value.symbol === record.symbol && key !== record.id) {
-        this.items.delete(key);
+        this.realItems.delete(key);
       }
     }
-    this.items.set(record.id, record);
+    this.realItems.set(record.id, record);
     this.persistBrowser();
     this.notify();
     await appendEvidence("state_changed", {
@@ -405,37 +466,53 @@ class WatchlistStore {
     return record;
   }
 
-  async toggleEnabled(id: string): Promise<WatchlistItem | null> {
-    const existing = this.items.get(id);
+  async toggleEnabled(
+    id: string,
+    options?: { mode?: WorkspaceMode; language?: "en" | "zh" },
+  ): Promise<WatchlistItem | null> {
+    const activeMode = this.resolveMode(options?.mode);
+    const targetMap = activeMode === "mock" ? this.mockItems : this.realItems;
+    const existing = targetMap.get(id);
     if (!existing) return null;
-    return this.upsert({
-      id: existing.id,
-      symbol: existing.symbol,
-      currency: existing.currency,
-      targetBuyDecimal: microsToDisplayDecimal(existing.targetBuyMicros),
-      targetSellDecimal: microsToDisplayDecimal(existing.targetSellMicros),
-      note: existing.note,
-      enabled: !existing.enabled,
-    });
+    return this.upsert(
+      {
+        id: existing.id,
+        symbol: existing.symbol,
+        currency: existing.currency,
+        targetBuyDecimal: microsToDisplayDecimal(existing.targetBuyMicros),
+        targetSellDecimal: microsToDisplayDecimal(existing.targetSellMicros),
+        note: existing.note,
+        enabled: !existing.enabled,
+      },
+      { mode: activeMode, language: options?.language },
+    );
   }
 
-  async remove(id: string): Promise<boolean> {
+  async remove(id: string, mode?: WorkspaceMode): Promise<boolean> {
     const epoch = getCurrentLockEpoch();
     const trimmed = id.trim();
     if (!trimmed) return false;
+    const activeMode = this.resolveMode(mode);
+
+    if (activeMode === "mock") {
+      if (!isCurrentLockEpoch(epoch)) return false;
+      const existed = this.mockItems.delete(trimmed);
+      if (existed) this.notify();
+      return existed;
+    }
 
     if (isTauriRuntime()) {
       const deleted = await invokeVaultDeleteWatchlistItem(trimmed);
       if (!isCurrentLockEpoch(epoch)) return false;
       if (deleted) {
-        this.items.delete(trimmed);
+        this.realItems.delete(trimmed);
         this.notify();
       }
       return deleted;
     }
 
     if (!isCurrentLockEpoch(epoch)) return false;
-    const existed = this.items.delete(trimmed);
+    const existed = this.realItems.delete(trimmed);
     if (existed) {
       this.persistBrowser();
       this.notify();
@@ -449,13 +526,15 @@ class WatchlistStore {
 
   /** Fail-Closed App Lock heap wipe: clears RAM without modifying persisted ciphertext. */
   purgeSensitiveMemory(): void {
-    this.items.clear();
+    this.realItems.clear();
+    this.mockItems.clear();
     this.notify();
   }
 
   /** Clear RAM + browser preview storage (used during explicit reset or tests). */
   clearAll(): void {
-    this.items.clear();
+    this.realItems.clear();
+    this.mockItems.clear();
     if (!isTauriRuntime()) {
       removeStored(BROWSER_WATCHLIST_KEY);
     }
@@ -463,7 +542,7 @@ class WatchlistStore {
   }
 
   private persistBrowser(): void {
-    writeStored(BROWSER_WATCHLIST_KEY, this.getAll());
+    writeStored(BROWSER_WATCHLIST_KEY, this.getAll("local-csv"));
   }
 }
 

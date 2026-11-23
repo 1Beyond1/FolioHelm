@@ -180,6 +180,12 @@ pub struct VaultKeyMaterial {
     device_signing_seed: Zeroizing<[u8; 32]>,
 }
 
+/// Snapshot of previous raw OS keyring secrets used to roll back a failed recovery write.
+pub struct KeyringSnapshot {
+    db_master_key: Option<Zeroizing<String>>,
+    device_signing_seed: Option<Zeroizing<String>>,
+}
+
 impl VaultKeyMaterial {
     /// Load existing keys from the OS keyring or generate new ones on first launch.
     ///
@@ -286,6 +292,73 @@ impl VaultKeyMaterial {
                     .ct_eq(decoded.as_slice()),
             ),
             Err(_) => false,
+        }
+    }
+
+    /// Build fresh in-memory key material for `.fhvault` disaster recovery when
+    /// the vault is in `ErrorLocked` (e.g. OS keyring lost or DB corrupted).
+    /// Does not write to `KeyStore` until `persist_to_key_store` is explicitly called
+    /// after staging DB verification succeeds.
+    pub fn for_recovery(restored_seed_hex: &str) -> Result<Self, VaultError> {
+        let device_signing_seed = decode_key32(restored_seed_hex)?;
+        let db_master_key = generate_random_key32()?;
+        Ok(Self {
+            db_master_key,
+            device_signing_seed,
+        })
+    }
+
+    /// Persist both `db_master_key` and `device_signing_seed` into the OS keyring,
+    /// rolling back on partial failure and returning previous raw secrets so the
+    /// caller can roll back cleanly if a post-swap check fails.
+    pub fn persist_to_key_store(
+        &self,
+        store: &dyn KeyStore,
+    ) -> Result<KeyringSnapshot, VaultError> {
+        let prev_db = store.get_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT)?;
+        let prev_seed = store.get_secret(VAULT_KEYRING_SERVICE, DEVICE_SIGNING_SEED_ACCOUNT)?;
+        let db_hex = encode_key32(&self.db_master_key);
+        let seed_hex = encode_key32(&self.device_signing_seed);
+
+        store.set_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT, &db_hex)?;
+        if let Err(error) = store.set_secret(
+            VAULT_KEYRING_SERVICE,
+            DEVICE_SIGNING_SEED_ACCOUNT,
+            &seed_hex,
+        ) {
+            match prev_db {
+                Some(ref old) => {
+                    let _ = store.set_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT, old);
+                }
+                None => {
+                    let _ = store.delete_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT);
+                }
+            }
+            return Err(error);
+        }
+        Ok(KeyringSnapshot {
+            db_master_key: prev_db,
+            device_signing_seed: prev_seed,
+        })
+    }
+
+    /// Roll back OS keyring entries to previously captured secret values.
+    pub fn rollback_key_store(store: &dyn KeyStore, snapshot: KeyringSnapshot) {
+        match snapshot.db_master_key {
+            Some(ref old) => {
+                let _ = store.set_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT, old);
+            }
+            None => {
+                let _ = store.delete_secret(VAULT_KEYRING_SERVICE, DB_MASTER_KEY_ACCOUNT);
+            }
+        }
+        match snapshot.device_signing_seed {
+            Some(ref old) => {
+                let _ = store.set_secret(VAULT_KEYRING_SERVICE, DEVICE_SIGNING_SEED_ACCOUNT, old);
+            }
+            None => {
+                let _ = store.delete_secret(VAULT_KEYRING_SERVICE, DEVICE_SIGNING_SEED_ACCOUNT);
+            }
         }
     }
 }

@@ -335,6 +335,23 @@ impl VaultRuntimeState {
         }
     }
 
+    /// Guard specifically for `.fhvault` disaster recovery (`dialog_open_fhvault_file` and
+    /// `vault_restore_fhvault_backup`):
+    /// - `Unlocked`: allowed (normal restore / device migration).
+    /// - `ErrorLocked`: allowed (disaster recovery when OS keyring was lost, canary corrupted,
+    ///   or a prior rollback failed).
+    /// - `UserLocked`: STRICTLY DENIED (App Lock screen bypass prevention).
+    fn ensure_unlocked_or_error_locked(&self) -> Result<(), String> {
+        let guard = self
+            .session
+            .lock()
+            .map_err(|_| "vault state lock is poisoned".to_string())?;
+        match &*guard {
+            VaultSession::Unlocked { .. } | VaultSession::ErrorLocked { .. } => Ok(()),
+            VaultSession::UserLocked { reason, .. } => Err(format!("Vault is locked: {reason}")),
+        }
+    }
+
     fn with_unlocked<T>(
         &self,
         op: impl FnOnce(&mut EncryptedVaultDb, &mut EvidenceJournal) -> Result<T, String>,
@@ -875,7 +892,7 @@ impl VaultRuntimeState {
         raw_backup: String,
         passphrase: String,
     ) -> Result<VaultRestoreSummaryDto, String> {
-        self.ensure_unlocked()?;
+        self.ensure_unlocked_or_error_locked()?;
         let pass = Zeroizing::new(passphrase);
         let decrypted =
             decrypt_fhvault_backup(&pass, &raw_backup).map_err(|error| error.to_string())?;
@@ -890,7 +907,7 @@ impl VaultRuntimeState {
         raw_backup: String,
         passphrase: String,
     ) -> Result<VaultRestoreSummaryDto, String> {
-        self.ensure_unlocked()?;
+        self.ensure_unlocked_or_error_locked()?;
         let pass = Zeroizing::new(passphrase);
         let payload = tokio::task::spawn_blocking(move || {
             let decrypted =
@@ -912,29 +929,50 @@ impl VaultRuntimeState {
             .session
             .lock()
             .map_err(|_| "vault state lock is poisoned".to_string())?;
-        let VaultSession::Unlocked {
-            db, journal, cache, ..
-        } = &mut *guard
-        else {
-            return Err("Vault must be unlocked before restoring a .fhvault backup".to_string());
-        };
-
-        match db.restore_from_backup_payload(payload, self.key_store.as_ref()) {
-            Ok((restored_journal, summary)) => {
-                **journal = restored_journal;
-                cache.reload_from_db(db);
-                Ok(summary)
+        match &mut *guard {
+            VaultSession::Unlocked {
+                db, journal, cache, ..
+            } => match db.restore_from_backup_payload(payload, self.key_store.as_ref()) {
+                Ok((restored_journal, summary)) => {
+                    **journal = restored_journal;
+                    cache.reload_from_db(db);
+                    Ok(summary)
+                }
+                Err(storage::StorageError::RollbackLockRequired(reason)) => {
+                    // Fail-Closed P1-5: rollback failed to reopen/verify original DB; drop placeholder
+                    // connection & all key material immediately and transition into ErrorLocked.
+                    cache.clear();
+                    *guard = VaultSession::ErrorLocked {
+                        reason: reason.clone(),
+                    };
+                    Err(reason)
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            VaultSession::ErrorLocked { .. } => {
+                // P1-4 disaster recovery: allow verified `.fhvault` restore from `ErrorLocked`
+                // (keyring lost, canary damaged, or prior rollback failure) to rebuild and unlock.
+                match EncryptedVaultDb::restore_from_error_locked(
+                    &self.db_path,
+                    payload,
+                    self.key_store.as_ref(),
+                    self.key_provider.clone(),
+                ) {
+                    Ok((restored_db, restored_journal, summary)) => {
+                        let mut cache = VaultRuntimeCache::default();
+                        cache.reload_from_db(&restored_db);
+                        *guard = VaultSession::Unlocked {
+                            db: Box::new(restored_db),
+                            journal: Box::new(restored_journal),
+                            lock_verifier: None,
+                            cache,
+                        };
+                        Ok(summary)
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
             }
-            Err(storage::StorageError::RollbackLockRequired(reason)) => {
-                // Fail-Closed P1-5: rollback failed to reopen/verify original DB; drop placeholder
-                // connection & all key material immediately and transition into ErrorLocked.
-                cache.clear();
-                *guard = VaultSession::ErrorLocked {
-                    reason: reason.clone(),
-                };
-                Err(reason)
-            }
-            Err(error) => Err(error.to_string()),
+            VaultSession::UserLocked { reason, .. } => Err(format!("Vault is locked: {reason}")),
         }
     }
 }
@@ -1940,7 +1978,9 @@ async fn dialog_open_fhvault_file(
     state: State<'_, VaultRuntimeState>,
     app: AppHandle,
 ) -> Result<Option<OpenedTextFileDto>, String> {
-    state.ensure_unlocked()?;
+    // P1-4: Strictly deny `UserLocked` (App Lock screen), while allowing `Unlocked` and
+    // `ErrorLocked` (disaster recovery when OS keyring or vault canary failed).
+    state.ensure_unlocked_or_error_locked()?;
     tauri::async_runtime::spawn_blocking(move || {
         let picked = app
             .dialog()
@@ -1948,7 +1988,8 @@ async fn dialog_open_fhvault_file(
             .add_filter("FolioHelm Encrypted Backup", &["fhvault", "json"])
             .blocking_pick_file();
 
-        app.state::<VaultRuntimeState>().ensure_unlocked()?;
+        app.state::<VaultRuntimeState>()
+            .ensure_unlocked_or_error_locked()?;
 
         let Some(file_path) = picked else {
             return Ok(None);
@@ -1959,7 +2000,8 @@ async fn dialog_open_fhvault_file(
         let raw_bytes = read_bounded_file_bytes(&path, MAX_FHVAULT_BYTES, ".fhvault backup")?;
         let content_raw = String::from_utf8(raw_bytes)
             .map_err(|_| "Selected .fhvault backup is not valid UTF-8".to_string())?;
-        app.state::<VaultRuntimeState>().ensure_unlocked()?;
+        app.state::<VaultRuntimeState>()
+            .ensure_unlocked_or_error_locked()?;
         let content = content_raw
             .strip_prefix('\u{feff}')
             .unwrap_or(&content_raw)
@@ -3058,5 +3100,138 @@ mod tests {
             let _ = fs::remove_dir_all(parent);
         }
         let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    #[tokio::test]
+    async fn p1_4_error_locked_allows_verified_fhvault_recovery_while_user_locked_stays_blocked() {
+        let vault_path = temp_vault_path("p1-4-error-locked-recovery");
+        let original_store = Arc::new(InMemoryKeyStore::new());
+        let state = VaultRuntimeState::open_with_store(
+            &vault_path,
+            Arc::clone(&original_store) as Arc<dyn KeyStore>,
+            "in-memory-test",
+        );
+
+        // Seed encrypted evidence, cash flow, and watchlist item before exporting .fhvault backup.
+        state
+            .with_unlocked(|db, journal| {
+                let (signed, _) = journal
+                    .prepare_append(AppendEvidenceRequest {
+                        kind: "state_changed".to_string(),
+                        payload: BTreeMap::from([("note".to_string(), "before-disaster".into())]),
+                        app_version: Some("0.2.0".to_string()),
+                        occurred_at_utc: None,
+                        account_ref: Some("acct_local_csv".to_string()),
+                        intent_id: Some("seed-recovery".to_string()),
+                    })
+                    .map_err(|e| e.to_string())?;
+                db.insert_evidence_entry(&signed)
+                    .map_err(|e| e.to_string())?;
+                journal.commit_prepared(signed);
+
+                db.upsert_cash_flow(&StoredCashFlow {
+                    id: "cf_rec_1".to_string(),
+                    account_id: "acct_default".to_string(),
+                    flow_type: "dividend".to_string(),
+                    symbol: Some("600519.SS".to_string()),
+                    currency: "CNY".to_string(),
+                    amount_micros: 500_000_000_000,
+                    flow_date: "2026-11-20".to_string(),
+                    note: "Annual dividend".to_string(),
+                    created_at: "2026-11-20T00:00:00.000Z".to_string(),
+                })
+                .map_err(|e| e.to_string())?;
+
+                db.upsert_watchlist_item(&StoredWatchlistItem {
+                    id: "wl_rec_1".to_string(),
+                    symbol: "00700.HK".to_string(),
+                    currency: "HKD".to_string(),
+                    target_buy_micros: Some(380_000_000),
+                    target_sell_micros: Some(460_000_000),
+                    note: "HK tech watch".to_string(),
+                    enabled: true,
+                    updated_at: "2026-11-20T00:00:00.000Z".to_string(),
+                })
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .expect("seed data");
+
+        let backup_pass = "Disaster-Recovery-Pass-2026!".to_string();
+        let backup_raw = state
+            .export_fhvault_backup_async(backup_pass.clone())
+            .await
+            .expect("export backup");
+
+        // 1) UserLocked MUST still strictly block BOTH dialog_open_fhvault_file guard AND restore.
+        state
+            .lock_session("manual", Some("local-csv"))
+            .expect("manual lock");
+        assert_eq!(state.status().expect("status").lock_state, "user-locked");
+        assert!(state.ensure_unlocked_or_error_locked().is_err());
+        assert!(state
+            .restore_fhvault_backup_async(backup_raw.clone(), backup_pass.clone())
+            .await
+            .is_err());
+        drop(state);
+
+        // 2) Simulate lost OS keyring against the existing SQLite file -> opens in ErrorLocked.
+        let fresh_store = Arc::new(InMemoryKeyStore::new());
+        let error_locked = VaultRuntimeState::open_with_store(
+            &vault_path,
+            Arc::clone(&fresh_store) as Arc<dyn KeyStore>,
+            "in-memory-test",
+        );
+        let status_before = error_locked.status().expect("status before");
+        assert!(!status_before.unlocked);
+        assert_eq!(status_before.lock_state, "error-locked");
+        // Normal locked commands still denied, while disaster-recovery guard permits opening .fhvault.
+        assert!(error_locked.ensure_unlocked().is_err());
+        assert!(error_locked.ensure_unlocked_or_error_locked().is_ok());
+
+        // Wrong passphrase must fail closed and keep ErrorLocked intact.
+        assert!(error_locked
+            .restore_fhvault_backup_async(backup_raw.clone(), "Wrong-Passphrase-2026!".to_string())
+            .await
+            .is_err());
+        assert_eq!(
+            error_locked.status().expect("still locked").lock_state,
+            "error-locked"
+        );
+
+        // Verified .fhvault restore from ErrorLocked rebuilds DB, persists fresh keys, and unlocks!
+        let summary = error_locked
+            .restore_fhvault_backup_async(backup_raw, backup_pass)
+            .await
+            .expect("disaster recovery restore from ErrorLocked must succeed");
+        assert_eq!(summary.cash_flow_count, 1);
+        assert_eq!(summary.watchlist_count, 1);
+        assert!(summary.evidence_count >= 1);
+
+        let status_after = error_locked.status().expect("status after");
+        assert!(status_after.unlocked);
+        assert_eq!(status_after.lock_state, "unlocked");
+
+        let (cfs, wls) = error_locked
+            .with_unlocked(|db, _| {
+                let cfs = db.load_all_cash_flows().map_err(|e| e.to_string())?;
+                let wls = db.list_watchlist_items().map_err(|e| e.to_string())?;
+                Ok((cfs, wls))
+            })
+            .expect("read restored tables");
+        assert_eq!(cfs.len(), 1);
+        assert_eq!(cfs[0].symbol.as_deref(), Some("600519.SS"));
+        assert_eq!(wls.len(), 1);
+        assert_eq!(wls[0].symbol, "00700.HK");
+        drop(error_locked);
+
+        // 3) Restart with the recovered KeyStore -> MUST reopen cleanly in Unlocked!
+        let restarted =
+            VaultRuntimeState::open_with_store(&vault_path, fresh_store, "in-memory-test");
+        assert!(restarted.status().expect("restarted status").unlocked);
+
+        if let Some(parent) = vault_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 }

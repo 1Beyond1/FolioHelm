@@ -11,6 +11,7 @@ import {
 import {
   CASH_FLOW_STORE,
   CASH_FLOW_TYPES,
+  MOCK_CASH_FLOW_ACCOUNT_ID,
   cashFlowSignedDecimal,
   computePnlAttribution,
   summarizeCashFlowsForBucket,
@@ -578,23 +579,26 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
   const [reportBusy, setReportBusy] = useState<boolean>(false);
   const [reportFeedback, setReportFeedback] = useState<string | null>(null);
 
+  const activeWorkspaceMode = isLocalMode ? "local-csv" : "mock";
+  const ledgerScopeAccountId = isLocalMode ? selectedAccountId : MOCK_CASH_FLOW_ACCOUNT_ID;
+
   const allCashFlows = useMemo(
-    () => CASH_FLOW_STORE.getAll(),
+    () => CASH_FLOW_STORE.getAll(activeWorkspaceMode),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cashFlowRevision],
+    [activeWorkspaceMode, cashFlowRevision],
   );
   const bucketCashFlows = useMemo(
-    () => CASH_FLOW_STORE.getFiltered(selectedAccountId, activeBucket.currency),
+    () => CASH_FLOW_STORE.getFiltered(ledgerScopeAccountId, activeBucket.currency, activeWorkspaceMode),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selectedAccountId, activeBucket.currency, cashFlowRevision],
+    [ledgerScopeAccountId, activeBucket.currency, activeWorkspaceMode, cashFlowRevision],
   );
   const bucketCashFlowSummary = useMemo(
-    () => summarizeCashFlowsForBucket(allCashFlows, activeBucket.currency, selectedAccountId),
-    [allCashFlows, activeBucket.currency, selectedAccountId],
+    () => summarizeCashFlowsForBucket(allCashFlows, activeBucket.currency, ledgerScopeAccountId),
+    [allCashFlows, activeBucket.currency, ledgerScopeAccountId],
   );
   const pnlAttribution = useMemo(
-    () => computePnlAttribution(snapshot.holdings, allCashFlows, activeBucket.currency, language, selectedAccountId),
-    [snapshot.holdings, allCashFlows, activeBucket.currency, language, selectedAccountId],
+    () => computePnlAttribution(snapshot.holdings, allCashFlows, activeBucket.currency, language, ledgerScopeAccountId),
+    [snapshot.holdings, allCashFlows, activeBucket.currency, language, ledgerScopeAccountId],
   );
   const effectiveLedgerCurrency = ledgerCurrency || activeBucket.currency;
 
@@ -835,6 +839,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     benchmarkReqSeqRef.current += 1;
     setBenchmarkLoading(false);
     setSelectedBucketCurrency(nextCurrency);
+    setLedgerCurrency("");
     setSelectedBenchmark(null);
     setBenchmarkNotice(null);
   }
@@ -1061,27 +1066,36 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     const epoch = getCurrentLockEpoch();
     setLedgerError(null);
     setLedgerStatus(null);
-    const targetAcct = selectedAccountId !== ALL_ACCOUNTS_ID ? selectedAccountId : ledgerAccountId;
+    const targetAcct = isLocalMode
+      ? (selectedAccountId !== ALL_ACCOUNTS_ID ? selectedAccountId : ledgerAccountId)
+      : MOCK_CASH_FLOW_ACCOUNT_ID;
     const currencyToUse = (effectiveLedgerCurrency || activeBucketCurrency || "USD").toUpperCase();
     setLedgerBusy(true);
     try {
-      const saved = await CASH_FLOW_STORE.upsert({
-        accountId: targetAcct,
-        flowType: ledgerFlowType,
-        symbol: ledgerSymbol.trim() || null,
-        currency: currencyToUse,
-        amountDecimal: ledgerAmount,
-        flowDate: ledgerDate,
-        note: ledgerNote,
-      });
+      const saved = await CASH_FLOW_STORE.upsert(
+        {
+          accountId: targetAcct,
+          flowType: ledgerFlowType,
+          symbol: ledgerSymbol.trim() || null,
+          currency: currencyToUse,
+          amountDecimal: ledgerAmount,
+          flowDate: ledgerDate,
+          note: ledgerNote,
+        },
+        { mode: activeWorkspaceMode, language },
+      );
       if (!isCurrentLockEpoch(epoch)) return;
       setLedgerAmount("");
       setLedgerSymbol("");
       setLedgerNote("");
       setLedgerStatus(
-        chinese
-          ? `已加密记录 ${saved.flowDate} · ${saved.currency} 现金流条目并写入 Ed25519 证据链。`
-          : `Encrypted ${saved.flowDate} (${saved.currency}) cash-flow entry saved & logged to Ed25519 evidence.`,
+        isLocalMode
+          ? (chinese
+              ? `已加密记录 ${saved.flowDate} · ${saved.currency} 现金流条目并写入 Ed25519 证据链。`
+              : `Encrypted ${saved.flowDate} (${saved.currency}) cash-flow entry saved & logged to Ed25519 evidence.`)
+          : (chinese
+              ? `已在 Mock 演示沙盒记录 ${saved.flowDate} · ${saved.currency} 现金流（仅内存，不写入真实加密金库）。`
+              : `Recorded ${saved.flowDate} (${saved.currency}) entry in Mock sandbox (memory-only; real encrypted vault untouched).`),
       );
     } catch (error) {
       if (!isCurrentLockEpoch(epoch)) return;
@@ -1097,11 +1111,13 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
     const epoch = getCurrentLockEpoch();
     setLedgerError(null);
     try {
-      const removed = await CASH_FLOW_STORE.remove(id);
+      const removed = await CASH_FLOW_STORE.remove(id, activeWorkspaceMode);
       if (!isCurrentLockEpoch(epoch)) return;
       if (removed) {
         setLedgerStatus(
-          chinese ? "已删除现金流条目并记录证据日志。" : "Cash-flow entry deleted and logged.",
+          isLocalMode
+            ? (chinese ? "已删除现金流条目并记录证据日志。" : "Cash-flow entry deleted and logged.")
+            : (chinese ? "已从 Mock 演示沙盒移除该条目。" : "Removed entry from Mock sandbox."),
         );
       }
     } catch (error) {
@@ -2040,14 +2056,22 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       >
         <div className="fh-panel-heading fh-holdings-heading">
           <div>
-            <p className="fh-eyebrow">{chinese ? "加密台账 · AES-256-GCM + Ed25519" : "Encrypted ledger · AES-256-GCM + Ed25519"}</p>
+            <p className="fh-eyebrow">
+              {isLocalMode
+                ? (chinese ? "加密台账 · AES-256-GCM + Ed25519" : "Encrypted ledger · AES-256-GCM + Ed25519")
+                : (chinese ? "Mock 演示沙盒 · 仅内存不落盘" : "Mock demo sandbox · Memory-only")}
+            </p>
             <h2 id="fh-ledger-title">
               {chinese ? `分红与现金流台账 (${activeBucketCurrency})` : `Cash-flow & dividend ledger (${activeBucketCurrency})`}
             </h2>
             <p>
-              {chinese
-                ? "记录股息分红、资金出入金与税费；数据经 AES-256-GCM 加密落盘、纳入 .fhvault 离线备份，并按账户/币种桶独立汇总。"
-                : "Track dividends, deposits, withdrawals, and fees encrypted in SQLite, included in .fhvault backups, and isolated per account & currency bucket."}
+              {isLocalMode
+                ? (chinese
+                    ? "记录股息分红、资金出入金与税费；数据经 AES-256-GCM 加密落盘、纳入 .fhvault 离线备份，并按账户/币种桶独立汇总。"
+                    : "Track dividends, deposits, withdrawals, and fees encrypted in SQLite, included in .fhvault backups, and isolated per account & currency bucket.")
+                : (chinese
+                    ? "当前处于 Mock 演示模式：此处录入的分红与出入金仅保存在内存沙盒中用于演示，与本地加密金库完全隔离。"
+                    : "Mock Demo mode: entries recorded here stay in an isolated memory sandbox and never read or modify your encrypted SQLite vault.")}
             </p>
           </div>
           <span className="fh-holdings-count" data-testid="cash-flow-count">
@@ -2099,7 +2123,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             void handleAddCashFlow();
           }}
         >
-          {selectedAccountId === ALL_ACCOUNTS_ID && (
+          {isLocalMode && selectedAccountId === ALL_ACCOUNTS_ID && (
             <label>
               <span>{chinese ? "账户" : "Account"}</span>
               <select
@@ -2130,7 +2154,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <input
               type="text"
               data-testid="cash-flow-symbol"
-              placeholder="e.g. AAPL"
+              placeholder={chinese ? "如 AAPL" : "e.g. AAPL"}
               value={ledgerSymbol}
               onChange={(event) => setLedgerSymbol(event.target.value)}
             />
@@ -2153,7 +2177,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
               type="text"
               inputMode="decimal"
               data-testid="cash-flow-amount"
-              placeholder="e.g. 125.50"
+              placeholder={chinese ? "如 125.50" : "e.g. 125.50"}
               value={ledgerAmount}
               onChange={(event) => setLedgerAmount(event.target.value)}
             />
@@ -2217,7 +2241,9 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
               {bucketCashFlows.map((cf) => {
                 const signedDec = cashFlowSignedDecimal(cf);
                 const signedNum = decimalToNumber(signedDec);
-                const acctName = accounts.find((a) => a.id === cf.accountId)?.name ?? cf.accountId;
+                const acctName = isLocalMode
+                  ? (accounts.find((a) => a.id === cf.accountId)?.name ?? cf.accountId)
+                  : (chinese ? "Mock 演示账户" : "Mock Demo Account");
                 return (
                   <tr key={cf.id} data-testid={`cash-flow-row-${cf.id}`}>
                     <td>{cf.flowDate}</td>

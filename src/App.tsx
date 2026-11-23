@@ -245,6 +245,9 @@ export function App() {
       if (detail.status) {
         setHasLockPassphrase(Boolean(detail.status.hasLockPassphrase));
         setRetryAfterSeconds(detail.status.retryAfterSeconds ?? 0);
+        const isErrLocked = detail.status.lockState === "error-locked";
+        setVaultErrorLocked(isErrLocked);
+        setVaultLockedReason(isErrLocked ? (detail.status.lockedReason ?? null) : null);
       }
     };
     const onWorkspacePrefsChanged = (event: Event) => {
@@ -262,7 +265,14 @@ export function App() {
     };
   }, []);
 
+  const vaultErrorLockedRef = useRef(vaultErrorLocked);
+  vaultErrorLockedRef.current = vaultErrorLocked;
+
   const lockSession = useCallback(async (trigger: "manual" | "idle") => {
+    // P2-4: In Fail-Closed ErrorLocked state, vault keys are already absent and `vault_unlock`
+    // cannot exit ErrorLocked. Never overlay `<LockScreen />` (which would trap the user out
+    // of the Settings `.fhvault` disaster-recovery workflow).
+    if (vaultErrorLockedRef.current) return;
     const mode = MOCK_BROKER.getWorkspaceMode();
     benchmarkReqSeqRef.current += 1;
     // P0-2 Fail-Closed: immediately wipe all sensitive user portfolio, quote, order,
@@ -364,7 +374,7 @@ export function App() {
   }, [language]);
 
   useEffect(() => {
-    if (userLocked || idleLockMinutes <= 0) return undefined;
+    if (userLocked || vaultErrorLocked || idleLockMinutes <= 0) return undefined;
     const timeoutMs = idleLockMinutes * 60 * 1000;
     let lastActivityAt = Date.now();
     let locked = false;
@@ -823,6 +833,16 @@ export function App() {
             onVaultStatusChange={(status) => {
               setHasLockPassphrase(Boolean(status.hasLockPassphrase));
               setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
+              const isErrLocked = status.lockState === "error-locked";
+              setVaultErrorLocked(isErrLocked);
+              setVaultLockedReason(isErrLocked ? (status.lockedReason ?? null) : null);
+              if (isErrLocked) {
+                // P2-1: Immediately purge frontend sensitive memory if backend entered ErrorLocked.
+                purgeAllFrontendSensitiveMemory();
+                setSelectedBenchmark(null);
+                setBenchmarkLoading(false);
+                setBenchmarkNotice(null);
+              }
             }}
           />
         );

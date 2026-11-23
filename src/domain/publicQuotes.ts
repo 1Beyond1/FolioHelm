@@ -48,7 +48,8 @@ export async function refreshPublicQuotes(
   const symbolSet = new Set<string>();
   for (const holding of snapshot.holdings) symbolSet.add(holding.symbol.toUpperCase());
   for (const quote of snapshot.quotes) symbolSet.add(quote.symbol.toUpperCase());
-  if (MOCK_BROKER.getWorkspaceMode() === "local-csv") {
+  const activeWorkspaceMode = MOCK_BROKER.getWorkspaceMode();
+  if (activeWorkspaceMode === "local-csv") {
     for (const acctId of MOCK_BROKER.getLocalAccountIds()) {
       try {
         const acctSnap = MOCK_BROKER.getAccountSnapshot(acctId);
@@ -58,7 +59,9 @@ export async function refreshPublicQuotes(
       }
     }
   }
-  for (const item of WATCHLIST_STORE.getAll()) {
+  // P1-1 & P1-3: Only include enabled watchlist symbols from the active workspace mode
+  // (never leak real encrypted local-csv watchlist tickers during Mock Demo browsing).
+  for (const item of WATCHLIST_STORE.getAll(activeWorkspaceMode)) {
     if (item.enabled && item.symbol.trim()) {
       symbolSet.add(item.symbol.trim().toUpperCase());
     }

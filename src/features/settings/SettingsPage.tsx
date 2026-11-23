@@ -36,6 +36,7 @@ import {
   loadWorkspacePreferences,
   normalizeWorkspacePreferences,
   PROTECTIONS_SETTING_KEY,
+  purgeAllFrontendSensitiveMemory,
   saveEncryptedSetting,
   saveWorkspacePreferences,
   VAULT_HYDRATED_EVENT,
@@ -843,11 +844,32 @@ export function SettingsPage({
         closeBackupModal();
         return;
       }
-      setBackupModalError(
-        chinese
-          ? `恢复失败（Fail-Closed，原加密库未被修改）：${error instanceof Error ? error.message : String(error)}`
-          : `Restore failed (Fail-Closed; existing vault untouched): ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const errMsg = error instanceof Error ? error.message : String(error);
+      // P2-1: Re-query backend vault status on restore failure (e.g. RollbackLockRequired -> ErrorLocked)
+      // so frontend immediately wipes sensitive memory and syncs ErrorLocked state accurately.
+      const latestStatus = await invokeVaultStatus().catch(() => null);
+      if (!isCurrentLockEpoch(epoch)) {
+        closeBackupModal();
+        return;
+      }
+      if (latestStatus) {
+        setVaultStatus(latestStatus);
+        onVaultStatusChange?.(latestStatus);
+      }
+      if (latestStatus?.lockState === "error-locked") {
+        purgeAllFrontendSensitiveMemory();
+        setBackupModalError(
+          chinese
+            ? `恢复失败，后端已切换为 Fail-Closed 错误锁定状态并擦除内存敏感数据（请重新选择有效的 .fhvault 备份恢复）：${errMsg}`
+            : `Restore failed and vault entered Fail-Closed ErrorLocked state with sensitive memory wiped (select a valid .fhvault backup to recover): ${errMsg}`,
+        );
+      } else {
+        setBackupModalError(
+          chinese
+            ? `恢复失败（Fail-Closed，原加密库未被修改）：${errMsg}`
+            : `Restore failed (Fail-Closed; existing vault untouched): ${errMsg}`,
+        );
+      }
       setBackupBusy(false);
     }
   }
@@ -1317,6 +1339,7 @@ export function SettingsPage({
               className="settings-button settings-button--secondary"
               type="button"
               data-testid="settings-lock-now"
+              disabled={vaultStatus?.lockState === "error-locked"}
               onClick={() => onLockSession?.("manual")}
             >
               {chinese ? "立即锁屏" : "Lock now"}

@@ -173,7 +173,7 @@ const COPY = {
     unsupportedTitle: "No demo data for this symbol",
     unsupportedBody: "This trade window only supports symbols with local fictional quotes. Return to Markets and choose a listed symbol. No order or brokerage request is available.",
     invalidQuantity: "Enter a whole-share quantity greater than 0.",
-    invalidLimitPrice: "Enter a limit price greater than 0 with at most two decimal places.",
+    invalidLimitPrice: "Enter a limit price greater than 0 with at most six decimal places.",
     previewFailed: "The local Mock preview could not be created. Review the ticket and try again.",
     previewBlocked: "The local Mock preview was blocked by a safety gate. No request was sent; review the account, quote, and position before trying again.",
     simulationFailed: "The local Mock simulation could not be completed. Do not repeat it until the preview state is reviewed.",
@@ -255,7 +255,7 @@ const COPY = {
     unsupportedTitle: "此代码暂无演示数据",
     unsupportedBody: "此交易窗口只支持有本地虚构报价的代码。请返回市场页选择列表中的代码；当前没有订单或券商请求可用。",
     invalidQuantity: "请输入大于 0 的整数数量。",
-    invalidLimitPrice: "请输入大于 0 且最多两位小数的限价价格。",
+    invalidLimitPrice: "请输入大于 0 且最多六位小数的限价价格。",
     previewFailed: "本地 Mock 预览创建失败。请检查交易单后再试。",
     previewBlocked: "本地 Mock 预览被安全门槛阻止。没有发送请求；请先检查账户、报价和持仓，再决定是否重试。",
     simulationFailed: "本地 Mock 模拟未完成。在确认预览状态前不要重复操作。",
@@ -279,7 +279,7 @@ function formatMoney(amount: Money | Price, language: Language, currency = "USD"
 }
 
 const WHOLE_QUANTITY_RE = /^[1-9]\d*$/;
-const POSITIVE_PRICE_RE = /^(?:\d+(?:\.\d{1,2})?|\.\d{1,2})$/;
+const POSITIVE_PRICE_RE = /^(?:\d+(?:\.\d{1,6})?|\.\d{1,6})$/;
 const ZERO_PRICE = price("0");
 
 export function TradePage({ language, initialSymbol, initialPrefill, onClose, onViewOrders }: TradePageProps) {

@@ -819,6 +819,7 @@ function buildLocalSnapshotFromCsv(
     if (!seenSymbols.has(baseQuote.symbol)) {
       const livePublic = publicQuoteMap?.get(baseQuote.symbol);
       if (livePublic) {
+        seenSymbols.add(baseQuote.symbol);
         quotes.push({
           ...baseQuote,
           price: price(livePublic.price),
@@ -832,6 +833,30 @@ function buildLocalSnapshotFromCsv(
           provider: livePublic.provider,
         });
       }
+    }
+  }
+
+  // P1-3: Preserve fetched public delayed quotes for any remaining non-holding, non-demo
+  // watchlist symbols (e.g. 00700.HK, QQQ, BRK.B) so local watchlist price alerts work end-to-end.
+  if (publicQuoteMap) {
+    for (const [sym, livePublic] of publicQuoteMap) {
+      const normalizedSym = sym.trim().toUpperCase();
+      if (!normalizedSym || seenSymbols.has(normalizedSym)) continue;
+      seenSymbols.add(normalizedSym);
+      quotes.push({
+        symbol: normalizedSym,
+        companyEn: normalizedSym,
+        companyZh: normalizedSym,
+        price: price(livePublic.price),
+        change: price(livePublic.change),
+        changePct: percent(livePublic.changePct),
+        asOf: livePublic.asOfUtc,
+        status: "available",
+        currency: livePublic.currency ?? "USD",
+        source: "public-delayed",
+        delayed: livePublic.delayed,
+        provider: livePublic.provider,
+      });
     }
   }
 

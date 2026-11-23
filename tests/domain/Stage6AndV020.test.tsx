@@ -36,10 +36,12 @@ import {
   saveWorkspacePreferences,
   WORKSPACE_PREFS_KEY,
 } from "../../src/domain/vaultStorage";
-import { evaluateWatchlistItem, WATCHLIST_STORE } from "../../src/domain/watchlist";
+import { evaluateWatchlistItem, microsToDisplayDecimal, WATCHLIST_STORE } from "../../src/domain/watchlist";
+import { refreshPublicQuotes } from "../../src/domain/publicQuotes";
 import { MarketsPage } from "../../src/features/markets/MarketsPage";
 import { PortfolioPage } from "../../src/features/portfolio/PortfolioPage";
 import { SettingsPage } from "../../src/features/settings/SettingsPage";
+import { TradePage } from "../../src/features/trade/TradePage";
 import { clearFolioHelmStored, readStored } from "../../src/platform/storage";
 
 function deferred<T>() {
@@ -547,5 +549,377 @@ describe("v0.2.0 Feature 3: Sanitized Portfolio Review Report Export (Markdown &
       );
       expect(screen.getByTestId("report-export-feedback")).toHaveTextContent("D:\\reports\\foliohelm-review.md");
     });
+  });
+});
+
+describe("Red-Team Recheck (#177/#178): Strict Mode Isolation, Report Redaction, Watchlist Quotes, ErrorLocked Recovery & Precision", () => {
+  it("P1-1: completely isolates Mock Demo sandbox from local-csv real encrypted vault (cash flows, watchlist, accounts, reports)", async () => {
+    // 1. Seed a real local account, real local-csv portfolio, cash flow, and watchlist item
+    const realAcct = await ACCOUNT_STORE.createOrUpdateAccount({
+      name: "Schwab Secret Vault",
+      broker: "Schwab",
+      accountType: "taxable",
+      baseCurrency: "USD",
+    });
+    const csv = [
+      "Symbol,Description,Quantity,Average Cost,Price,Currency",
+      "AAPL,Apple Inc.,10,180.00,200.00,USD",
+    ].join("\n");
+    const committed = await commitBrokerCsv(csv, "schwab.csv", realAcct.id, realAcct.name);
+    MOCK_BROKER.applyLocalPortfolioSnapshot(committed.snapshot, { switchMode: true });
+
+    await CASH_FLOW_STORE.upsert(
+      {
+        accountId: realAcct.id,
+        flowType: "dividend",
+        symbol: "AAPL",
+        currency: "USD",
+        amountDecimal: "99.00",
+        flowDate: "2026-11-20",
+        note: "Real Vault Dividend",
+      },
+      { mode: "local-csv" },
+    );
+    await WATCHLIST_STORE.upsert(
+      {
+        symbol: "00700.HK",
+        currency: "HKD",
+        targetBuyDecimal: "380.00",
+        note: "Real HK target",
+      },
+      { mode: "local-csv" },
+    );
+
+    // 2. Switch back to Mock Demo mode under Tauri runtime
+    MOCK_BROKER.setWorkspaceMode("mock");
+    tauriMocks.isTauri.mockReturnValue(true);
+    tauriMocks.invoke.mockClear();
+    tauriMocks.invoke.mockResolvedValue(null);
+
+    // Real local-csv data MUST NOT leak into Mock mode stores or reports
+    expect(CASH_FLOW_STORE.getAll("mock")).toHaveLength(0);
+    expect(WATCHLIST_STORE.getAll("mock")).toHaveLength(0);
+    const mockReport = buildPortfolioReportInputFromStores("en", realAcct.id);
+    expect(mockReport.buckets.every((b) => b.cashFlows.length === 0)).toBe(true);
+
+    // PortfolioPage in Mock mode must NOT expose real local account name or real dividend
+    const { unmount: unmountPortfolio } = render(
+      <PortfolioPage language="en" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />,
+    );
+    expect(screen.queryByTestId("cash-flow-account")).not.toBeInTheDocument();
+    expect(screen.queryByText("Schwab Secret Vault")).not.toBeInTheDocument();
+    expect(screen.queryByText("Real Vault Dividend")).not.toBeInTheDocument();
+
+    // Recording a Mock cash flow MUST stay in memory sandbox and NEVER call vault_upsert_cash_flow
+    fireEvent.change(screen.getByTestId("cash-flow-amount"), { target: { value: "12.34" } });
+    fireEvent.change(screen.getByTestId("cash-flow-note"), { target: { value: "Mock Sandbox Div" } });
+    fireEvent.click(screen.getByTestId("cash-flow-submit"));
+    await waitFor(() => {
+      expect(screen.getByText("Mock Sandbox Div")).toBeInTheDocument();
+    });
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("vault_upsert_cash_flow", expect.anything());
+    unmountPortfolio();
+
+    // MarketsPage in Mock mode must NOT show real watchlist item and MUST NOT call vault_upsert_watchlist_item
+    const { unmount: unmountMarkets } = render(
+      <MarketsPage language="en" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />,
+    );
+    expect(screen.queryByTestId("watchlist-row-00700.HK")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("watchlist-symbol-input"), { target: { value: "NVDA" } });
+    fireEvent.change(screen.getByTestId("watchlist-buy-input"), { target: { value: "120.00" } });
+    fireEvent.click(screen.getByTestId("watchlist-submit"));
+    await waitFor(() => {
+      expect(screen.getByTestId("watchlist-row-NVDA")).toBeInTheDocument();
+    });
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("vault_upsert_watchlist_item", expect.anything());
+    unmountMarkets();
+
+    // 3. Switch back to local-csv -> real vault entries intact, Mock sandbox entries absent!
+    MOCK_BROKER.setWorkspaceMode("local-csv");
+    expect(CASH_FLOW_STORE.getAll("local-csv").map((c) => c.note)).toEqual(["Real Vault Dividend"]);
+    expect(WATCHLIST_STORE.getAll("local-csv").map((w) => w.symbol)).toEqual(["00700.HK"]);
+    const localReport = buildPortfolioReportInputFromStores("en", realAcct.id);
+    const localNotes = localReport.buckets.flatMap((b) => b.cashFlows.map((c) => c.note));
+    expect(localNotes).toEqual(["Real Vault Dividend"]);
+  });
+
+  it("P1-2 & P2-5: preserves 6-digit A-share tickers and >=100k decimal amounts while redacting JWTs and underscore account IDs", async () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    expect(sanitizeSensitiveReportText(`acct_1234567890 token ${jwt} 600519.SS 500000.00`)).toBe(
+      "acct_••••7890 token [REDACTED] 600519.SS 500000.00",
+    );
+
+    const aShareCsv = [
+      "代码,名称,持有数量,平均成本价,现价,币种",
+      "600519.SS,贵州茅台,100,1500.00,1800.00,人民币",
+      "000001.SZ,平安银行,1000,10.00,12.00,人民币",
+    ].join("\n");
+    const committed = await commitBrokerCsv(aShareCsv, "cn.csv");
+    committed.snapshot.cash = "500000.00";
+    committed.snapshot.cashByCurrency = { CNY: "500000.00" };
+    MOCK_BROKER.applyLocalPortfolioSnapshot(committed.snapshot, { switchMode: true });
+
+    await CASH_FLOW_STORE.upsert(
+      {
+        accountId: DEFAULT_ACCOUNT_ID,
+        flowType: "dividend",
+        symbol: "600519.SS",
+        currency: "CNY",
+        amountDecimal: "120000.00",
+        flowDate: "2026-11-21",
+        note: `Dividend acct_9988776655 ${jwt}`,
+      },
+      { mode: "local-csv" },
+    );
+
+    const input = buildPortfolioReportInputFromStores("zh", DEFAULT_ACCOUNT_ID, "2026-11-23T09:00:00.000Z");
+    const md = generatePortfolioMarkdownReport(input);
+    const csv = generatePortfolioCsvReport(input);
+
+    // 6-digit tickers & >=100k structured amounts MUST NOT be corrupted
+    expect(md).toContain("| 600519.SS |");
+    expect(md).toContain("| 000001.SZ |");
+    expect(md).toContain("500000.00 CNY");
+    expect(md).toContain("+120000.00 CNY");
+    expect(csv).toContain(",600519.SS,");
+    expect(csv).toContain(",000001.SZ,");
+    expect(csv).toContain("Cash=500000.00; Dividends=120000.00;");
+
+    // Sensitive tokens & underscore account IDs MUST be redacted
+    expect(md).not.toContain("9988776655");
+    expect(md).not.toContain("eyJhbGci");
+    expect(md).toContain("acct_••••6655");
+    expect(csv).not.toContain("9988776655");
+    expect(csv).not.toContain("eyJhbGci");
+  });
+
+  it("P1-3: fetches and retains public delayed quotes for non-holding, non-demo local-csv watchlist symbols (e.g. 00700.HK)", async () => {
+    const csv = [
+      "Symbol,Description,Quantity,Average Cost,Price,Currency",
+      "AAPL,Apple Inc.,10,180.00,200.00,USD",
+    ].join("\n");
+    const committed = await commitBrokerCsv(csv, "us-only.csv");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(committed.snapshot, { switchMode: true });
+    MOCK_BROKER.setPublicQuotesEnabled(true);
+
+    // Add non-holding, non-demo HK symbol to local-csv watchlist
+    await WATCHLIST_STORE.upsert(
+      {
+        symbol: "00700.HK",
+        currency: "HKD",
+        targetBuyDecimal: "400.00",
+        targetSellDecimal: "480.00",
+        note: "Tencent watch",
+      },
+      { mode: "local-csv" },
+    );
+
+    tauriMocks.isTauri.mockReturnValue(true);
+    let requestedSymbols: string[] = [];
+    tauriMocks.invoke.mockImplementation(async (cmd, args) => {
+      if (cmd === "quotes_fetch_public") {
+        requestedSymbols = Array.isArray(args?.symbols) ? (args.symbols as string[]) : [];
+        return {
+          quotes: [
+            {
+              symbol: "AAPL",
+              price: "205.00",
+              change: "5.00",
+              changePct: "2.50",
+              currency: "USD",
+              asOfUtc: "2026-11-23T09:00:00.000Z",
+              provider: "yahoo",
+              delayed: true,
+            },
+            {
+              symbol: "00700.HK",
+              price: "385.20",
+              change: "-4.80",
+              changePct: "-1.23",
+              currency: "HKD",
+              asOfUtc: "2026-11-23T09:00:00.000Z",
+              provider: "yahoo",
+              delayed: true,
+            },
+          ],
+          fromCache: false,
+          degradedReason: null,
+          provider: "yahoo",
+        };
+      }
+      if (cmd === "nav_upsert_snapshots") return 1;
+      return null;
+    });
+
+    await refreshPublicQuotes("yahoo");
+    expect(requestedSymbols).toContain("00700.HK");
+
+    // Snapshot MUST preserve 00700.HK delayed quote even though it is neither held nor in the 7 demo stocks
+    const snap = MOCK_BROKER.getSnapshot();
+    expect(snap.quotes.find((q) => q.symbol === "00700.HK")?.price).toBe("385.2");
+
+    render(<MarketsPage language="en" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />);
+    expect(screen.getByTestId("watchlist-row-00700.HK")).toHaveAttribute("data-alert-status", "buy-triggered");
+    expect(screen.getByTestId("watchlist-triggered-count")).toHaveTextContent("1 target alert(s) hit");
+  });
+
+  it("P2-1 & P2-4: syncs ErrorLocked state & wipes memory on rollback failure, and never traps user on LockScreen when ErrorLocked", async () => {
+    tauriMocks.isTauri.mockReturnValue(true);
+    let backendErrorLocked = false;
+
+    tauriMocks.invoke.mockImplementation(async (cmd) => {
+      switch (cmd) {
+        case "vault_status":
+          return backendErrorLocked
+            ? {
+                unlocked: false,
+                lockState: "error-locked",
+                hasLockPassphrase: false,
+                retryAfterSeconds: 0,
+                cipher: "AES-256-GCM + Ed25519",
+                schemaVersion: 1,
+                keyProvider: "os-keyring",
+                signerPublicKey: null,
+                evidenceCount: 0,
+                hasLocalPortfolio: false,
+                lockedReason: "rollback failed to reopen original vault",
+              }
+            : {
+                unlocked: true,
+                lockState: "unlocked",
+                hasLockPassphrase: false,
+                retryAfterSeconds: 0,
+                cipher: "AES-256-GCM + Ed25519",
+                schemaVersion: 1,
+                keyProvider: "os-keyring",
+                signerPublicKey: "pub-1",
+                evidenceCount: 1,
+                hasLocalPortfolio: false,
+                lockedReason: null,
+              };
+        case "dialog_open_fhvault_file":
+          return { fileName: "backup.fhvault", content: "{\"version\":1}" };
+        case "vault_restore_backup":
+          backendErrorLocked = true;
+          throw new Error("restore verification failed; unable to reopen original vault");
+        case "vault_list_cash_flows":
+          return [
+            {
+              id: "cf_mem_1",
+              accountId: DEFAULT_ACCOUNT_ID,
+              flowType: "dividend",
+              symbol: "AAPL",
+              currency: "USD",
+              amountMicros: "50000000",
+              flowDate: "2026-11-20",
+              note: "Sensitive memo",
+              createdAt: "2026-11-20T00:00:00.000Z",
+            },
+          ];
+        case "vault_list_watchlist":
+        case "quotes_load_cached":
+        case "vault_load_account_portfolios":
+        case "vault_list_accounts":
+        case "nav_list_snapshots":
+        case "benchmark_load_cached":
+        case "vault_load_paper_orders":
+          return [];
+        default:
+          return null;
+      }
+    });
+
+    window.location.hash = "#/settings";
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("fhvault-restore-open")).toBeInTheDocument();
+      expect(CASH_FLOW_STORE.getAll("local-csv")).toHaveLength(1);
+    });
+
+    // Open restore modal, select file, submit -> backend fails into ErrorLocked
+    fireEvent.click(screen.getByTestId("fhvault-restore-open"));
+    fireEvent.click(screen.getByTestId("fhvault-choose-file"));
+    await waitFor(() => {
+      expect(screen.getByTestId("fhvault-passphrase-input")).toBeInTheDocument();
+    });
+    fireEvent.change(screen.getByTestId("fhvault-passphrase-input"), { target: { value: "Valid-Passphrase-2026!" } });
+    fireEvent.click(screen.getByTestId("fhvault-modal-submit"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("fhvault-modal-error")).toHaveTextContent(/ErrorLocked/i);
+      expect(screen.getByTestId("fhvault-modal-error")).not.toHaveTextContent(/existing vault untouched/i);
+    });
+    // Sensitive frontend memory must be wiped immediately
+    expect(CASH_FLOW_STORE.getAll("local-csv")).toHaveLength(0);
+
+    // P2-4: Clicking topbar Lock while ErrorLocked must NOT trap user behind <LockScreen />
+    fireEvent.click(screen.getByTestId("topbar-lock-button"));
+    expect(screen.queryByTestId("app-lock-screen")).not.toBeInTheDocument();
+  });
+
+  it("P2-2 & P2-3: preserves 6-decimal watchlist precision across toggleEnabled and TradePage, localizes Chinese errors, and resets ledger currency on bucket switch", async () => {
+    // 6-decimal target prices must not truncate to 4 decimals on toggleEnabled
+    const saved = await WATCHLIST_STORE.upsert(
+      {
+        symbol: "PENNY",
+        currency: "HKD",
+        targetBuyDecimal: "0.01001",
+        targetSellDecimal: "0.01002",
+      },
+      { mode: "mock" },
+    );
+    expect(microsToDisplayDecimal(saved.targetBuyMicros)).toBe("0.01001");
+    expect(microsToDisplayDecimal(saved.targetSellMicros)).toBe("0.01002");
+    const toggled = await WATCHLIST_STORE.toggleEnabled(saved.id, { mode: "mock" });
+    expect(toggled?.enabled).toBe(false);
+    expect(microsToDisplayDecimal(toggled?.targetBuyMicros ?? null)).toBe("0.01001");
+
+    // TradePage accepts up to 6-decimal limit prices prefilled from Watchlist
+    const { unmount: unmountTrade } = render(
+      <TradePage
+        language="en"
+        initialSymbol="AAPL"
+        initialPrefill={{ symbol: "AAPL", side: "buy", orderType: "limit", limitPrice: "0.01001", currency: "USD" }}
+        onClose={vi.fn()}
+        onViewOrders={vi.fn()}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Quantity (whole shares)"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByTestId("trade-safety")).toBeInTheDocument();
+    unmountTrade();
+
+    // Chinese validation errors in MarketsPage and PortfolioPage + currency reset on bucket switch
+    const { unmount: unmountMarkets } = render(
+      <MarketsPage language="zh" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("watchlist-symbol-input"), { target: { value: "AAPL" } });
+    fireEvent.change(screen.getByTestId("watchlist-buy-input"), { target: { value: "300" } });
+    fireEvent.change(screen.getByTestId("watchlist-sell-input"), { target: { value: "200" } });
+    fireEvent.click(screen.getByTestId("watchlist-submit"));
+    await waitFor(() => {
+      expect(screen.getByTestId("watchlist-error")).toHaveTextContent("买入目标价必须低于卖出目标价");
+    });
+    unmountMarkets();
+
+    const mixedCsv = [
+      "代码,名称,持有数量,平均成本价,现价,币种",
+      "US.AAPL,Apple Inc,10,180.00,200.00,美元",
+      "HK.00700,腾讯控股,100,320.00,300.00,港元",
+    ].join("\n");
+    const committed = await commitBrokerCsv(mixedCsv, "mixed.csv");
+    MOCK_BROKER.applyLocalPortfolioSnapshot(committed.snapshot, { switchMode: true });
+
+    render(<PortfolioPage language="zh" onOpenInstrument={vi.fn()} onOpenTrade={vi.fn()} />);
+    // Submit invalid empty amount -> must show Chinese validation error
+    fireEvent.click(screen.getByTestId("cash-flow-submit"));
+    await waitFor(() => {
+      expect(screen.getByTestId("cash-flow-error")).toHaveTextContent("现金流金额必须为正数");
+    });
+    // Manually change ledgerCurrency to EUR, then click HKD bucket tab -> must reset to HKD
+    fireEvent.change(screen.getByTestId("cash-flow-currency"), { target: { value: "EUR" } });
+    expect(screen.getByTestId("cash-flow-currency")).toHaveValue("EUR");
+    fireEvent.click(screen.getByTestId("allocation-bucket-tab-HKD"));
+    expect(screen.getByTestId("cash-flow-currency")).toHaveValue("HKD");
   });
 });
