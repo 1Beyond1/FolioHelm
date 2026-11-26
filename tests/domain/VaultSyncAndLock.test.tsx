@@ -623,8 +623,8 @@ describe("Stage 4 Security Core: Heap purge on lock, sleep/wake idle lock, full 
     await waitFor(() => {
       expect(screen.queryByTestId("app-lock-screen")).not.toBeInTheDocument();
       expect(MOCK_BROKER.hasLocalPortfolio()).toBe(true);
+      expect(document.title).toContain("VOO");
     });
-    expect(document.title).toContain("VOO");
   });
 
   it("enforces wall-clock idle auto-lock across OS sleep/wake (focus/visibilitychange/activity never bypass deadline)", async () => {
