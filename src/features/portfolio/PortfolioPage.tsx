@@ -900,22 +900,54 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
       const fallbackCash = breakdown ? decimalToMicros(breakdown.cash).toString() : "0";
       const fallbackPos = breakdown ? decimalToMicros(breakdown.holdingsValue).toString() : "0";
       const fallbackNet = breakdown ? decimalToMicros(breakdown.totalEquity).toString() : "0";
-      await NAV_STORE.recordExternalCashFlow({
-        date: cfDate,
-        accountId: targetAcct,
-        currency: activeBucketCurrency,
-        cashFlowDecimal: trimmedAmt,
-        fallbackNetValueMicros: fallbackNet,
-        fallbackCashMicros: fallbackCash,
-        fallbackPositionsMicros: fallbackPos,
-      });
+      const cfMicros = decimalToMicros(trimmedAmt);
+      if (cfMicros === 0n) {
+        await NAV_STORE.recordExternalCashFlow({
+          date: cfDate,
+          accountId: targetAcct,
+          currency: activeBucketCurrency,
+          cashFlowDecimal: "0",
+          fallbackNetValueMicros: fallbackNet,
+          fallbackCashMicros: fallbackCash,
+          fallbackPositionsMicros: fallbackPos,
+        });
+      } else {
+        // Ensure a real NAV snapshot exists on `cfDate`, then record a canonical deposit/withdrawal
+        // in the Cash-Flow Ledger so `cash_flows` and `nav_snapshots.external_cash_flow_micros`
+        // remain a single unified source of truth (no split or duplicate entry).
+        if (!NAV_STORE.hasSnapshot(cfDate, targetAcct, activeBucketCurrency)) {
+          await NAV_STORE.recordExternalCashFlow({
+            date: cfDate,
+            accountId: targetAcct,
+            currency: activeBucketCurrency,
+            cashFlowDecimal: "0",
+            fallbackNetValueMicros: fallbackNet,
+            fallbackCashMicros: fallbackCash,
+            fallbackPositionsMicros: fallbackPos,
+          });
+        }
+        const flowType = cfMicros > 0n ? "deposit" : "withdrawal";
+        const absDecimal = trimmedAmt.replace(/^[+-]/, "");
+        await CASH_FLOW_STORE.upsert(
+          {
+            accountId: targetAcct,
+            flowType,
+            symbol: null,
+            currency: activeBucketCurrency,
+            amountDecimal: absDecimal,
+            flowDate: cfDate,
+            note: chinese ? "由净值出入金快捷录入并同步" : "Recorded via NAV cash-flow shortcut",
+          },
+          { mode: workspaceMode, language },
+        );
+      }
       if (!isCurrentLockEpoch(epoch)) return;
       setCfAmount("");
       setCfFormOpen(false);
       setCfNotice(
         chinese
-          ? `已记录 ${cfDate} 外部现金流 ${trimmedAmt} ${activeBucketCurrency}（后续自动快照将保留此现金流）。`
-          : `Recorded ${cfDate} external cash flow ${trimmedAmt} ${activeBucketCurrency} (preserved across future automatic snapshots).`,
+          ? `已写入现金流台账并自动同步至 ${cfDate} 净值/TWR（${trimmedAmt} ${activeBucketCurrency}，无需重复录入）。`
+          : `Saved to Cash-Flow Ledger and synced to ${cfDate} NAV/TWR (${trimmedAmt} ${activeBucketCurrency}; single source of truth).`,
       );
     } catch (error) {
       if (!isCurrentLockEpoch(epoch)) return;
@@ -1815,7 +1847,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
 
             <div className="fh-rebalance-weights-grid">
               {rebalanceHoldings.map((holding) => (
-                <label key={holding.symbol} className="fh-rebalance-weight-item">
+                <label key={`${holding.symbol}:${holding.currency ?? activeBucketCurrency}`} className="fh-rebalance-weight-item">
                   <span>{holding.symbol}</span>
                   <div className="fh-rebalance-input-wrap">
                     <input
@@ -1899,7 +1931,7 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                         const deltaNum = decimalToNumber(suggestion.deltaAmount);
                         const driftNum = decimalToNumber(suggestion.driftPct);
                         return (
-                          <tr key={suggestion.symbol} data-testid={`rebalance-row-${suggestion.symbol}`}>
+                          <tr key={`${suggestion.symbol}:${suggestion.currency}`} data-testid={`rebalance-row-${suggestion.symbol}`}>
                             <th scope="row">
                               <span className="fh-symbol">{isCashRow ? copy.rebalanceCashLabel : suggestion.symbol}</span>
                             </th>
@@ -2015,14 +2047,21 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
                   className="fh-attribution-row"
                   data-testid={`pnl-attribution-row-${entry.symbol}`}
                 >
-                  <button
-                    type="button"
-                    className="fh-attribution-symbol"
-                    onClick={() => onOpenInstrument(entry.symbol)}
-                  >
-                    <strong>{entry.symbol}</strong>
-                    <small title={entry.company}>{entry.company} · {entry.currency}</small>
-                  </button>
+                  {entry.symbol === "UNATTRIBUTED" ? (
+                    <div className="fh-attribution-symbol">
+                      <strong>{entry.symbol}</strong>
+                      <small title={entry.company}>{entry.company} · {entry.currency}</small>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="fh-attribution-symbol"
+                      onClick={() => onOpenInstrument(entry.symbol)}
+                    >
+                      <strong>{entry.symbol}</strong>
+                      <small title={entry.company}>{entry.company} · {entry.currency}</small>
+                    </button>
+                  )}
                   <div className="fh-attribution-bar-track" aria-hidden="true">
                     <div
                       className={`fh-attribution-bar-fill ${contribNum < 0 ? "is-negative" : "is-positive"}`}
@@ -2067,8 +2106,8 @@ export function PortfolioPage({ language, onOpenInstrument, onOpenTrade }: Portf
             <p>
               {isLocalMode
                 ? (chinese
-                    ? "记录股息分红、资金出入金与税费；数据经 AES-256-GCM 加密落盘、纳入 .fhvault 离线备份，并按账户/币种桶独立汇总。"
-                    : "Track dividends, deposits, withdrawals, and fees encrypted in SQLite, included in .fhvault backups, and isolated per account & currency bucket.")
+                    ? "记录股息分红、资金出入金与税费；数据经 AES-256-GCM 加密落盘、纳入 .fhvault 离线备份，并按账户/币种桶独立汇总。入金/出金将自动汇总并同步至对应日期的净值与 TWR 外部现金流，无需重复录入。"
+                    : "Track dividends, deposits, withdrawals, and fees encrypted in SQLite, included in .fhvault backups, and isolated per account & currency bucket. Deposits and withdrawals automatically sync into matching NAV/TWR external cash flows—no duplicate entry needed.")
                 : (chinese
                     ? "当前处于 Mock 演示模式：此处录入的分红与出入金仅保存在内存沙盒中用于演示，与本地加密金库完全隔离。"
                     : "Mock Demo mode: entries recorded here stay in an isolated memory sandbox and never read or modify your encrypted SQLite vault.")}

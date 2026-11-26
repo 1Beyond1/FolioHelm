@@ -952,6 +952,12 @@ impl VaultRuntimeState {
             VaultSession::ErrorLocked { .. } => {
                 // P1-4 disaster recovery: allow verified `.fhvault` restore from `ErrorLocked`
                 // (keyring lost, canary damaged, or prior rollback failure) to rebuild and unlock.
+                if self.db_path.as_os_str().is_empty() {
+                    return Err(
+                        "Vault database path is empty; cannot execute disaster recovery"
+                            .to_string(),
+                    );
+                }
                 match EncryptedVaultDb::restore_from_error_locked(
                     &self.db_path,
                     payload,
@@ -2034,9 +2040,12 @@ fn vault_upsert_cash_flow(
     state: State<'_, VaultRuntimeState>,
     record: StoredCashFlow,
 ) -> Result<StoredCashFlow, String> {
-    state.with_unlocked(|db, journal| {
+    state.with_unlocked_and_cache(|db, journal, cache| {
         let saved = db
             .upsert_cash_flow(&record)
+            .map_err(|error| error.to_string())?;
+        cache.nav_snapshots = db
+            .load_all_nav_snapshots()
             .map_err(|error| error.to_string())?;
         let mut payload = BTreeMap::from([
             ("action".to_string(), "cash_flow_upserted".to_string()),
@@ -2069,11 +2078,14 @@ fn vault_upsert_cash_flow(
 
 #[tauri::command]
 fn vault_delete_cash_flow(state: State<'_, VaultRuntimeState>, id: String) -> Result<bool, String> {
-    state.with_unlocked(|db, journal| {
+    state.with_unlocked_and_cache(|db, journal, cache| {
         let deleted = db
             .delete_cash_flow(&id)
             .map_err(|error| error.to_string())?;
         if deleted {
+            cache.nav_snapshots = db
+                .load_all_nav_snapshots()
+                .map_err(|error| error.to_string())?;
             let trimmed = id.trim().to_string();
             let (signed, _) = journal
                 .prepare_append(AppendEvidenceRequest {
@@ -3207,6 +3219,7 @@ mod tests {
         assert_eq!(summary.cash_flow_count, 1);
         assert_eq!(summary.watchlist_count, 1);
         assert!(summary.evidence_count >= 1);
+        assert!(summary.app_lock_cleared);
 
         let status_after = error_locked.status().expect("status after");
         assert!(status_after.unlocked);
@@ -3231,6 +3244,104 @@ mod tests {
         assert!(restarted.status().expect("restarted status").unlocked);
 
         if let Some(parent) = vault_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
+    async fn v021_error_locked_with_empty_db_path_fails_closed_and_cash_flow_syncs_twr_cache() {
+        let locked = VaultRuntimeState::locked("simulated boot error", "in-memory-test");
+        let src_path = temp_vault_path("v021-runtime-sync");
+        let store = Arc::new(InMemoryKeyStore::new());
+        let state = VaultRuntimeState::open_with_store(
+            &src_path,
+            Arc::clone(&store) as Arc<dyn KeyStore>,
+            "in-memory-test",
+        );
+
+        // Seed 2 days of NAV snapshots ($10,000 -> $16,500) then record a $5,000 deposit on Day 2.
+        state
+            .with_unlocked_and_cache(|db, _, cache| {
+                db.upsert_nav_snapshot(
+                    &StoredNavSnapshot {
+                        date: "2026-11-20".into(),
+                        account_id: storage::DEFAULT_ACCOUNT_ID.into(),
+                        currency: "USD".into(),
+                        net_value_micros: 10_000_000_000,
+                        cash_micros: 10_000_000_000,
+                        positions_micros: 0,
+                        external_cash_flow_micros: 0,
+                        eod_onboarding_micros: 0,
+                        source: "csv-import".into(),
+                        updated_at: "2026-11-20T16:00:00.000Z".into(),
+                    },
+                    true,
+                )
+                .map_err(|e| e.to_string())?;
+                db.upsert_nav_snapshot(
+                    &StoredNavSnapshot {
+                        date: "2026-11-21".into(),
+                        account_id: storage::DEFAULT_ACCOUNT_ID.into(),
+                        currency: "USD".into(),
+                        net_value_micros: 16_500_000_000,
+                        cash_micros: 6_500_000_000,
+                        positions_micros: 10_000_000_000,
+                        external_cash_flow_micros: 0,
+                        eod_onboarding_micros: 0,
+                        source: "csv-import".into(),
+                        updated_at: "2026-11-21T16:00:00.000Z".into(),
+                    },
+                    true,
+                )
+                .map_err(|e| e.to_string())?;
+                db.upsert_cash_flow(&StoredCashFlow {
+                    id: "cf_sync_twr".into(),
+                    account_id: storage::DEFAULT_ACCOUNT_ID.into(),
+                    flow_type: "deposit".into(),
+                    symbol: None,
+                    currency: "USD".into(),
+                    amount_micros: 5_000_000_000,
+                    flow_date: "2026-11-21".into(),
+                    note: "Top-up".into(),
+                    created_at: "2026-11-21T09:00:00.000Z".into(),
+                })
+                .map_err(|e| e.to_string())?;
+                cache.nav_snapshots = db.load_all_nav_snapshots().map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .expect("seed");
+
+        // Verify TWR uses the cash-flow-synced $5,000 BOD deposit: 16,500 / (10,000 + 5,000) = +10.00%!
+        let twr = state
+            .with_unlocked_and_cache(|db, _, cache| {
+                assert_eq!(cache.nav_snapshots.len(), 2);
+                assert_eq!(
+                    cache.nav_snapshots[1].external_cash_flow_micros,
+                    5_000_000_000
+                );
+                let snaps = db
+                    .load_nav_snapshots(None, Some("USD"))
+                    .map_err(|e| e.to_string())?;
+                let agg = aggregate_nav_snapshots_for_currency(&snaps, "USD", Some("ALL"))
+                    .map_err(|e| e.to_string())?;
+                compute_twr_series(&agg, "USD", "ALL").map_err(|e| e.to_string())
+            })
+            .expect("compute twr");
+        assert_eq!(twr.cumulative_twr_pct.as_deref(), Some("10.00"));
+        assert_eq!(twr.period_pnl_micros, 1_500_000_000);
+
+        // Verify empty db_path ErrorLocked rejects restore fail-closed.
+        let backup = state
+            .export_fhvault_backup_async("Valid-Passphrase-2026!".to_string())
+            .await
+            .expect("export");
+        let err = locked
+            .restore_fhvault_backup_async(backup, "Valid-Passphrase-2026!".to_string())
+            .await
+            .expect_err("empty db_path must fail");
+        assert!(err.contains("empty"));
+
+        if let Some(parent) = src_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
     }

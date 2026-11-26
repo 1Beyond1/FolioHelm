@@ -336,6 +336,8 @@ pub struct StoredNavSnapshot {
     pub positions_micros: i128,
     #[serde(default, with = "i128_string_serde")]
     pub external_cash_flow_micros: i128,
+    #[serde(default, with = "i128_string_serde")]
+    pub eod_onboarding_micros: i128,
     pub source: String,
     pub updated_at: String,
 }
@@ -566,6 +568,8 @@ struct RestoreIntentRecord {
     target_seed_hex: Zeroizing<String>,
     staging_file_name: String,
     backup_file_name: String,
+    #[serde(default)]
+    is_error_locked_recovery: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -587,6 +591,8 @@ pub struct VaultRestoreSummaryDto {
     #[serde(default)]
     pub watchlist_count: usize,
     pub signer_public_key: String,
+    #[serde(default)]
+    pub app_lock_cleared: bool,
 }
 
 pub struct EncryptedVaultDb {
@@ -620,6 +626,54 @@ fn remove_sqlite_files(db_path: &Path) {
     for sidecar in sqlite_sidecar_paths(db_path) {
         let _ = fs::remove_file(sidecar);
     }
+}
+
+/// Move a SQLite database file together with any existing `-wal` / `-shm` sidecars
+/// to `backup_path` (preserving uncommitted WAL frames until post-swap verification passes).
+/// Rolls back any partial renames if an intermediate rename fails.
+fn backup_sqlite_files(src_db: &Path, backup_db: &Path) -> Result<bool, std::io::Error> {
+    let src_sidecars = sqlite_sidecar_paths(src_db);
+    let dst_sidecars = sqlite_sidecar_paths(backup_db);
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(3);
+
+    let candidates: [(PathBuf, PathBuf); 3] = [
+        (src_db.to_path_buf(), backup_db.to_path_buf()),
+        (src_sidecars[0].clone(), dst_sidecars[0].clone()),
+        (src_sidecars[1].clone(), dst_sidecars[1].clone()),
+    ];
+
+    for (from, to) in candidates {
+        if from.exists() {
+            if let Err(err) = fs::rename(&from, &to) {
+                for (orig_from, orig_to) in moved.into_iter().rev() {
+                    let _ = fs::rename(orig_to, orig_from);
+                }
+                return Err(err);
+            }
+            moved.push((from, to));
+        }
+    }
+
+    Ok(!moved.is_empty())
+}
+
+/// Restore a previously backed-up SQLite database file and its `-wal` / `-shm` sidecars.
+fn restore_sqlite_files_from_backup(
+    backup_db: &Path,
+    target_db: &Path,
+) -> Result<(), std::io::Error> {
+    remove_sqlite_files(target_db);
+    if backup_db.exists() {
+        fs::rename(backup_db, target_db)?;
+    }
+    let src_sidecars = sqlite_sidecar_paths(backup_db);
+    let dst_sidecars = sqlite_sidecar_paths(target_db);
+    for (from, to) in src_sidecars.into_iter().zip(dst_sidecars.into_iter()) {
+        if from.exists() {
+            fs::rename(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_safe_sibling_file_name(name: &str) -> bool {
@@ -703,12 +757,17 @@ fn recover_interrupted_restore(
         return Ok(());
     }
 
-    // Roll back to pre-restore backup and ensure OS keyring matches `previous_seed_hex`.
-    if backup_path.exists() {
-        remove_sqlite_files(db_path);
-        fs::rename(&backup_path, db_path)?;
+    // Roll back to pre-restore backup (including `-wal`/`-shm` sidecars) and ensure OS keyring matches `previous_seed_hex`.
+    let has_backup = backup_path.exists()
+        || sqlite_sidecar_paths(&backup_path)
+            .iter()
+            .any(|p| p.exists());
+    if has_backup {
+        restore_sqlite_files_from_backup(&backup_path, db_path)?;
     }
-    if !keys.signing_seed_matches_hex(&intent.previous_seed_hex) {
+    if !intent.previous_seed_hex.is_empty()
+        && !keys.signing_seed_matches_hex(&intent.previous_seed_hex)
+    {
         let _ = keys.replace_signing_seed(key_store, &intent.previous_seed_hex)?;
     }
     remove_sqlite_files(&staging_path);
@@ -1217,6 +1276,7 @@ fn validate_and_stage_backup_payload(
         cash_flow_count: encrypted_cash_flows.len(),
         watchlist_count: encrypted_watchlist.len(),
         signer_public_key: verified_journal.signer_public_key_hex(),
+        app_lock_cleared: preserved_verifier.is_none(),
     };
 
     Ok(StagedBackupRestore {
@@ -1572,8 +1632,8 @@ impl EncryptedVaultDb {
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO paper_orders (id, workspace_mode, submitted_at_utc, ciphertext)
+        match tx.execute(
+            "INSERT INTO paper_orders (id, workspace_mode, submitted_at_utc, ciphertext)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 order.id,
@@ -1581,7 +1641,18 @@ impl EncryptedVaultDb {
                 order.submitted_at,
                 ciphertext
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StorageError::InvalidInput(format!(
+                    "paper order id '{}' already exists; refusing to overwrite historical order",
+                    order.id
+                )));
+            }
+            Err(error) => return Err(StorageError::Sqlite(error)),
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2043,20 +2114,31 @@ impl EncryptedVaultDb {
         let mut normalized = validate_and_normalize_nav_snapshot(snapshot)?;
         let record_id = normalized.record_id();
 
+        let tx = self.conn.transaction()?;
         if preserve_existing_cf && normalized.external_cash_flow_micros == 0 {
-            let existing_blob: Option<Vec<u8>> = self
-                .conn
-                .query_row(
-                    "SELECT ciphertext FROM nav_snapshots WHERE record_id = ?1",
-                    params![record_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(blob) = existing_blob {
-                let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
-                let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
-                let prev: StoredNavSnapshot = serde_json::from_slice(&plaintext)?;
-                normalized.external_cash_flow_micros = prev.external_cash_flow_micros;
+            let (ledger_has_ext, ledger_net_micros) = compute_net_external_cash_flow_in_tx(
+                &tx,
+                self.keys.db_master_key(),
+                &normalized.account_id,
+                &normalized.currency,
+                &normalized.date,
+            )?;
+            if ledger_has_ext {
+                normalized.external_cash_flow_micros = ledger_net_micros;
+            } else {
+                let existing_blob: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT ciphertext FROM nav_snapshots WHERE record_id = ?1",
+                        params![record_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(blob) = existing_blob {
+                    let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
+                    let plaintext = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
+                    let prev: StoredNavSnapshot = serde_json::from_slice(&plaintext)?;
+                    normalized.external_cash_flow_micros = prev.external_cash_flow_micros;
+                }
             }
         }
 
@@ -2064,7 +2146,6 @@ impl EncryptedVaultDb {
         let plaintext = Zeroizing::new(serde_json::to_vec(&normalized)?);
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
-        let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO nav_snapshots
                 (record_id, date, account_id, currency, updated_at_utc, ciphertext)
@@ -2221,6 +2302,19 @@ impl EncryptedVaultDb {
         let ciphertext = encrypt_record(self.keys.db_master_key(), &aad, &plaintext)?;
 
         let tx = self.conn.transaction()?;
+        let prev_record: Option<StoredCashFlow> = tx
+            .query_row(
+                "SELECT ciphertext FROM cash_flows WHERE id = ?1",
+                params![normalized.id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|blob| -> Result<StoredCashFlow, StorageError> {
+                let pt = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
+                Ok(serde_json::from_slice(&pt)?)
+            })
+            .transpose()?;
+
         tx.execute(
             "INSERT OR REPLACE INTO cash_flows
                 (id, account_id, flow_date, currency, created_at_utc, ciphertext)
@@ -2234,6 +2328,30 @@ impl EncryptedVaultDb {
                 ciphertext
             ],
         )?;
+
+        let mut affected_buckets: BTreeSet<(String, String, String)> = BTreeSet::new();
+        if matches!(normalized.flow_type.as_str(), "deposit" | "withdrawal") {
+            affected_buckets.insert((
+                normalized.account_id.clone(),
+                normalized.currency.clone(),
+                normalized.flow_date.clone(),
+            ));
+        }
+        if let Some(prev) = prev_record {
+            if matches!(prev.flow_type.as_str(), "deposit" | "withdrawal") {
+                affected_buckets.insert((prev.account_id, prev.currency, prev.flow_date));
+            }
+        }
+        for (acct, curr, date) in affected_buckets {
+            sync_nav_snapshot_external_cf_in_tx(
+                &tx,
+                self.keys.db_master_key(),
+                &acct,
+                &curr,
+                &date,
+            )?;
+        }
+
         tx.commit()?;
         Ok(normalized)
     }
@@ -2290,7 +2408,34 @@ impl EncryptedVaultDb {
             ));
         }
         let tx = self.conn.transaction()?;
+        let prev_record: Option<StoredCashFlow> = tx
+            .query_row(
+                "SELECT ciphertext FROM cash_flows WHERE id = ?1",
+                params![trimmed],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|blob| -> Result<StoredCashFlow, StorageError> {
+                let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", trimmed);
+                let pt = decrypt_record(self.keys.db_master_key(), &aad, &blob)?;
+                Ok(serde_json::from_slice(&pt)?)
+            })
+            .transpose()?;
+
         let deleted = tx.execute("DELETE FROM cash_flows WHERE id = ?1", params![trimmed])?;
+        if deleted > 0 {
+            if let Some(prev) = prev_record {
+                if matches!(prev.flow_type.as_str(), "deposit" | "withdrawal") {
+                    sync_nav_snapshot_external_cf_in_tx(
+                        &tx,
+                        self.keys.db_master_key(),
+                        &prev.account_id,
+                        &prev.currency,
+                        &prev.flow_date,
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(deleted > 0)
     }
@@ -2427,6 +2572,7 @@ impl EncryptedVaultDb {
             target_seed_hex: payload.device_signing_seed_hex.clone(),
             staging_file_name: staged.staging_file_name,
             backup_file_name: staged.backup_file_name,
+            is_error_locked_recovery: false,
         };
         let intent_plaintext = Zeroizing::new(serde_json::to_vec(&intent)?);
         let intent_aad = build_aad(
@@ -2537,26 +2683,35 @@ impl EncryptedVaultDb {
         // Smoothly guarantee default account exists even when restoring a legacy v1 backup.
         self.ensure_default_account_if_missing()?;
 
-        Ok((staged.verified_journal, staged.summary))
+        let mut summary = staged.summary;
+        summary.app_lock_cleared = false;
+        Ok((staged.verified_journal, summary))
     }
 
     /// Disaster-recovery `.fhvault` restore when the vault is in `ErrorLocked`
     /// (e.g., OS keyring cleared, canary/DB corrupted, or prior rollback failure).
     ///
     /// Guarantees:
+    /// - Rejects empty/invalid `db_path` before touching disk.
     /// - Validates schema, signing seed, full Ed25519 chain, and record uniqueness BEFORE
     ///   touching any existing DB file or OS keyring entry.
     /// - Stages & cryptographically verifies a brand-new encrypted SQLite database under a
     ///   fresh AES-256 `db_master_key` + the backup's Ed25519 signing seed.
-    /// - Backs up any existing unreadable DB file before swapping, rolls back both disk and
-    ///   OS keyring on any failure so original ciphertext is never lost, and transitions
-    ///   cleanly into a live verified `EncryptedVaultDb` only after full post-swap checks pass.
+    /// - Writes an encrypted `.restore-intent` record and moves any existing DB file together
+    ///   with its `-wal` / `-shm` sidecars to backup before swapping; rolls back DB + sidecars +
+    ///   OS keyring on any failure so original ciphertext is never lost; only removes backups
+    ///   AFTER keyring persistence and full post-swap verification pass.
     pub fn restore_from_error_locked(
         db_path: &Path,
         payload: VaultBackupPayload,
         key_store: &dyn KeyStore,
         key_provider: impl Into<String>,
     ) -> Result<(Self, EvidenceJournal, VaultRestoreSummaryDto), StorageError> {
+        if db_path.as_os_str().is_empty() || db_path.file_name().is_none() {
+            return Err(StorageError::InvalidInput(
+                "vault database path must not be empty".to_string(),
+            ));
+        }
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -2572,36 +2727,59 @@ impl EncryptedVaultDb {
             &AppLockBackoffState::default(),
         )?;
 
-        let had_existing_db = db_path.exists();
-        let swap_result: Result<(), StorageError> = (|| {
-            if had_existing_db {
-                fs::rename(db_path, &staged.backup_path)?;
-                for sidecar in sqlite_sidecar_paths(db_path) {
-                    let _ = fs::remove_file(sidecar);
-                }
-            }
-            if let Err(error) = fs::rename(&staged.staging_path, db_path) {
-                if had_existing_db {
-                    let _ = fs::rename(&staged.backup_path, db_path);
-                }
+        let intent_path = restore_intent_path(db_path);
+        let intent = RestoreIntentRecord {
+            schema_version: STORAGE_SCHEMA_VERSION,
+            previous_seed_hex: Zeroizing::new(String::new()),
+            target_seed_hex: payload.device_signing_seed_hex.clone(),
+            staging_file_name: staged.staging_file_name,
+            backup_file_name: staged.backup_file_name,
+            is_error_locked_recovery: true,
+        };
+        let intent_plaintext = Zeroizing::new(serde_json::to_vec(&intent)?);
+        let intent_aad = build_aad(
+            STORAGE_SCHEMA_VERSION,
+            RESTORE_INTENT_AAD_TABLE,
+            RESTORE_INTENT_RECORD_ID,
+        );
+        let intent_ciphertext = encrypt_record(
+            recovery_keys.db_master_key(),
+            &intent_aad,
+            &intent_plaintext,
+        )?;
+        if let Err(error) = atomic_write_bytes(&intent_path, &intent_ciphertext) {
+            remove_sqlite_files(&staged.staging_path);
+            return Err(StorageError::Io(error));
+        }
+
+        let had_existing_files = match backup_sqlite_files(db_path, &staged.backup_path) {
+            Ok(moved_any) => moved_any,
+            Err(error) => {
+                remove_sqlite_files(&staged.staging_path);
+                let _ = fs::remove_file(&intent_path);
                 return Err(StorageError::Io(error));
             }
-            Ok(())
-        })();
+        };
 
-        if let Err(error) = swap_result {
+        if let Err(error) = fs::rename(&staged.staging_path, db_path) {
+            if had_existing_files {
+                let _ = restore_sqlite_files_from_backup(&staged.backup_path, db_path);
+            }
             remove_sqlite_files(&staged.staging_path);
-            return Err(error);
+            let _ = fs::remove_file(&intent_path);
+            return Err(StorageError::Io(error));
         }
 
         let prev_keyring = match recovery_keys.persist_to_key_store(key_store) {
             Ok(prev) => prev,
             Err(error) => {
-                remove_sqlite_files(db_path);
-                if had_existing_db {
-                    let _ = fs::rename(&staged.backup_path, db_path);
+                if had_existing_files {
+                    let _ = restore_sqlite_files_from_backup(&staged.backup_path, db_path);
+                } else {
+                    remove_sqlite_files(db_path);
                 }
                 remove_sqlite_files(&staged.staging_path);
+                let _ = fs::remove_file(&intent_path);
                 return Err(StorageError::Vault(error));
             }
         };
@@ -2625,18 +2803,20 @@ impl EncryptedVaultDb {
             Ok(conn) => conn,
             Err(error) => {
                 VaultKeyMaterial::rollback_key_store(key_store, prev_keyring);
-                remove_sqlite_files(db_path);
-                if had_existing_db {
-                    let _ = fs::rename(&staged.backup_path, db_path);
+                if had_existing_files {
+                    let _ = restore_sqlite_files_from_backup(&staged.backup_path, db_path);
+                } else {
+                    remove_sqlite_files(db_path);
                 }
                 remove_sqlite_files(&staged.staging_path);
+                let _ = fs::remove_file(&intent_path);
                 return Err(error);
             }
         };
 
         remove_sqlite_files(&staged.backup_path);
         remove_sqlite_files(&staged.staging_path);
-        let _ = fs::remove_file(restore_intent_path(db_path));
+        let _ = fs::remove_file(&intent_path);
 
         let mut db = Self {
             db_path: db_path.to_path_buf(),
@@ -2646,7 +2826,9 @@ impl EncryptedVaultDb {
         };
         db.ensure_default_account_if_missing()?;
 
-        Ok((db, staged.verified_journal, staged.summary))
+        let mut summary = staged.summary;
+        summary.app_lock_cleared = true;
+        Ok((db, staged.verified_journal, summary))
     }
 
     /// Reopen and cryptographically verify the original database file after a failed
@@ -2829,9 +3011,100 @@ fn validate_and_normalize_nav_snapshot(
         cash_micros: snapshot.cash_micros,
         positions_micros: snapshot.positions_micros,
         external_cash_flow_micros: snapshot.external_cash_flow_micros,
+        eod_onboarding_micros: snapshot.eod_onboarding_micros,
         source,
         updated_at,
     })
+}
+
+/// Aggregates net external capital cash flows (`+deposit - withdrawal`) from `cash_flows`
+/// inside an active SQLite transaction for a specific `(account_id, currency, flow_date)` bucket.
+/// Returns `(has_any_external_entries, net_micros)`.
+fn compute_net_external_cash_flow_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    db_master_key: &[u8; 32],
+    account_id: &str,
+    currency: &str,
+    flow_date: &str,
+) -> Result<(bool, i128), StorageError> {
+    let upper_curr = currency.trim().to_ascii_uppercase();
+    let mut stmt = tx.prepare(
+        "SELECT id, ciphertext FROM cash_flows
+         WHERE account_id = ?1 AND UPPER(currency) = ?2 AND flow_date = ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![account_id.trim(), upper_curr, flow_date.trim()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )?;
+    let mut has_external = false;
+    let mut net_micros: i128 = 0;
+    for row in rows {
+        let (id, ciphertext) = row?;
+        let aad = build_aad(STORAGE_SCHEMA_VERSION, "cash_flows", &id);
+        let plaintext = decrypt_record(db_master_key, &aad, &ciphertext)?;
+        let item: StoredCashFlow = serde_json::from_slice(&plaintext)?;
+        match item.flow_type.as_str() {
+            "deposit" => {
+                has_external = true;
+                net_micros = net_micros.checked_add(item.amount_micros).ok_or_else(|| {
+                    StorageError::InvalidInput("external cash flow sum overflow".to_string())
+                })?;
+            }
+            "withdrawal" => {
+                has_external = true;
+                net_micros = net_micros.checked_sub(item.amount_micros).ok_or_else(|| {
+                    StorageError::InvalidInput("external cash flow sum overflow".to_string())
+                })?;
+            }
+            _ => {}
+        }
+    }
+    Ok((has_external, net_micros))
+}
+
+/// Synchronizes `nav_snapshots.external_cash_flow_micros` for `(account_id, currency, flow_date)`
+/// from the canonical `cash_flows` table inside the same SQLite transaction (if a NAV snapshot
+/// exists for that date).
+fn sync_nav_snapshot_external_cf_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    db_master_key: &[u8; 32],
+    account_id: &str,
+    currency: &str,
+    flow_date: &str,
+) -> Result<(), StorageError> {
+    let upper_curr = currency.trim().to_ascii_uppercase();
+    let record_id = format!("{}|{}|{}", flow_date.trim(), account_id.trim(), upper_curr);
+    let existing_blob: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT ciphertext FROM nav_snapshots WHERE record_id = ?1",
+            params![record_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(blob) = existing_blob else {
+        return Ok(());
+    };
+
+    let (_, net_micros) = compute_net_external_cash_flow_in_tx(
+        tx,
+        db_master_key,
+        account_id,
+        &upper_curr,
+        flow_date,
+    )?;
+    let aad = build_aad(STORAGE_SCHEMA_VERSION, "nav_snapshots", &record_id);
+    let plaintext = decrypt_record(db_master_key, &aad, &blob)?;
+    let mut snap: StoredNavSnapshot = serde_json::from_slice(&plaintext)?;
+    snap.external_cash_flow_micros = net_micros;
+    snap.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    let next_plaintext = Zeroizing::new(serde_json::to_vec(&snap)?);
+    let next_ciphertext = encrypt_record(db_master_key, &aad, &next_plaintext)?;
+    tx.execute(
+        "UPDATE nav_snapshots SET updated_at_utc = ?1, ciphertext = ?2 WHERE record_id = ?3",
+        params![snap.updated_at, next_ciphertext, record_id],
+    )?;
+    Ok(())
 }
 
 fn validate_and_normalize_benchmark_series(
@@ -3838,6 +4111,7 @@ mod tests {
             target_seed_hex: exported.device_signing_seed_hex.clone(),
             staging_file_name: staging_name,
             backup_file_name: backup_name,
+            is_error_locked_recovery: false,
         };
         let intent_bytes = encrypt_record(
             &db_master_key,
@@ -3984,6 +4258,7 @@ mod tests {
                     cash_micros: 10_000_000_000,
                     positions_micros: 78_776_655_000,
                     external_cash_flow_micros: 5_000_000_000,
+                    eod_onboarding_micros: 0,
                     source: "csv-import".into(),
                     updated_at: "2026-11-21T21:00:00.000Z".into(),
                 },
@@ -4002,6 +4277,7 @@ mod tests {
                         cash_micros: 10_000_000_000,
                         positions_micros: 79_000_000_000,
                         external_cash_flow_micros: 0,
+                        eod_onboarding_micros: 0,
                         source: "portfolio-load".into(),
                         updated_at: "2026-11-21T22:00:00.000Z".into(),
                     },
@@ -4022,6 +4298,7 @@ mod tests {
                         cash_micros: 1_000_000,
                         positions_micros: 0,
                         external_cash_flow_micros: 0,
+                        eod_onboarding_micros: 0,
                         source: "test".into(),
                         updated_at: "2026-11-22T00:00:00.000Z".into(),
                     },
@@ -4082,6 +4359,7 @@ mod tests {
                     cash_micros: 15_000_000_000,
                     positions_micros: 38_000_000_000,
                     external_cash_flow_micros: 0,
+                    eod_onboarding_micros: 0,
                     source: "csv-import".into(),
                     updated_at: "2026-11-20T08:00:00.000Z".into(),
                 },
@@ -4259,6 +4537,7 @@ mod tests {
                 cash_micros: 5_000_000_000,
                 positions_micros: 0,
                 external_cash_flow_micros: 0,
+                eod_onboarding_micros: 0,
                 source: "csv-import".to_string(),
                 updated_at: "2026-11-22T11:00:00.000Z".to_string(),
             },
@@ -4334,6 +4613,7 @@ mod tests {
                 cash_micros: 1_000_000_000,
                 positions_micros: 0,
                 external_cash_flow_micros: 0,
+                eod_onboarding_micros: 0,
                 source: "csv-import".to_string(),
                 updated_at: "2026-11-22T11:10:00.000Z".to_string(),
             },
@@ -4514,5 +4794,243 @@ mod tests {
 
         cleanup_temp_db(&src_path);
         cleanup_temp_db(&dst_path);
+    }
+
+    #[test]
+    fn v021_save_paper_order_rejects_duplicate_primary_key_without_overwriting() {
+        let db_path = unique_temp_db("v021-paper-order-pk");
+        let keys = InMemoryKeyStore::new();
+        let mut db =
+            EncryptedVaultDb::open(&db_path, &keys, "in-memory-test").expect("open vault db");
+
+        let original = StoredPaperOrder {
+            id: "PAPER-ORDER-UUID-001".to_string(),
+            workspace_mode: "local-csv".to_string(),
+            account_id: DEFAULT_ACCOUNT_ID.to_string(),
+            symbol: "AAPL".to_string(),
+            side: "buy".to_string(),
+            order_type: "market".to_string(),
+            quantity: "10".to_string(),
+            filled_quantity: "0".to_string(),
+            limit_price: None,
+            currency: "USD".to_string(),
+            status: "working".to_string(),
+            submitted_at: "2026-11-25T10:00:00.000Z".to_string(),
+            events: vec![],
+        };
+        db.save_paper_order(&original).expect("first insert ok");
+
+        let colliding = StoredPaperOrder {
+            symbol: "MSFT".to_string(),
+            quantity: "99".to_string(),
+            ..original.clone()
+        };
+        let err = db
+            .save_paper_order(&colliding)
+            .expect_err("duplicate paper order id MUST be rejected");
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+
+        // Verify original historical order remains completely untouched.
+        let loaded = db.load_paper_orders("local-csv").expect("load orders");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].symbol, "AAPL");
+        assert_eq!(loaded[0].quantity, "10");
+
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn v021_error_locked_recovery_guards_empty_path_preserves_wal_on_rollback_and_marks_app_lock_cleared(
+    ) {
+        struct FailingKeyStore;
+        impl KeyStore for FailingKeyStore {
+            fn get_secret(
+                &self,
+                _s: &str,
+                _a: &str,
+            ) -> Result<Option<Zeroizing<String>>, VaultError> {
+                Ok(None)
+            }
+            fn set_secret(&self, _s: &str, _a: &str, _v: &str) -> Result<(), VaultError> {
+                Err(VaultError::KeyStoreUnavailable(
+                    "simulated keyring write failure".to_string(),
+                ))
+            }
+            fn delete_secret(&self, _s: &str, _a: &str) -> Result<(), VaultError> {
+                Ok(())
+            }
+        }
+
+        let src_path = unique_temp_db("v021-errlock-src");
+        let dst_path = unique_temp_db("v021-errlock-dst");
+        let src_keys = InMemoryKeyStore::new();
+        let backup = {
+            let db = EncryptedVaultDb::open(&src_path, &src_keys, "in-memory-test").expect("src");
+            db.export_backup_payload().expect("export")
+        };
+
+        // 1. Empty db_path is rejected Fail-Closed before any disk write.
+        let empty_err = EncryptedVaultDb::restore_from_error_locked(
+            Path::new(""),
+            backup.clone(),
+            &InMemoryKeyStore::new(),
+            "test",
+        )
+        .err()
+        .expect("empty db_path must fail");
+        assert!(matches!(empty_err, StorageError::InvalidInput(_)));
+
+        // 2. Existing DB + `-wal` + `-shm` sidecars are preserved intact when keyring write fails!
+        fs::create_dir_all(dst_path.parent().expect("dst parent")).expect("create dst dir");
+        fs::write(&dst_path, b"ORIGINAL-DB-BYTES").expect("write orig db");
+        let [wal_path, shm_path] = sqlite_sidecar_paths(&dst_path);
+        fs::write(&wal_path, b"ORIGINAL-WAL-FRAMES").expect("write orig wal");
+        fs::write(&shm_path, b"ORIGINAL-SHM-INDEX").expect("write orig shm");
+
+        let rollback_err = EncryptedVaultDb::restore_from_error_locked(
+            &dst_path,
+            backup.clone(),
+            &FailingKeyStore,
+            "failing-store",
+        );
+        assert!(rollback_err.is_err());
+        assert_eq!(
+            fs::read(&dst_path).expect("db restored"),
+            b"ORIGINAL-DB-BYTES"
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("wal restored"),
+            b"ORIGINAL-WAL-FRAMES"
+        );
+        assert_eq!(
+            fs::read(&shm_path).expect("shm restored"),
+            b"ORIGINAL-SHM-INDEX"
+        );
+        assert!(!restore_intent_path(&dst_path).exists());
+
+        // 3. Successful recovery cleans up old sidecars/intent and sets `app_lock_cleared = true`.
+        let good_keys = InMemoryKeyStore::new();
+        let (_recovered_db, _journal, summary) = EncryptedVaultDb::restore_from_error_locked(
+            &dst_path,
+            backup,
+            &good_keys,
+            "in-memory-test",
+        )
+        .expect("recovery succeeds");
+        assert!(summary.app_lock_cleared);
+        assert!(!restore_intent_path(&dst_path).exists());
+
+        cleanup_temp_db(&src_path);
+        cleanup_temp_db(&dst_path);
+    }
+
+    #[test]
+    fn v021_cash_flow_ledger_transactionally_syncs_nav_external_cash_flow() {
+        let db_path = unique_temp_db("v021-cf-nav-sync");
+        let keys = InMemoryKeyStore::new();
+        let mut db = EncryptedVaultDb::open(&db_path, &keys, "in-memory-test").expect("open");
+
+        // Seed NAV snapshot on 2026-11-22 with 0 external CF.
+        db.upsert_nav_snapshot(
+            &StoredNavSnapshot {
+                date: "2026-11-22".into(),
+                account_id: DEFAULT_ACCOUNT_ID.into(),
+                currency: "USD".into(),
+                net_value_micros: 15_000_000_000,
+                cash_micros: 5_000_000_000,
+                positions_micros: 10_000_000_000,
+                external_cash_flow_micros: 0,
+                eod_onboarding_micros: 0,
+                source: "csv-import".into(),
+                updated_at: "2026-11-22T10:00:00.000Z".into(),
+            },
+            true,
+        )
+        .expect("seed nav");
+
+        // Upsert +$5,000 deposit + -$1,200 withdrawal + $250 dividend on same date:
+        // Only deposit & withdrawal sync to nav_snapshots.external_cash_flow_micros (= +$3,800).
+        db.upsert_cash_flow(&StoredCashFlow {
+            id: "cf_dep_1".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
+            flow_type: "deposit".into(),
+            symbol: None,
+            currency: "USD".into(),
+            amount_micros: 5_000_000_000,
+            flow_date: "2026-11-22".into(),
+            note: "Wire in".into(),
+            created_at: "2026-11-22T11:00:00.000Z".into(),
+        })
+        .expect("deposit");
+        db.upsert_cash_flow(&StoredCashFlow {
+            id: "cf_wdr_1".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
+            flow_type: "withdrawal".into(),
+            symbol: None,
+            currency: "USD".into(),
+            amount_micros: 1_200_000_000,
+            flow_date: "2026-11-22".into(),
+            note: "Wire out".into(),
+            created_at: "2026-11-22T11:05:00.000Z".into(),
+        })
+        .expect("withdrawal");
+        db.upsert_cash_flow(&StoredCashFlow {
+            id: "cf_div_1".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
+            flow_type: "dividend".into(),
+            symbol: Some("AAPL".into()),
+            currency: "USD".into(),
+            amount_micros: 250_000_000,
+            flow_date: "2026-11-22".into(),
+            note: "Div".into(),
+            created_at: "2026-11-22T11:10:00.000Z".into(),
+        })
+        .expect("dividend");
+
+        let snaps = db
+            .load_nav_snapshots(Some(DEFAULT_ACCOUNT_ID), Some("USD"))
+            .expect("load nav");
+        assert_eq!(snaps[0].external_cash_flow_micros, 3_800_000_000);
+
+        // Deleting the withdrawal brings synced external CF back to +$5,000.
+        assert!(db.delete_cash_flow("cf_wdr_1").expect("delete wdr"));
+        let snaps_after_del = db
+            .load_nav_snapshots(Some(DEFAULT_ACCOUNT_ID), Some("USD"))
+            .expect("load nav after del");
+        assert_eq!(snaps_after_del[0].external_cash_flow_micros, 5_000_000_000);
+
+        // Pre-recorded deposit BEFORE NAV snapshot creation is picked up on upsert_nav_snapshot!
+        db.upsert_cash_flow(&StoredCashFlow {
+            id: "cf_dep_pre".into(),
+            account_id: DEFAULT_ACCOUNT_ID.into(),
+            flow_type: "deposit".into(),
+            symbol: None,
+            currency: "USD".into(),
+            amount_micros: 2_000_000_000,
+            flow_date: "2026-11-23".into(),
+            note: "Pre-logged deposit".into(),
+            created_at: "2026-11-23T08:00:00.000Z".into(),
+        })
+        .expect("pre deposit");
+        let day2 = db
+            .upsert_nav_snapshot(
+                &StoredNavSnapshot {
+                    date: "2026-11-23".into(),
+                    account_id: DEFAULT_ACCOUNT_ID.into(),
+                    currency: "USD".into(),
+                    net_value_micros: 17_500_000_000,
+                    cash_micros: 7_000_000_000,
+                    positions_micros: 10_500_000_000,
+                    external_cash_flow_micros: 0,
+                    eod_onboarding_micros: 0,
+                    source: "csv-import".into(),
+                    updated_at: "2026-11-23T16:00:00.000Z".into(),
+                },
+                true,
+            )
+            .expect("upsert day2 nav");
+        assert_eq!(day2.external_cash_flow_micros, 2_000_000_000);
+
+        cleanup_temp_db(&db_path);
     }
 }

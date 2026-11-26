@@ -6,7 +6,7 @@ FolioHelm 是一款本地优先、安全优先的 Windows 桌面端投资组合�
 
 > FolioHelm 提供 **Mock 演示模式** 与 **本地持仓模式（CSV + 纸上模拟）** 两种隔离的本地工作模式，持仓与交易演练数据均保存在本机。实盘券商 OAuth 登录与下单功能将在 [API Gate](docs/api-gate.md) 评审后按计划接入。
 
-## 已实现能力 (v0.2.0)
+## 已实现能力 (v0.2.1)
 
 - **本地加密持久化、`.fhvault` 离线备份与真实锁屏（Fail-Closed）**：
   - 使用内置 SQLite（`WAL` + `secure_delete = ON`）结合 **AES-256-GCM**（随机 96-bit Nonce + `schema_version|table|record_id` AAD）与 `Zeroizing` 内存擦除，加密存储多账户配置、CSV 持仓、每日 NAV 快照、基准缓存、分红与现金流台账、自选目标价预警、纸上订单、Ed25519 证据链、行情缓存、自动化策略、再平衡权重与安全设置。

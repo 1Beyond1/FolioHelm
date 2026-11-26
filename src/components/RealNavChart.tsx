@@ -273,7 +273,8 @@ export function RealNavChart({
   const activeNavNum = safeMicrosToNumber(activePoint.netValueMicros);
   const activeTwrNum = Number(activePoint.cumulativeTwrPct);
   const activeDailyPct = activePoint.dailyReturnPct !== null ? Number(activePoint.dailyReturnPct) : null;
-  const activeCfMicros = safeParseMicros(activePoint.externalCashFlowMicros);
+  const activeCfMicros = safeParseMicros(activePoint.externalCashFlowMicros)
+    + (activePoint.eodOnboardingMicros ? safeParseMicros(activePoint.eodOnboardingMicros) : 0n);
   const activeBenchPct = hasAlignedBenchmark ? (benchMap.get(activePoint.date) ?? null) : null;
   const activeX = PAD_L + (activeIdx / Math.max(lastIdx, 1)) * (PAD_R - PAD_L);
   const activeY = toSvgY(portfolioValues[activeIdx] ?? 0, minVal, maxVal);

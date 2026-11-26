@@ -112,7 +112,7 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
       "USD",
       DEFAULT_ACCOUNT_ID,
     );
-    expect(zeroStart.points[1]?.dailyReturnPct).toBeNull();
+    expect(zeroStart.points[1]?.dailyReturnPct).toBe("0.00");
     expect(zeroStart.points[2]?.dailyReturnPct).toBe("10.00");
     expect(zeroStart.cumulativeTwrPct).toBe("10.00");
 
@@ -179,11 +179,12 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     const aggUsd = aggregateNavSnapshotsByCurrency(snaps, "USD", ALL_ACCOUNTS_ID);
     expect(aggUsd).toHaveLength(2);
     expect(aggUsd[1]?.netValueMicros).toBe(decimalToMicros("31000").toString());
-    expect(aggUsd[1]?.externalCashFlowMicros).toBe(decimalToMicros("20000").toString());
+    expect(aggUsd[1]?.externalCashFlowMicros).toBe("0");
+    expect(aggUsd[1]?.eodOnboardingMicros).toBe(decimalToMicros("20000").toString());
 
     const twr = computeTwrSeries(aggUsd, "USD", ALL_ACCOUNTS_ID);
     expect(twr.periodPnlMicros).toBe(decimalToMicros("1000").toString());
-    expect(twr.cumulativeTwrPct).toBe("3.33");
+    expect(twr.cumulativeTwrPct).toBe("10.00");
 
     // Allowlist check
     expect(isAllowlistedBenchmark("SPY")).toBe(true);
@@ -215,7 +216,7 @@ describe("F1: Pure BigInt TWR, multi-account NAV aggregation & read-only benchma
     const day1 = heatmap.entries.find((e) => e.date === "2026-11-18");
     const emptyDay = heatmap.entries.find((e) => e.date === "2026-01-05");
     expect(day2?.status).toBe("available");
-    expect(day2?.dailyReturnPct).toBe("3.33");
+    expect(day2?.dailyReturnPct).toBe("10");
     expect(day1?.status).toBe("no-data"); // baseline day 0 has no fabricated prior-day return
     expect(emptyDay?.status).toBe("no-data");
   });

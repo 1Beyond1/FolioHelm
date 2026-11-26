@@ -31,6 +31,11 @@ jobs:
       - name: Frontend production build
         run: npm run build
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
       - name: Rust format
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
@@ -40,6 +45,6 @@ jobs:
       - name: Rust lint
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features -- -D warnings
 
-      - name: Build independent Windows Mock executable
+      - name: Build portable Windows desktop executable
         run: npm run desktop:build:portable
 

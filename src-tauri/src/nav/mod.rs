@@ -49,7 +49,9 @@ pub struct TwrPointDto {
     pub positions_micros: i128,
     #[serde(with = "i128_string_serde")]
     pub external_cash_flow_micros: i128,
-    /// Investment P&L for this sub-period excluding external cash flow (`V_end - CF - V_start`).
+    #[serde(default, with = "i128_string_serde")]
+    pub eod_onboarding_micros: i128,
+    /// Investment P&L for this sub-period excluding external cash flow (`V_end - eod_onboarding - CF - V_start`).
     pub daily_pnl_micros: Option<String>,
     /// Daily sub-period return percentage formatted to 2 decimals (e.g. `"1.25"`), `None` on day 0 or undefined start.
     pub daily_return_pct: Option<String>,
@@ -406,6 +408,7 @@ pub fn build_nav_snapshots_from_portfolio(
             cash_micros,
             positions_micros,
             external_cash_flow_micros: 0,
+            eod_onboarding_micros: 0,
             source: source.to_string(),
             updated_at: updated_at.to_string(),
         });
@@ -472,23 +475,27 @@ pub fn aggregate_nav_snapshots_for_currency(
         let mut net_sum: i128 = 0;
         let mut cash_sum: i128 = 0;
         let mut pos_sum: i128 = 0;
-        let mut cf_sum: i128 = 0;
+        let mut bod_cf_sum: i128 = 0;
+        let mut eod_onboarding_sum: i128 = 0;
         let mut latest_updated = String::new();
 
         for (acct_id, date_map) in &per_account {
             if let Some(today_snap) = date_map.get(&date) {
                 let is_first_for_account = !latest_by_account.contains_key(acct_id);
-                let effective_cf = if is_first_for_account && date > first_global_date {
-                    // Account newly added on a later date: its full opening NAV on entry day
-                    // represents external capital onboarding into the aggregate portfolio
-                    // (even if the account also recorded a partial same-day cash flow).
-                    today_snap.net_value_micros
+                if is_first_for_account && date > first_global_date {
+                    // Account newly onboarded on a later date: its full opening NAV enters at EOD
+                    // (it did NOT participate in today's sub-period return for existing accounts).
+                    eod_onboarding_sum = eod_onboarding_sum
+                        .checked_add(today_snap.net_value_micros)
+                        .ok_or(NavError::ArithmeticOverflow)?;
                 } else {
-                    today_snap.external_cash_flow_micros
-                };
-                cf_sum = cf_sum
-                    .checked_add(effective_cf)
-                    .ok_or(NavError::ArithmeticOverflow)?;
+                    bod_cf_sum = bod_cf_sum
+                        .checked_add(today_snap.external_cash_flow_micros)
+                        .ok_or(NavError::ArithmeticOverflow)?;
+                    eod_onboarding_sum = eod_onboarding_sum
+                        .checked_add(today_snap.eod_onboarding_micros)
+                        .ok_or(NavError::ArithmeticOverflow)?;
+                }
                 if today_snap.updated_at > latest_updated {
                     latest_updated = today_snap.updated_at.clone();
                 }
@@ -518,7 +525,8 @@ pub fn aggregate_nav_snapshots_for_currency(
             net_value_micros: net_sum,
             cash_micros: cash_sum,
             positions_micros: pos_sum,
-            external_cash_flow_micros: cf_sum,
+            external_cash_flow_micros: bod_cf_sum,
+            eod_onboarding_micros: eod_onboarding_sum,
             source: "aggregated".to_string(),
             updated_at: latest_updated,
         });
@@ -582,6 +590,7 @@ pub fn compute_twr_series(
         cash_micros: first.cash_micros,
         positions_micros: first.positions_micros,
         external_cash_flow_micros: first.external_cash_flow_micros,
+        eod_onboarding_micros: first.eod_onboarding_micros,
         daily_pnl_micros: None,
         daily_return_pct: None,
         cumulative_twr_pct: "0.00".to_string(),
@@ -593,9 +602,17 @@ pub fn compute_twr_series(
         let curr = window[1];
         let v_start = prev.net_value_micros;
         let v_end = curr.net_value_micros;
-        let cf = curr.external_cash_flow_micros;
+        let bod_cf = curr.external_cash_flow_micros;
+        let eod_onb = curr.eod_onboarding_micros;
 
-        let adjusted_end = v_end.checked_sub(cf).ok_or(NavError::ArithmeticOverflow)?;
+        // Strip EOD newly onboarded account NAV from ending value before computing sub-period
+        // return so onboarding a second account never dilutes existing accounts' day return.
+        let v_end_ex_onb = v_end
+            .checked_sub(eod_onb)
+            .ok_or(NavError::ArithmeticOverflow)?;
+        let adjusted_end = v_end_ex_onb
+            .checked_sub(bod_cf)
+            .ok_or(NavError::ArithmeticOverflow)?;
         let daily_pnl = adjusted_end
             .checked_sub(v_start)
             .ok_or(NavError::ArithmeticOverflow)?;
@@ -603,20 +620,24 @@ pub fn compute_twr_series(
             .checked_add(daily_pnl)
             .ok_or(NavError::ArithmeticOverflow)?;
 
-        let (sub_factor, daily_return_pct) = if v_start <= 0 {
-            (TWR_FACTOR_SCALE, None)
-        } else if cf > 0 {
-            // Beginning-of-day inflow convention: capital base is `V_start + CF`.
+        let (sub_factor, daily_return_pct) = if bod_cf > 0 {
+            // Beginning-of-day inflow convention: capital base is `V_start + bod_cf`.
+            // Handles both `v_start > 0` and zero-start initial deposits (`v_start <= 0 && bod_cf > 0`)
+            // cleanly whenever `capital_base > 0`.
             let capital_base = v_start
-                .checked_add(cf)
+                .checked_add(bod_cf)
                 .ok_or(NavError::ArithmeticOverflow)?;
-            if v_end <= 0 {
+            if capital_base <= 0 {
+                (TWR_FACTOR_SCALE, None)
+            } else if v_end_ex_onb <= 0 {
                 (0_i128, Some("-100.00".to_string()))
             } else {
-                let factor = mul_div_round_i128(v_end, TWR_FACTOR_SCALE, capital_base)?;
+                let factor = mul_div_round_i128(v_end_ex_onb, TWR_FACTOR_SCALE, capital_base)?;
                 let pct = format_return_pct_from_factor(factor)?;
                 (factor, Some(pct))
             }
+        } else if v_start <= 0 {
+            (TWR_FACTOR_SCALE, None)
         } else if adjusted_end <= 0 {
             (0_i128, Some("-100.00".to_string()))
         } else {
@@ -634,6 +655,7 @@ pub fn compute_twr_series(
             cash_micros: curr.cash_micros,
             positions_micros: curr.positions_micros,
             external_cash_flow_micros: curr.external_cash_flow_micros,
+            eod_onboarding_micros: curr.eod_onboarding_micros,
             daily_pnl_micros: Some(daily_pnl.to_string()),
             daily_return_pct,
             cumulative_twr_pct: cum_pct,
@@ -810,6 +832,7 @@ mod tests {
             cash_micros: 0,
             positions_micros: net,
             external_cash_flow_micros: cf,
+            eod_onboarding_micros: 0,
             source: "test".to_string(),
             updated_at: format!("{date}T21:00:00.000Z"),
         }
@@ -916,12 +939,38 @@ mod tests {
             "acct_default",
         )
         .expect("zero start safe");
-        assert_eq!(zero_start.points[1].daily_return_pct, None);
+        assert_eq!(
+            zero_start.points[1].daily_return_pct.as_deref(),
+            Some("0.00")
+        );
         assert_eq!(
             zero_start.points[2].daily_return_pct.as_deref(),
             Some("10.00")
         );
         assert_eq!(zero_start.cumulative_twr_pct.as_deref(), Some("10.00"));
+
+        // 1b. Zero V_start + BOD deposit ($5,000) with +10% same-day gain ($5,500) computes +10.00%!
+        let zero_start_gain = compute_twr_series(
+            &[
+                snap("2026-11-18", "acct_default", "USD", 0, 0),
+                snap(
+                    "2026-11-19",
+                    "acct_default",
+                    "USD",
+                    5_500 * MICROS_PER_UNIT,
+                    5_000 * MICROS_PER_UNIT,
+                ),
+            ],
+            "USD",
+            "acct_default",
+        )
+        .expect("zero start BOD gain");
+        assert_eq!(
+            zero_start_gain.points[1].daily_return_pct.as_deref(),
+            Some("10.00")
+        );
+        assert_eq!(zero_start_gain.cumulative_twr_pct.as_deref(), Some("10.00"));
+        assert_eq!(zero_start_gain.period_pnl_micros, 500 * MICROS_PER_UNIT);
 
         // 2. P0-6 regression: small base ($100) + large deposit (+$10,000) + -2% intraday drop ($9,898)
         //    must NEVER lock cum_factor at 0 (-100.00%); Day 3 +50% ($14,847) recovers cleanly to +47.00%!
@@ -1047,15 +1096,38 @@ mod tests {
         assert_eq!(usd_agg.len(), 2);
         assert_eq!(usd_agg[0].net_value_micros, 10_000 * MICROS_PER_UNIT);
         assert_eq!(usd_agg[1].net_value_micros, 31_000 * MICROS_PER_UNIT);
-        assert_eq!(
-            usd_agg[1].external_cash_flow_micros,
-            20_000 * MICROS_PER_UNIT
-        );
+        assert_eq!(usd_agg[1].external_cash_flow_micros, 0);
+        assert_eq!(usd_agg[1].eod_onboarding_micros, 20_000 * MICROS_PER_UNIT);
 
         let twr = compute_twr_series(&usd_agg, "USD", "ALL").expect("agg twr");
-        // True P&L = +$1,000 (not +$20,000); BOD inflow return = 31_000 / (10_000 + 20_000) - 1 = +3.33%
+        // True P&L = +$1,000; EOD onboarding is stripped from V_end so Account A's true +10.00%
+        // return (11,000 / 10,000) is NEVER diluted to +3.33%!
         assert_eq!(twr.period_pnl_micros, 1_000 * MICROS_PER_UNIT);
-        assert_eq!(twr.cumulative_twr_pct.as_deref(), Some("3.33"));
+        assert_eq!(twr.cumulative_twr_pct.as_deref(), Some("10.00"));
+
+        // Combined scenario: existing account has +$5,000 BOD deposit AND +10% gain ($16,500),
+        // while Account B onboards at EOD with $20,000 -> (36,500 - 20,000) / (10,000 + 5,000) = +10.00%.
+        let combined = vec![
+            snap("2026-11-18", "acct_a", "USD", 10_000 * MICROS_PER_UNIT, 0),
+            snap(
+                "2026-11-19",
+                "acct_a",
+                "USD",
+                16_500 * MICROS_PER_UNIT,
+                5_000 * MICROS_PER_UNIT,
+            ),
+            snap("2026-11-19", "acct_b", "USD", 20_000 * MICROS_PER_UNIT, 0),
+        ];
+        let comb_agg = aggregate_nav_snapshots_for_currency(&combined, "USD", Some("ALL"))
+            .expect("aggregate combined");
+        assert_eq!(
+            comb_agg[1].external_cash_flow_micros,
+            5_000 * MICROS_PER_UNIT
+        );
+        assert_eq!(comb_agg[1].eod_onboarding_micros, 20_000 * MICROS_PER_UNIT);
+        let comb_twr = compute_twr_series(&comb_agg, "USD", "ALL").expect("comb twr");
+        assert_eq!(comb_twr.period_pnl_micros, 1_500 * MICROS_PER_UNIT);
+        assert_eq!(comb_twr.cumulative_twr_pct.as_deref(), Some("10.00"));
     }
 
     #[test]

@@ -413,6 +413,10 @@ export function SettingsPage({
   const [lockPassError, setLockPassError] = useState<string | null>(null);
 
   const lastNonZeroIdleMinutesRef = useRef<number>(localIdleMinutes > 0 ? localIdleMinutes : 15);
+  const onIdleLockMinutesChangeRef = useRef(onIdleLockMinutesChange);
+  onIdleLockMinutesChangeRef.current = onIdleLockMinutesChange;
+  const onVaultStatusChangeRef = useRef(onVaultStatusChange);
+  onVaultStatusChangeRef.current = onVaultStatusChange;
   const importInputRef = useRef<HTMLInputElement>(null);
   const fhvaultInputRef = useRef<HTMLInputElement>(null);
   const riskScrollRef = useRef<HTMLDivElement>(null);
@@ -474,7 +478,7 @@ export function SettingsPage({
           if (prefs.idleLockMinutes > 0) {
             lastNonZeroIdleMinutesRef.current = prefs.idleLockMinutes;
           }
-          if (!onIdleLockMinutesChange) setLocalIdleMinutes(prefs.idleLockMinutes);
+          if (!onIdleLockMinutesChangeRef.current) setLocalIdleMinutes(prefs.idleLockMinutes);
           void loadVaultProtections(prefs.idleLockMinutes);
         })
         .catch(() => {
@@ -487,7 +491,7 @@ export function SettingsPage({
         .then((status) => {
           if (active && isCurrentLockEpoch(mountEpoch)) {
             setVaultStatus(status);
-            onVaultStatusChange?.(status);
+            onVaultStatusChangeRef.current?.(status);
           }
         })
         .catch(() => undefined);
@@ -498,7 +502,7 @@ export function SettingsPage({
       if (!active || !detail) return;
       if (detail.status) {
         setVaultStatus(detail.status);
-        onVaultStatusChange?.(detail.status);
+        onVaultStatusChangeRef.current?.(detail.status);
       }
       setPublicQuotesEnabled(MOCK_BROKER.isPublicQuotesEnabled());
       if (detail.preferences) {
@@ -518,7 +522,7 @@ export function SettingsPage({
       active = false;
       window.removeEventListener(VAULT_HYDRATED_EVENT, onVaultHydrated);
     };
-  }, [onIdleLockMinutesChange, onVaultStatusChange]);
+  }, []);
 
   useEffect(() => {
     onModalStateChange(settingsModalOpen);
@@ -833,10 +837,16 @@ export function SettingsPage({
         setVaultStatus(hydrated.status);
         onVaultStatusChange?.(hydrated.status);
       }
+      const lockClearedNotice = summary.appLockCleared
+        ? (chinese
+            ? " 注意：灾难恢复已重置本机应用锁密码，请立即在「应用锁与本地金库」中重新设置新密码。"
+            : " Note: Disaster recovery cleared the local App Lock passphrase; please set a new App Lock passphrase in Vault & App Lock settings.")
+        : "";
       setBackupStatusMessage(
-        chinese
+        (chinese
           ? `已验签并原子恢复金库（${summary.portfolioCount} 份持仓快照、${summary.paperOrderCount} 笔纸上订单、${summary.evidenceCount} 条签名证据）。`
-          : `Verified and restored vault atomically (${summary.portfolioCount} snapshots, ${summary.paperOrderCount} paper orders, ${summary.evidenceCount} signed evidence entries).`,
+          : `Verified and restored vault atomically (${summary.portfolioCount} snapshots, ${summary.paperOrderCount} paper orders, ${summary.evidenceCount} signed evidence entries).`)
+        + lockClearedNotice,
       );
       closeBackupModal();
     } catch (error) {
@@ -1442,7 +1452,7 @@ export function SettingsPage({
           <span className="settings-badge">Apache-2.0</span>
         </div>
         <dl className="settings-about-list">
-          <div><dt>{copy.version}</dt><dd>0.2.0</dd></div>
+          <div><dt>{copy.version}</dt><dd>0.2.1</dd></div>
           <div><dt>{copy.connection}</dt><dd>{language === "zh" ? "未连接券商" : "No brokerage connection"}</dd></div>
           <div><dt>{copy.apiGate}</dt><dd>{copy.apiGateValue}</dd></div>
         </dl>

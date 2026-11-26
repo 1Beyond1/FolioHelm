@@ -291,16 +291,93 @@ function inferCurrencyFromCashSymbol(symbolLower: string): string | undefined {
       return "GBP";
     case "sgd":
       return "SGD";
+    case "jpy":
+      return "JPY";
+    case "cad":
+      return "CAD";
+    case "aud":
+      return "AUD";
+    case "chf":
+      return "CHF";
+    case "dkk":
+      return "DKK";
+    case "sek":
+      return "SEK";
+    case "nok":
+      return "NOK";
+    case "twd":
+      return "TWD";
+    case "krw":
+      return "KRW";
+    case "inr":
+      return "INR";
+    case "nzd":
+      return "NZD";
+    case "brl":
+      return "BRL";
+    case "mxn":
+      return "MXN";
+    case "idr":
+      return "IDR";
+    case "thb":
+      return "THB";
+    case "myr":
+      return "MYR";
+    case "ils":
+      return "ILS";
+    case "zar":
+      return "ZAR";
     default:
       return undefined;
   }
 }
 
+const EXCHANGE_SUFFIX_CURRENCY_MAP: Readonly<Record<string, string>> = {
+  ".HK": "HKD",
+  ".SS": "CNY",
+  ".SZ": "CNY",
+  ".SI": "SGD",
+  ".T": "JPY",
+  ".L": "GBP",
+  ".TO": "CAD",
+  ".V": "CAD",
+  ".AX": "AUD",
+  ".DE": "EUR",
+  ".PA": "EUR",
+  ".AS": "EUR",
+  ".MI": "EUR",
+  ".MC": "EUR",
+  ".BR": "EUR",
+  ".HE": "EUR",
+  ".SW": "CHF",
+  ".CO": "DKK",
+  ".ST": "SEK",
+  ".OL": "NOK",
+  ".TW": "TWD",
+  ".TWO": "TWD",
+  ".KS": "KRW",
+  ".KQ": "KRW",
+  ".BO": "INR",
+  ".NS": "INR",
+  ".NZ": "NZD",
+  ".SA": "BRL",
+  ".MX": "MXN",
+  ".JK": "IDR",
+  ".BK": "THB",
+  ".KL": "MYR",
+  ".TA": "ILS",
+  ".JO": "ZAR",
+};
+
 function inferCurrencyFromSymbol(symbol: string): string | undefined {
-  if (symbol.endsWith(".HK")) return "HKD";
-  if (symbol.endsWith(".SS") || symbol.endsWith(".SZ")) return "CNY";
-  if (symbol.endsWith(".SI")) return "SGD";
-  return undefined;
+  const dotIdx = symbol.lastIndexOf(".");
+  if (dotIdx <= 0) return undefined;
+  const suffix = symbol.slice(dotIdx).toUpperCase();
+  return EXCHANGE_SUFFIX_CURRENCY_MAP[suffix];
+}
+
+function normalizeIbkrDiscriminator(raw: string): string {
+  return raw.replace(/[\s_-]+/g, "").toLowerCase();
 }
 
 function normalizeNumericUnicode(raw: string): string {
@@ -1026,6 +1103,10 @@ export async function parseCsvLocally(
     let tradeHeaders: string[] | null = null;
     let cashHeaders: string[] | null = null;
     const mappingMap = new Map<string, { canonicalField: string; sourceHeader: string }>();
+    const rawIbkrTrades: Array<{
+      kind: "order" | "trade" | "untagged";
+      tx: ImportedPortfolioTransaction;
+    }> = [];
 
     for (let idx = 0; idx < rows.length; idx += 1) {
       const row = rows[idx]!;
@@ -1119,6 +1200,17 @@ export async function parseCsvLocally(
         const rowCurrency = normalizeCurrency(findCell(posHeaders, rest, CURRENCY_ALIASES));
         accumulateHolding(holdingsMap, symbol, company, qty, avgCost, effectiveLast, rowCurrency);
       } else if (section === "trades" && tradeHeaders) {
+        const discRaw = findCell(tradeHeaders, rest, ["datadiscriminator", "header"]);
+        let discKind: "order" | "trade" | "untagged" = "untagged";
+        if (discRaw && discRaw.trim()) {
+          const normDisc = normalizeIbkrDiscriminator(discRaw);
+          if (normDisc === "subtotal" || normDisc === "total" || normDisc === "closedlot" || normDisc === "washsale") {
+            skippedRows += 1;
+            continue;
+          }
+          if (normDisc === "order") discKind = "order";
+          else if (normDisc === "trade") discKind = "trade";
+        }
         const rawSymbol = findCell(tradeHeaders, rest, SYMBOL_ALIASES) ?? "";
         if (isSummaryOrBlankSymbol(rawSymbol)) {
           skippedRows += 1;
@@ -1141,15 +1233,18 @@ export async function parseCsvLocally(
         const dateSanitized = sanitizeCsvTextCell(findCell(tradeHeaders, rest, ["date/time", "date", "trade date"]) ?? "", "Date/Time", warnings);
         const date = normalizeTransactionDate(dateSanitized, rowNum, warnings);
         const txCurrency = normalizeCurrency(findCell(tradeHeaders, rest, CURRENCY_ALIASES));
-        transactions.push({
-          date,
-          action: decimalCompare(qty, ZERO) >= 0 ? "BUY" : "SELL",
-          symbol,
-          quantity: decimal(qty.startsWith("-") ? qty.slice(1) : qty),
-          price: decimalToFixed(px.startsWith("-") ? decimal(px.slice(1)) : px, 4, "half-up"),
-          amount: decimalToFixed(proceeds, 2, "half-up"),
-          fees: decimalToFixed(comm.startsWith("-") ? decimal(comm.slice(1)) : comm, 2, "half-up"),
-          currency: txCurrency,
+        rawIbkrTrades.push({
+          kind: discKind,
+          tx: {
+            date,
+            action: decimalCompare(qty, ZERO) >= 0 ? "BUY" : "SELL",
+            symbol,
+            quantity: decimal(qty.startsWith("-") ? qty.slice(1) : qty),
+            price: decimalToFixed(px.startsWith("-") ? decimal(px.slice(1)) : px, 4, "half-up"),
+            amount: decimalToFixed(proceeds, 2, "half-up"),
+            fees: decimalToFixed(comm.startsWith("-") ? decimal(comm.slice(1)) : comm, 2, "half-up"),
+            currency: txCurrency,
+          },
         });
       } else if (section === "cash report" && cashHeaders) {
         const summary = (findCell(cashHeaders, rest, ["currency summary", "field"]) ?? "").toLowerCase();
@@ -1169,6 +1264,22 @@ export async function parseCsvLocally(
         skippedRows += 1;
       }
     }
+    const ibkrOrderKeys = new Set<string>();
+    for (const item of rawIbkrTrades) {
+      if (item.kind === "order") {
+        ibkrOrderKeys.add(`${item.tx.symbol}|${item.tx.date}|${item.tx.currency}|${item.tx.action}`);
+      }
+    }
+    for (const item of rawIbkrTrades) {
+      if (
+        item.kind === "trade"
+        && ibkrOrderKeys.has(`${item.tx.symbol}|${item.tx.date}|${item.tx.currency}|${item.tx.action}`)
+      ) {
+        skippedRows += 1;
+        continue;
+      }
+      transactions.push(item.tx);
+    }
     columnMappings = [...mappingMap.values()];
   } else {
     const located = locateHeaderRow(rows);
@@ -1182,6 +1293,8 @@ export async function parseCsvLocally(
     let inSecondaryTxSection = false;
     const mappingMap = new Map<string, { canonicalField: string; sourceHeader: string }>();
     collectMappings(activeHeaders).forEach((m) => mappingMap.set(m.canonicalField, m));
+    const pendingUntaggedCashRows: DecimalString[] = [];
+    const pendingUntaggedCashCols: DecimalString[] = [];
     skippedRows = located.index;
 
     for (let idx = located.index + 1; idx < rows.length; idx += 1) {
@@ -1234,31 +1347,46 @@ export async function parseCsvLocally(
           const parsedCash = parseCsvDecimal(valRaw, rowNum, "Cash");
           const cashCurr = explicitCurrency
             ?? inferCurrencyFromCashSymbol(symbolLower)
-            ?? inferCurrencyFromAmount(valRaw)
-            ?? "USD";
-          addCashByCurrency(cashByCurrencyMap, cashCurr, parsedCash);
+            ?? inferCurrencyFromAmount(valRaw);
+          if (cashCurr) {
+            addCashByCurrency(cashByCurrencyMap, cashCurr, parsedCash);
+          } else {
+            pendingUntaggedCashRows.push(parsedCash);
+          }
         }
         continue;
       }
 
+      let rowCashCol: { parsed: DecimalString; taggedCurr?: string } | null = null;
       if (!inSecondaryTxSection) {
         const cashCol = findCell(headers, row, CASH_COL_ALIASES);
         if (cashCol && cashCol.trim() && !isNaPlaceholder(cashCol)) {
           const parsedCash = parseCsvDecimal(cashCol, rowNum, "cash");
-          const cashCurr = explicitCurrency ?? inferCurrencyFromAmount(cashCol) ?? "USD";
-          const existingCash = cashByCurrencyMap.get(cashCurr) ?? ZERO;
-          if (decimalCompare(parsedCash, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
-            cashByCurrencyMap.set(cashCurr, parsedCash);
-          }
+          const taggedCurr = explicitCurrency ?? inferCurrencyFromAmount(cashCol);
+          rowCashCol = { parsed: parsedCash, taggedCurr };
         }
       }
 
+      const applySkippedRowCashCol = () => {
+        if (!rowCashCol) return;
+        if (rowCashCol.taggedCurr) {
+          const existingCash = cashByCurrencyMap.get(rowCashCol.taggedCurr) ?? ZERO;
+          if (decimalCompare(rowCashCol.parsed, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
+            cashByCurrencyMap.set(rowCashCol.taggedCurr, rowCashCol.parsed);
+          }
+        } else if (decimalCompare(rowCashCol.parsed, ZERO) > 0) {
+          pendingUntaggedCashCols.push(rowCashCol.parsed);
+        }
+      };
+
       if (isSummaryOrBlankSymbol(rawSymbol)) {
+        applySkippedRowCashCol();
         skippedRows += 1;
         continue;
       }
 
       if (isOptionRow(headers, row, rawSymbol)) {
+        applySkippedRowCashCol();
         warnings.push(`Skipped unsupported option/derivative row ${rowNum} (${rawSymbol.trim().slice(0, 32)})`);
         skippedRows += 1;
         continue;
@@ -1301,6 +1429,13 @@ export async function parseCsvLocally(
           ?? inferCurrencyFromAmount(amtRaw)
           ?? inferCurrencyFromSymbol(symbol)
           ?? "USD";
+        if (rowCashCol) {
+          const cashCurr = rowCashCol.taggedCurr ?? txCurr;
+          const existingCash = cashByCurrencyMap.get(cashCurr) ?? ZERO;
+          if (decimalCompare(rowCashCol.parsed, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
+            cashByCurrencyMap.set(cashCurr, rowCashCol.parsed);
+          }
+        }
         transactions.push({
           date,
           action,
@@ -1317,6 +1452,7 @@ export async function parseCsvLocally(
       const symbol = validateCsvSymbol(rawSymbol, rowNum);
       const qtyRaw = findCell(headers, row, QUANTITY_ALIASES) ?? "";
       if (isNaPlaceholder(qtyRaw)) {
+        applySkippedRowCashCol();
         skippedRows += 1;
         continue;
       }
@@ -1325,6 +1461,7 @@ export async function parseCsvLocally(
         throw new Error(`Negative holding quantity is not allowed in row ${rowNum} for ${symbol}`);
       }
       if (decimalCompare(qty, ZERO) === 0) {
+        applySkippedRowCashCol();
         skippedRows += 1;
         continue;
       }
@@ -1369,8 +1506,35 @@ export async function parseCsvLocally(
         ?? inferCurrencyFromAmount(avgCostRaw)
         ?? inferCurrencyFromSymbol(symbol)
         ?? "USD";
+      if (rowCashCol) {
+        const cashCurr = rowCashCol.taggedCurr ?? rowCurrency;
+        const existingCash = cashByCurrencyMap.get(cashCurr) ?? ZERO;
+        if (decimalCompare(rowCashCol.parsed, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
+          cashByCurrencyMap.set(cashCurr, rowCashCol.parsed);
+        }
+      }
       const company = sanitizeCsvTextCell(companyRaw, "Description", warnings);
       accumulateHolding(holdingsMap, symbol, company, qty, avgCost, effectiveLast, rowCurrency);
+    }
+    if (holdingsMap.size === 0 && transactions.length > 0) {
+      replayTransactions(transactions, holdingsMap, warnings);
+    }
+    if (pendingUntaggedCashRows.length > 0 || pendingUntaggedCashCols.length > 0) {
+      const inferredCurrencies = new Set<string>();
+      for (const h of holdingsMap.values()) inferredCurrencies.add(h.currency);
+      if (inferredCurrencies.size === 0) {
+        for (const tx of transactions) inferredCurrencies.add(tx.currency);
+      }
+      const fallbackCurrency = inferredCurrencies.size === 1 ? [...inferredCurrencies][0]! : "USD";
+      for (const amt of pendingUntaggedCashRows) {
+        addCashByCurrency(cashByCurrencyMap, fallbackCurrency, amt);
+      }
+      for (const amt of pendingUntaggedCashCols) {
+        const existingCash = cashByCurrencyMap.get(fallbackCurrency) ?? ZERO;
+        if (decimalCompare(amt, ZERO) > 0 && decimalCompare(existingCash, ZERO) === 0) {
+          cashByCurrencyMap.set(fallbackCurrency, amt);
+        }
+      }
     }
     columnMappings = [...mappingMap.values()];
   }

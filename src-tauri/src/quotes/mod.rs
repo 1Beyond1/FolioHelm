@@ -63,33 +63,37 @@ fn split_exchange_suffix(symbol: &str) -> Option<(&str, &str)> {
     }
 }
 
-pub fn infer_currency_from_symbol(symbol: &str) -> &'static str {
+pub fn infer_exchange_currency_from_symbol(symbol: &str) -> Option<&'static str> {
     match split_exchange_suffix(symbol).map(|(_, suffix)| suffix) {
-        Some(".HK") => "HKD",
-        Some(".SS" | ".SZ") => "CNY",
-        Some(".SI") => "SGD",
-        Some(".T") => "JPY",
-        Some(".L") => "GBP",
-        Some(".TO" | ".V") => "CAD",
-        Some(".AX") => "AUD",
-        Some(".DE" | ".PA" | ".AS" | ".MI" | ".MC" | ".BR" | ".HE") => "EUR",
-        Some(".SW") => "CHF",
-        Some(".CO") => "DKK",
-        Some(".ST") => "SEK",
-        Some(".OL") => "NOK",
-        Some(".TW" | ".TWO") => "TWD",
-        Some(".KS" | ".KQ") => "KRW",
-        Some(".BO" | ".NS") => "INR",
-        Some(".NZ") => "NZD",
-        Some(".SA") => "BRL",
-        Some(".MX") => "MXN",
-        Some(".JK") => "IDR",
-        Some(".BK") => "THB",
-        Some(".KL") => "MYR",
-        Some(".TA") => "ILS",
-        Some(".JO") => "ZAR",
-        _ => "USD",
+        Some(".HK") => Some("HKD"),
+        Some(".SS" | ".SZ") => Some("CNY"),
+        Some(".SI") => Some("SGD"),
+        Some(".T") => Some("JPY"),
+        Some(".L") => Some("GBP"),
+        Some(".TO" | ".V") => Some("CAD"),
+        Some(".AX") => Some("AUD"),
+        Some(".DE" | ".PA" | ".AS" | ".MI" | ".MC" | ".BR" | ".HE") => Some("EUR"),
+        Some(".SW") => Some("CHF"),
+        Some(".CO") => Some("DKK"),
+        Some(".ST") => Some("SEK"),
+        Some(".OL") => Some("NOK"),
+        Some(".TW" | ".TWO") => Some("TWD"),
+        Some(".KS" | ".KQ") => Some("KRW"),
+        Some(".BO" | ".NS") => Some("INR"),
+        Some(".NZ") => Some("NZD"),
+        Some(".SA") => Some("BRL"),
+        Some(".MX") => Some("MXN"),
+        Some(".JK") => Some("IDR"),
+        Some(".BK") => Some("THB"),
+        Some(".KL") => Some("MYR"),
+        Some(".TA") => Some("ILS"),
+        Some(".JO") => Some("ZAR"),
+        _ => None,
     }
+}
+
+pub fn infer_currency_from_symbol(symbol: &str) -> &'static str {
+    infer_exchange_currency_from_symbol(symbol).unwrap_or("USD")
 }
 
 /// Maps a normalized FolioHelm ticker to a Yahoo Finance chart symbol.
@@ -323,7 +327,10 @@ fn build_read_only_client() -> Result<Client, QuoteError> {
         .timeout(Duration::from_secs(QUOTE_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(4))
         .redirect(Policy::none())
-        .user_agent("FolioHelm-ReadOnlyQuotes/0.1")
+        .user_agent(concat!(
+            "FolioHelm-ReadOnlyQuotes/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .map_err(|error| QuoteError::ClientInit(error.to_string()))
 }
@@ -649,7 +656,7 @@ async fn fetch_yahoo_symbol(
 ) -> Result<CachedPublicQuote, QuoteError> {
     let yahoo_ticker = map_yahoo_symbol(symbol);
     let url_str = format!(
-        "https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval=1d&range=2d"
+        "https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}?interval=1d&range=1d"
     );
     let url = validate_allowlisted_https_url(&url_str)?;
 
@@ -683,6 +690,8 @@ struct YahooChartBody {
 #[derive(Deserialize)]
 struct YahooChartResult {
     meta: YahooChartMeta,
+    #[serde(default)]
+    indicators: Option<YahooHistoryIndicators>,
 }
 
 #[derive(Deserialize)]
@@ -693,6 +702,41 @@ struct YahooChartMeta {
     previous_close: Option<Box<RawValue>>,
     currency: Option<String>,
     regular_market_time: Option<i64>,
+}
+
+/// Normalize Yahoo Finance raw currency strings BEFORE uppercasing so case-sensitive
+/// sub-unit codes (`GBp` / `GBX` pence, `ZAc` South African cents, `ILA` Israeli agorot)
+/// are mapped to their major ISO currency with an exact fixed-point divisor of 100.
+fn normalize_yahoo_currency_and_divisor(
+    raw_currency: Option<&str>,
+    requested_symbol: &str,
+) -> (String, i128) {
+    match raw_currency.map(str::trim).filter(|c| !c.is_empty()) {
+        Some("GBp" | "GBX" | "GBx") => ("GBP".to_string(), 100),
+        Some("ZAc" | "ZAC") => ("ZAR".to_string(), 100),
+        Some("ILA" | "ILa") => ("ILS".to_string(), 100),
+        Some(other) => (other.to_ascii_uppercase(), 1),
+        None => (infer_currency_from_symbol(requested_symbol).to_string(), 1),
+    }
+}
+
+/// Exact `i128` fixed-point division by a positive sub-unit divisor (e.g. 100) with
+/// half-away-from-zero rounding.
+fn scale_down_fixed(value: i128, divisor: i128) -> Result<i128, QuoteError> {
+    if divisor == 1 {
+        return Ok(value);
+    }
+    let half = divisor / 2;
+    let scaled = value
+        .checked_add(half)
+        .ok_or_else(|| QuoteError::Parse("yahoo quote sub-unit scaling overflow".to_string()))?
+        / divisor;
+    if scaled <= 0 {
+        return Err(QuoteError::Parse(
+            "yahoo quote sub-unit scaled value must be positive".to_string(),
+        ));
+    }
+    Ok(scaled)
 }
 
 fn parse_raw_json_positive_fixed(raw: Option<&RawValue>) -> Result<i128, QuoteError> {
@@ -725,21 +769,48 @@ pub fn parse_yahoo_chart_response(
     }
     let parsed: YahooChartRoot =
         serde_json::from_str(body).map_err(|error| QuoteError::Parse(error.to_string()))?;
-    let meta = parsed
+    let item = parsed
         .chart
         .result
         .and_then(|mut list| list.drain(..).next())
-        .map(|item| item.meta)
         .ok_or_else(|| {
             QuoteError::Parse(format!("missing yahoo chart meta for {requested_symbol}"))
         })?;
+    let meta = item.meta;
 
-    let price_fixed = parse_raw_json_positive_fixed(meta.regular_market_price.as_deref())
+    let (currency, subunit_divisor) =
+        normalize_yahoo_currency_and_divisor(meta.currency.as_deref(), requested_symbol);
+
+    let raw_price_fixed = parse_raw_json_positive_fixed(meta.regular_market_price.as_deref())
         .map_err(|_| QuoteError::Parse("invalid yahoo regularMarketPrice".to_string()))?;
 
-    let prev_close_fixed = parse_raw_json_positive_fixed(meta.chart_previous_close.as_deref())
-        .or_else(|_| parse_raw_json_positive_fixed(meta.previous_close.as_deref()))
-        .unwrap_or(price_fixed);
+    // Extract penultimate daily bar close if multiple daily bars are present (1-day fallback
+    // whenever `meta.previousClose` is omitted and `chartPreviousClose` spans > 1 day).
+    let penultimate_close_fixed = item
+        .indicators
+        .and_then(|ind| ind.quote)
+        .and_then(|mut q| q.drain(..).next())
+        .and_then(|q| q.close)
+        .and_then(|closes| {
+            let valid: Vec<i128> = closes
+                .iter()
+                .filter_map(|c| parse_raw_json_positive_fixed(c.as_deref()).ok())
+                .collect();
+            if valid.len() >= 2 {
+                Some(valid[valid.len() - 2])
+            } else {
+                None
+            }
+        });
+
+    let raw_prev_close_fixed = parse_raw_json_positive_fixed(meta.previous_close.as_deref())
+        .ok()
+        .or(penultimate_close_fixed)
+        .or_else(|| parse_raw_json_positive_fixed(meta.chart_previous_close.as_deref()).ok())
+        .unwrap_or(raw_price_fixed);
+
+    let price_fixed = scale_down_fixed(raw_price_fixed, subunit_divisor)?;
+    let prev_close_fixed = scale_down_fixed(raw_prev_close_fixed, subunit_divisor)?;
 
     let change_fixed = price_fixed
         .checked_sub(prev_close_fixed)
@@ -757,11 +828,7 @@ pub fn parse_yahoo_chart_response(
         price: format_fixed(price_fixed, 4),
         change: format_fixed(change_fixed, 4),
         change_pct: format_fixed(change_pct_fixed, 2),
-        currency: meta
-            .currency
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| c.trim().to_ascii_uppercase())
-            .unwrap_or_else(|| infer_currency_from_symbol(requested_symbol).to_string()),
+        currency,
         provider: PublicQuoteProvider::Yahoo.code().to_string(),
         as_of_utc,
         delayed: true,
@@ -1089,6 +1156,8 @@ struct YahooHistoryBody {
 
 #[derive(Deserialize)]
 struct YahooHistoryResult {
+    #[serde(default)]
+    meta: Option<YahooChartMeta>,
     timestamp: Option<Vec<i64>>,
     indicators: Option<YahooHistoryIndicators>,
 }
@@ -1122,6 +1191,10 @@ pub fn parse_yahoo_history_json(
         .and_then(|mut list| list.drain(..).next())
         .ok_or_else(|| QuoteError::Parse(format!("missing yahoo history result for {symbol}")))?;
 
+    let (_, subunit_divisor) = normalize_yahoo_currency_and_divisor(
+        item.meta.as_ref().and_then(|m| m.currency.as_deref()),
+        symbol,
+    );
     let timestamps = item.timestamp.unwrap_or_default();
     let closes = item
         .indicators
@@ -1135,7 +1208,10 @@ pub fn parse_yahoo_history_json(
         let Some(dt) = chrono::DateTime::from_timestamp(*ts, 0) else {
             continue;
         };
-        let Ok(fixed) = parse_raw_json_positive_fixed(close_opt.as_deref()) else {
+        let Ok(raw_fixed) = parse_raw_json_positive_fixed(close_opt.as_deref()) else {
+            continue;
+        };
+        let Ok(fixed) = scale_down_fixed(raw_fixed, subunit_divisor) else {
             continue;
         };
         let Ok(micros) = fixed_1e8_to_micros(fixed) else {
@@ -1482,5 +1558,64 @@ mod tests {
         assert!(cleaned_series.points.iter().all(|pt| pt.date.len() == 10));
         assert_eq!(cleaned_series.points[0].close_micros, 580_125_000);
         assert_eq!(cleaned_series.points[1].close_micros, 590_500_000);
+    }
+
+    #[test]
+    fn v021_yahoo_uses_1d_previous_close_and_scales_subunit_currencies_by_100() {
+        // 1. Prefer `meta.previousClose` (1-day) over 2-day `meta.chartPreviousClose`.
+        let yahoo_1d = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":105.0,"previousClose":100.0,"chartPreviousClose":90.0,"currency":"USD","regularMarketTime":1763760000}}]}}"#;
+        let q_1d = parse_yahoo_chart_response("AAPL", yahoo_1d, "2026-11-22T00:00:00.000Z")
+            .expect("parse 1d");
+        assert_eq!(q_1d.price, "105.0000");
+        assert_eq!(q_1d.change, "5.0000");
+        assert_eq!(q_1d.change_pct, "5.00");
+
+        // 2. When `previousClose` is omitted on a multi-bar response, fall back to penultimate close.
+        let yahoo_penult = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":105.0,"chartPreviousClose":90.0,"currency":"USD","regularMarketTime":1763760000},"indicators":{"quote":[{"close":[100.0,105.0]}]}}]}}"#;
+        let q_penult = parse_yahoo_chart_response("AAPL", yahoo_penult, "2026-11-22T00:00:00.000Z")
+            .expect("parse penultimate");
+        assert_eq!(q_penult.change, "5.0000");
+        assert_eq!(q_penult.change_pct, "5.00");
+
+        // 3. `GBp` / `GBX` -> `GBP` (÷100), `ZAc` -> `ZAR` (÷100), `ILA` -> `ILS` (÷100),
+        //    while major `GBP` stays unscaled.
+        let yahoo_gbp_pence = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":2450.5,"previousClose":2400.0,"currency":"GBp","regularMarketTime":1763760000}}]}}"#;
+        let q_gbp =
+            parse_yahoo_chart_response("HSBA.L", yahoo_gbp_pence, "2026-11-22T00:00:00.000Z")
+                .expect("parse GBp");
+        assert_eq!(q_gbp.currency, "GBP");
+        assert_eq!(q_gbp.price, "24.5050");
+        assert_eq!(q_gbp.change, "0.5050");
+        assert_eq!(q_gbp.change_pct, "2.10");
+
+        let yahoo_gbx = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":1200.0,"previousClose":1000.0,"currency":"GBX","regularMarketTime":1763760000}}]}}"#;
+        let q_gbx = parse_yahoo_chart_response("AZN.L", yahoo_gbx, "2026-11-22T00:00:00.000Z")
+            .expect("parse GBX");
+        assert_eq!(q_gbx.currency, "GBP");
+        assert_eq!(q_gbx.price, "12.0000");
+        assert_eq!(q_gbx.change, "2.0000");
+        assert_eq!(q_gbx.change_pct, "20.00");
+
+        let yahoo_zac = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":15000.0,"previousClose":14850.0,"currency":"ZAc","regularMarketTime":1763760000}}]}}"#;
+        let q_zac = parse_yahoo_chart_response("NPN.JO", yahoo_zac, "2026-11-22T00:00:00.000Z")
+            .expect("parse ZAc");
+        assert_eq!(q_zac.currency, "ZAR");
+        assert_eq!(q_zac.price, "150.0000");
+        assert_eq!(q_zac.change, "1.5000");
+
+        let yahoo_ila = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":8420.0,"previousClose":8400.0,"currency":"ILA","regularMarketTime":1763760000}}]}}"#;
+        let q_ila = parse_yahoo_chart_response("TEVA.TA", yahoo_ila, "2026-11-22T00:00:00.000Z")
+            .expect("parse ILA");
+        assert_eq!(q_ila.currency, "ILS");
+        assert_eq!(q_ila.price, "84.2000");
+        assert_eq!(q_ila.change, "0.2000");
+
+        let yahoo_gbp_major = r#"{"chart":{"result":[{"meta":{"regularMarketPrice":24.5,"previousClose":24.0,"currency":"GBP","regularMarketTime":1763760000}}]}}"#;
+        let q_major =
+            parse_yahoo_chart_response("HSBA.L", yahoo_gbp_major, "2026-11-22T00:00:00.000Z")
+                .expect("parse major GBP");
+        assert_eq!(q_major.currency, "GBP");
+        assert_eq!(q_major.price, "24.5000");
+        assert_eq!(q_major.change, "0.5000");
     }
 }

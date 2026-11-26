@@ -61,6 +61,7 @@ export interface TauriVaultRestoreSummary {
   cashFlowCount?: number;
   watchlistCount?: number;
   signerPublicKey: string;
+  appLockCleared?: boolean;
 }
 
 export interface TauriStoredCashFlow {
@@ -103,6 +104,7 @@ export interface TauriStoredNavSnapshot {
   cashMicros: string;
   positionsMicros: string;
   externalCashFlowMicros: string;
+  eodOnboardingMicros?: string;
   source: string;
   updatedAt: string;
 }
@@ -133,6 +135,7 @@ export interface TauriTwrPoint {
   cashMicros: string;
   positionsMicros: string;
   externalCashFlowMicros: string;
+  eodOnboardingMicros?: string;
   dailyPnlMicros: string | null;
   dailyReturnPct: string | null;
   cumulativeTwrPct: string;

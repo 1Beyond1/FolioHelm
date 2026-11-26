@@ -56,6 +56,7 @@ export interface NavSnapshotRecord {
   cashMicros: string;
   positionsMicros: string;
   externalCashFlowMicros: string;
+  eodOnboardingMicros?: string;
   source: string;
   updatedAt: string;
 }
@@ -79,6 +80,7 @@ export interface TwrPoint {
   cashMicros: string;
   positionsMicros: string;
   externalCashFlowMicros: string;
+  eodOnboardingMicros?: string;
   dailyPnlMicros: string | null;
   dailyReturnPct: string | null;
   cumulativeTwrPct: string;
@@ -281,7 +283,8 @@ export function aggregateNavSnapshotsByCurrency(
     let netSum = 0n;
     let cashSum = 0n;
     let posSum = 0n;
-    let cfSum = 0n;
+    let bodCfSum = 0n;
+    let eodOnboardingSum = 0n;
     let latestUpdated = "";
 
     for (const [acctId, dateMap] of perAccount.entries()) {
@@ -290,14 +293,16 @@ export function aggregateNavSnapshotsByCurrency(
         const isFirstForAcct = !latestByAccount.has(acctId);
         const todayNet = parseMicrosString(today.netValueMicros);
         const todayCf = parseMicrosString(today.externalCashFlowMicros);
-        // P1-1: On an account's first date after `firstGlobalDate`, its ENTIRE opening NAV
-        // is external capital onboarding into the aggregate portfolio (even if the account
-        // also had a partial same-day cash flow), preventing pre-existing holdings from
-        // masquerading as fake investment gain.
-        const effectiveCf = isFirstForAcct && date > firstGlobalDate
-          ? todayNet
-          : todayCf;
-        cfSum = assertI128Range(cfSum + effectiveCf);
+        const todayEodOnb = today.eodOnboardingMicros ? parseMicrosString(today.eodOnboardingMicros) : 0n;
+        // On an account's first date after `firstGlobalDate`, its ENTIRE opening NAV
+        // enters at end-of-day (`eodOnboardingMicros`) so it neither masquerades as fake
+        // gain nor dilutes existing accounts' day return as a BOD inflow.
+        if (isFirstForAcct && date > firstGlobalDate) {
+          eodOnboardingSum = assertI128Range(eodOnboardingSum + todayNet);
+        } else {
+          bodCfSum = assertI128Range(bodCfSum + todayCf);
+          eodOnboardingSum = assertI128Range(eodOnboardingSum + todayEodOnb);
+        }
         if (today.updatedAt > latestUpdated) latestUpdated = today.updatedAt;
         latestByAccount.set(acctId, today);
       }
@@ -318,7 +323,8 @@ export function aggregateNavSnapshotsByCurrency(
       netValueMicros: netSum.toString(),
       cashMicros: cashSum.toString(),
       positionsMicros: posSum.toString(),
-      externalCashFlowMicros: cfSum.toString(),
+      externalCashFlowMicros: bodCfSum.toString(),
+      eodOnboardingMicros: eodOnboardingSum.toString(),
       source: "aggregated",
       updatedAt: latestUpdated,
     });
@@ -373,6 +379,8 @@ export function computeTwrSeries(
   parseMicrosString(first.positionsMicros);
   parseMicrosString(first.externalCashFlowMicros);
 
+  const firstEodOnb = first.eodOnboardingMicros ? parseMicrosString(first.eodOnboardingMicros) : 0n;
+
   const points: TwrPoint[] = [
     {
       date: first.date,
@@ -380,6 +388,7 @@ export function computeTwrSeries(
       cashMicros: first.cashMicros,
       positionsMicros: first.positionsMicros,
       externalCashFlowMicros: first.externalCashFlowMicros,
+      eodOnboardingMicros: firstEodOnb.toString(),
       dailyPnlMicros: null,
       dailyReturnPct: null,
       cumulativeTwrPct: "0.00",
@@ -392,27 +401,36 @@ export function computeTwrSeries(
     const curr = sorted[i]!;
     const vStart = parseMicrosString(prev.netValueMicros);
     const vEnd = parseMicrosString(curr.netValueMicros);
-    const cf = parseMicrosString(curr.externalCashFlowMicros);
+    const bodCf = parseMicrosString(curr.externalCashFlowMicros);
+    const eodOnb = curr.eodOnboardingMicros ? parseMicrosString(curr.eodOnboardingMicros) : 0n;
 
-    const adjustedEnd = assertI128Range(vEnd - cf);
+    // Strip EOD newly onboarded account NAV from ending value before computing sub-period
+    // return so onboarding a second account never dilutes existing accounts' day return.
+    const vEndExOnb = assertI128Range(vEnd - eodOnb);
+    const adjustedEnd = assertI128Range(vEndExOnb - bodCf);
     const dailyPnl = assertI128Range(adjustedEnd - vStart);
     periodPnl = assertI128Range(periodPnl + dailyPnl);
 
     let subFactor: bigint;
     let dailyReturnPct: string | null;
-    if (vStart <= 0n) {
-      subFactor = TWR_FACTOR_SCALE;
-      dailyReturnPct = null;
-    } else if (cf > 0n) {
-      // Beginning-of-day inflow convention: capital base is `V_start + CF`.
-      const capitalBase = assertI128Range(vStart + cf);
-      if (vEnd <= 0n) {
+    if (bodCf > 0n) {
+      // Beginning-of-day inflow convention: capital base is `V_start + bod_cf`.
+      // Also handles zero-start initial deposits (`vStart <= 0 && bodCf > 0`) whenever
+      // `capitalBase > 0`.
+      const capitalBase = assertI128Range(vStart + bodCf);
+      if (capitalBase <= 0n) {
+        subFactor = TWR_FACTOR_SCALE;
+        dailyReturnPct = null;
+      } else if (vEndExOnb <= 0n) {
         subFactor = 0n;
         dailyReturnPct = "-100.00";
       } else {
-        subFactor = mulDivRoundBigInt(vEnd, TWR_FACTOR_SCALE, capitalBase);
+        subFactor = mulDivRoundBigInt(vEndExOnb, TWR_FACTOR_SCALE, capitalBase);
         dailyReturnPct = formatReturnPctFromFactor(subFactor);
       }
+    } else if (vStart <= 0n) {
+      subFactor = TWR_FACTOR_SCALE;
+      dailyReturnPct = null;
     } else if (adjustedEnd <= 0n) {
       subFactor = 0n;
       dailyReturnPct = "-100.00";
@@ -430,6 +448,7 @@ export function computeTwrSeries(
       cashMicros: curr.cashMicros,
       positionsMicros: curr.positionsMicros,
       externalCashFlowMicros: curr.externalCashFlowMicros,
+      eodOnboardingMicros: eodOnb.toString(),
       dailyPnlMicros: dailyPnl.toString(),
       dailyReturnPct,
       cumulativeTwrPct: cumPct,
@@ -938,6 +957,34 @@ class NavHistoryStore {
     };
     const saved = await this.recordSnapshots([record], false);
     return saved[0] ?? null;
+  }
+
+  /**
+   * Synchronizes an existing NAV snapshot's `externalCashFlowMicros` in browser preview mode
+   * from aggregated `cash_flows` deposit/withdrawal entries (mirroring Rust transactional sync).
+   */
+  syncExternalCashFlowFromLedger(
+    accountId: string,
+    currency: string,
+    date: string,
+    netExternalMicros: bigint,
+  ): boolean {
+    if (!isValidIsoDate(date)) return false;
+    const curr = currency.trim().toUpperCase();
+    const key = navRecordKey({ date, accountId: accountId.trim(), currency: curr });
+    const existing = this.snapshots.get(key);
+    if (!existing) return false;
+    const updated: NavSnapshotRecord = {
+      ...existing,
+      externalCashFlowMicros: netExternalMicros.toString(),
+      updatedAt: new Date().toISOString(),
+    };
+    this.snapshots.set(key, updated);
+    if (!isTauriRuntime()) {
+      writeStored(BROWSER_NAV_KEY, this.getAllSnapshots());
+    }
+    this.notify();
+    return true;
   }
 
   async syncBenchmarkHistory(

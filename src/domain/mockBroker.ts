@@ -1354,9 +1354,8 @@ export class MockBroker implements BrokerAdapter {
     const replace = options.replace === true;
     if (!replace && persistedOrders.length === 0) return;
 
-    if (replace) {
-      this.sequence = 0;
-    }
+    // Never reset `this.sequence` to 0 on cross-mode hydration (e.g. hydrating "local-csv"
+    // then hydrating an empty "mock" ledger); keep the counter strictly monotonic.
     for (const order of persistedOrders) {
       const match = /^(?:PAPER|MOCK)-ORDER-(\d+)$/.exec(order.id);
       if (match) {
@@ -1652,7 +1651,9 @@ export class MockBroker implements BrokerAdapter {
     this.previewIssuedAt.delete(previewId);
     this.previewTargetAccounts.delete(previewId);
 
-    const id = isLocalMode ? `PAPER-ORDER-${++this.sequence}` : `MOCK-ORDER-${++this.sequence}`;
+    const id = isLocalMode
+      ? generateUniquePaperOrderId(++this.sequence)
+      : `MOCK-ORDER-${++this.sequence}`;
     const unknown = !isLocalMode && (this.scenario === "unknown" || this.scenario === "reconciliation-failed");
     const eventAt = nowIso(this.clock);
     const event = unknown
@@ -1773,6 +1774,20 @@ export class MockBroker implements BrokerAdapter {
       this.previewTargetAccounts.delete(previewId);
     }
   }
+}
+
+function generateUniquePaperOrderId(sequenceFallback: number): string {
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return `PAPER-ORDER-${cryptoObj.randomUUID()}`;
+  }
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    cryptoObj.getRandomValues(bytes);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `PAPER-ORDER-${hex}`;
+  }
+  return `PAPER-ORDER-${Date.now().toString(36)}-${sequenceFallback}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export const MOCK_BROKER = new MockBroker();

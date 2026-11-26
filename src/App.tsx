@@ -448,7 +448,7 @@ export function App() {
       window.removeEventListener("focus", onFocusOrVisibility);
       document.removeEventListener("visibilitychange", onFocusOrVisibility);
     };
-  }, [idleLockMinutes, userLocked]);
+  }, [idleLockMinutes, userLocked, vaultErrorLocked]);
 
   useEffect(() => {
     MOCK_BROKER.setScenario(mockScenario);
@@ -834,10 +834,12 @@ export function App() {
               setHasLockPassphrase(Boolean(status.hasLockPassphrase));
               setRetryAfterSeconds(status.retryAfterSeconds ?? 0);
               const isErrLocked = status.lockState === "error-locked";
+              const wasErrLocked = vaultErrorLockedRef.current;
               setVaultErrorLocked(isErrLocked);
               setVaultLockedReason(isErrLocked ? (status.lockedReason ?? null) : null);
-              if (isErrLocked) {
-                // P2-1: Immediately purge frontend sensitive memory if backend entered ErrorLocked.
+              if (isErrLocked && !wasErrLocked) {
+                // P2-1: Immediately purge frontend sensitive memory on transition into ErrorLocked
+                // (avoid redundant lockEpoch bumps on repeated status polls during disaster recovery).
                 purgeAllFrontendSensitiveMemory();
                 setSelectedBenchmark(null);
                 setBenchmarkLoading(false);

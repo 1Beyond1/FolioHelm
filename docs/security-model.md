@@ -1,6 +1,6 @@
 # Security Model
 
-Updated: 2026-11-23 (v0.2.0)
+Updated: 2026-11-26 (v0.2.1)
 
 ## Assets
 

@@ -27,7 +27,7 @@ import {
 } from "./decimal";
 import { appendEvidence } from "./evidenceJournal";
 import { MOCK_BROKER, registerBrokerResetHook } from "./mockBroker";
-import { decimalToMicros, microsToDecimal, todayUtcIsoDate } from "./nav";
+import { decimalToMicros, microsToDecimal, NAV_STORE, todayUtcIsoDate } from "./nav";
 import { getCurrentLockEpoch, isCurrentLockEpoch } from "./sessionEpoch";
 import {
   invokeVaultDeleteCashFlow,
@@ -302,7 +302,7 @@ export function computePnlAttribution(
 
   // Sum dividends per symbol inside this isolated currency bucket & account scope
   const dividendsBySymbol = new Map<string, bigint>();
-  let totalBucketDividendsMicros = 0n;
+  let unattributedDividendsMicros = 0n;
   for (const cf of cashFlows) {
     if (cf.flowType !== "dividend") continue;
     if (cf.currency.trim().toUpperCase() !== targetCurrency) continue;
@@ -314,17 +314,20 @@ export function computePnlAttribution(
       continue;
     }
     if (amt <= 0n) continue;
-    totalBucketDividendsMicros += amt;
     const sym = cf.symbol?.trim().toUpperCase();
     if (sym) {
       dividendsBySymbol.set(sym, (dividendsBySymbol.get(sym) ?? 0n) + amt);
+    } else {
+      unattributedDividendsMicros += amt;
     }
   }
 
   let totalCostBasis = ZERO;
   let totalMarketValue = ZERO;
   let totalUnrealizedPnl = ZERO;
+  let totalDividendsSum = ZERO;
 
+  const matchedSymbols = new Set<string>();
   const rawEntries: Array<{
     symbol: string;
     company: string;
@@ -344,6 +347,7 @@ export function computePnlAttribution(
     if (holdingCurr !== targetCurrency) continue;
 
     const sym = holding.symbol.trim().toUpperCase();
+    matchedSymbols.add(sym);
     const costBasis = decimalRound(decimalMultiply(holding.quantity, holding.averageCost), 2, "half-up");
     const marketValue = decimalRound(holding.marketValue, 2, "half-up");
     const unrealizedPnl = decimalRound(holding.totalPnl, 2, "half-up");
@@ -366,6 +370,7 @@ export function computePnlAttribution(
     totalCostBasis = decimalAdd(totalCostBasis, costBasis);
     totalMarketValue = decimalAdd(totalMarketValue, marketValue);
     totalUnrealizedPnl = decimalAdd(totalUnrealizedPnl, unrealizedPnl);
+    totalDividendsSum = decimalAdd(totalDividendsSum, dividendsReceived);
 
     rawEntries.push({
       symbol: sym,
@@ -379,6 +384,45 @@ export function computePnlAttribution(
       totalContribution,
       returnOnCostPct,
       absContribution,
+    });
+  }
+
+  // Include liquidated / closed-out symbols that received dividends so Σ entries === summary.
+  for (const [sym, divMicros] of dividendsBySymbol.entries()) {
+    if (matchedSymbols.has(sym) || divMicros <= 0n) continue;
+    const dividendsReceived = decimal(microsToDecimal(divMicros, 2));
+    totalDividendsSum = decimalAdd(totalDividendsSum, dividendsReceived);
+    rawEntries.push({
+      symbol: sym,
+      company: language === "zh" ? "已清仓标的（仅分红）" : "Closed position (dividends only)",
+      currency: targetCurrency,
+      quantity: ZERO,
+      costBasis: ZERO,
+      marketValue: ZERO,
+      unrealizedPnl: ZERO,
+      dividendsReceived,
+      totalContribution: dividendsReceived,
+      returnOnCostPct: decimal("0"),
+      absContribution: dividendsReceived,
+    });
+  }
+
+  // Include unattributed dividends (`symbol === null`) so Σ entries === summary strictly holds.
+  if (unattributedDividendsMicros > 0n) {
+    const dividendsReceived = decimal(microsToDecimal(unattributedDividendsMicros, 2));
+    totalDividendsSum = decimalAdd(totalDividendsSum, dividendsReceived);
+    rawEntries.push({
+      symbol: "UNATTRIBUTED",
+      company: language === "zh" ? "未挂靠标的分红" : "Unattributed dividends",
+      currency: targetCurrency,
+      quantity: ZERO,
+      costBasis: ZERO,
+      marketValue: ZERO,
+      unrealizedPnl: ZERO,
+      dividendsReceived,
+      totalContribution: dividendsReceived,
+      returnOnCostPct: decimal("0"),
+      absContribution: dividendsReceived,
     });
   }
 
@@ -418,9 +462,10 @@ export function computePnlAttribution(
     };
   });
 
-  const totalDividends = decimal(microsToDecimal(totalBucketDividendsMicros, 2));
+  const roundedTotalUnrealized = decimalRound(totalUnrealizedPnl, 2, "half-up");
+  const totalDividends = decimalRound(totalDividendsSum, 2, "half-up");
   const combinedContribution = decimalRound(
-    decimalAdd(totalUnrealizedPnl, totalDividends),
+    decimalAdd(roundedTotalUnrealized, totalDividends),
     2,
     "half-up",
   );
@@ -429,7 +474,7 @@ export function computePnlAttribution(
     currency: targetCurrency,
     totalCostBasis: decimalRound(totalCostBasis, 2, "half-up"),
     totalMarketValue: decimalRound(totalMarketValue, 2, "half-up"),
-    totalUnrealizedPnl: decimalRound(totalUnrealizedPnl, 2, "half-up"),
+    totalUnrealizedPnl: roundedTotalUnrealized,
     totalDividends,
     combinedContribution,
     entries,
@@ -547,18 +592,24 @@ class CashFlowStore {
     }
 
     const record = validateCashFlowInput(input, language);
+    const prevRecord = this.realRecords.get(record.id);
+    const affectedBuckets = this.collectExternalBuckets(record, prevRecord);
 
     if (isTauriRuntime()) {
       const saved = await invokeVaultUpsertCashFlow(record);
       if (!isCurrentLockEpoch(epoch)) return saved;
       this.realRecords.set(saved.id, saved);
       this.notify();
+      if (affectedBuckets.length > 0) {
+        await NAV_STORE.hydrateFromVault().catch(() => undefined);
+      }
       return saved;
     }
 
     if (!isCurrentLockEpoch(epoch)) return record;
     this.realRecords.set(record.id, record);
     this.persistBrowser();
+    this.syncBrowserNavBuckets(affectedBuckets);
     this.notify();
     await appendEvidence("state_changed", {
       action: "cash_flow_upserted",
@@ -586,12 +637,18 @@ class CashFlowStore {
       return existed;
     }
 
+    const prevRecord = this.realRecords.get(trimmed);
+    const affectedBuckets = this.collectExternalBuckets(undefined, prevRecord);
+
     if (isTauriRuntime()) {
       const deleted = await invokeVaultDeleteCashFlow(trimmed);
       if (!isCurrentLockEpoch(epoch)) return false;
       if (deleted) {
         this.realRecords.delete(trimmed);
         this.notify();
+        if (affectedBuckets.length > 0 || !prevRecord) {
+          await NAV_STORE.hydrateFromVault().catch(() => undefined);
+        }
       }
       return deleted;
     }
@@ -600,6 +657,7 @@ class CashFlowStore {
     const existed = this.realRecords.delete(trimmed);
     if (existed) {
       this.persistBrowser();
+      this.syncBrowserNavBuckets(affectedBuckets);
       this.notify();
       await appendEvidence("state_changed", {
         action: "cash_flow_deleted",
@@ -607,6 +665,56 @@ class CashFlowStore {
       }).catch(() => undefined);
     }
     return existed;
+  }
+
+  private collectExternalBuckets(
+    current?: CashFlowRecord,
+    previous?: CashFlowRecord,
+  ): Array<{ accountId: string; currency: string; flowDate: string }> {
+    const buckets = new Map<string, { accountId: string; currency: string; flowDate: string }>();
+    for (const candidate of [current, previous]) {
+      if (!candidate) continue;
+      if (candidate.flowType !== "deposit" && candidate.flowType !== "withdrawal") continue;
+      const curr = candidate.currency.trim().toUpperCase();
+      const key = `${candidate.accountId}|${curr}|${candidate.flowDate}`;
+      buckets.set(key, {
+        accountId: candidate.accountId,
+        currency: curr,
+        flowDate: candidate.flowDate,
+      });
+    }
+    return [...buckets.values()];
+  }
+
+  private syncBrowserNavBuckets(
+    buckets: ReadonlyArray<{ accountId: string; currency: string; flowDate: string }>,
+  ): void {
+    for (const bucket of buckets) {
+      let netMicros = 0n;
+      for (const cf of this.realRecords.values()) {
+        if (
+          cf.accountId !== bucket.accountId
+          || cf.currency.trim().toUpperCase() !== bucket.currency
+          || cf.flowDate !== bucket.flowDate
+        ) {
+          continue;
+        }
+        let amt: bigint;
+        try {
+          amt = BigInt(cf.amountMicros);
+        } catch {
+          continue;
+        }
+        if (cf.flowType === "deposit") netMicros += amt;
+        else if (cf.flowType === "withdrawal") netMicros -= amt;
+      }
+      NAV_STORE.syncExternalCashFlowFromLedger(
+        bucket.accountId,
+        bucket.currency,
+        bucket.flowDate,
+        netMicros,
+      );
+    }
   }
 
   removeForAccount(accountId: string): void {

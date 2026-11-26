@@ -341,7 +341,7 @@ export function listEvidence(): Promise<LocalEvidenceRecord[]> {
 async function appendEvidenceNow(
   kind: LocalEvidenceKind,
   payload: Record<string, string>,
-  appVersion = "0.2.0-mock",
+  appVersion = "0.2.1-mock",
   occurredAtUtc = new Date().toISOString(),
 ): Promise<LocalEvidenceRecord> {
   rejectSensitiveFields(payload);
@@ -386,7 +386,7 @@ async function appendEvidenceNow(
 export function appendEvidence(
   kind: LocalEvidenceKind,
   payload: Record<string, string>,
-  appVersion = "0.2.0-mock",
+  appVersion = "0.2.1-mock",
   occurredAtUtc = new Date().toISOString(),
 ): Promise<LocalEvidenceRecord> {
   return enqueueJournalOperation(() => appendEvidenceNow(kind, payload, appVersion, occurredAtUtc));

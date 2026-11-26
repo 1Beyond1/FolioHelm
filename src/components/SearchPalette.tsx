@@ -51,7 +51,10 @@ export function SearchPalette({
     if (results.length === 0) return;
     const wrapped = (nextIndex + results.length) % results.length;
     setActiveIndex(wrapped);
-    const element = document.getElementById(`search-result-${results[wrapped].symbol}`);
+    const activeItem = results[wrapped];
+    const element = activeItem
+      ? document.getElementById(`search-result-${activeItem.symbol}-${activeItem.currency}`)
+      : null;
     if (typeof element?.scrollIntoView === "function") element.scrollIntoView({ block: "nearest" });
   }
 
@@ -104,7 +107,11 @@ export function SearchPalette({
           placeholder={copy.searchSymbol}
           aria-label={copy.searchSymbol}
           aria-controls="search-results"
-          aria-activedescendant={activeIndex >= 0 ? `search-result-${results[activeIndex]?.symbol}` : undefined}
+          aria-activedescendant={
+            activeIndex >= 0 && results[activeIndex]
+              ? `search-result-${results[activeIndex].symbol}-${results[activeIndex].currency}`
+              : undefined
+          }
         />
         <button type="button" onClick={onClose}>Esc</button>
       </div>
@@ -120,10 +127,10 @@ export function SearchPalette({
         {results.map((item, index) => (
           <button
             type="button"
-            id={`search-result-${item.symbol}`}
+            id={`search-result-${item.symbol}-${item.currency}`}
             className={index === activeIndex ? "is-active" : undefined}
             aria-current={index === activeIndex ? "true" : undefined}
-            key={item.symbol}
+            key={`${item.symbol}:${item.currency}`}
             onMouseEnter={() => setActiveIndex(index)}
             onClick={() => onOpenInstrument(item.symbol)}
           >

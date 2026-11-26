@@ -918,8 +918,8 @@ export function TradePage({ language, initialSymbol, initialPrefill, onClose, on
                       id="trade-limit-price"
                       aria-label={copy.limitPrice}
                       type="number"
-                      min="0.01"
-                      step="0.01"
+                      min="0.000001"
+                      step="any"
                       inputMode="decimal"
                       value={limitPrice}
                       aria-invalid={Boolean(errors.limitPrice)}

@@ -543,6 +543,20 @@ fn add_cash(
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IbkrTradeDiscriminator {
+    Order,
+    Trade,
+    Untagged,
+}
+
+fn normalize_ibkr_discriminator(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
 fn parse_ibkr_multi_section(
     rows: &[Vec<String>],
     warnings: &mut Vec<String>,
@@ -552,7 +566,7 @@ fn parse_ibkr_multi_section(
     let mut cash_headers: Option<Vec<String>> = None;
     let mut mappings = Vec::new();
     let mut holdings_map: BTreeMap<(String, String), HoldingAccumulator> = BTreeMap::new();
-    let mut transactions = Vec::new();
+    let mut raw_trades: Vec<(IbkrTradeDiscriminator, StoredPortfolioTransaction)> = Vec::new();
     let mut cash_by_currency: BTreeMap<String, i128> = BTreeMap::new();
     let mut skipped_rows = 0_usize;
 
@@ -714,6 +728,21 @@ fn parse_ibkr_multi_section(
                     skipped_rows += 1;
                     continue;
                 };
+                let discriminator_kind = if let Some(raw_disc) =
+                    find_cell(headers, values, &["datadiscriminator", "header"])
+                {
+                    match normalize_ibkr_discriminator(raw_disc).as_str() {
+                        "subtotal" | "total" | "closedlot" | "washsale" => {
+                            skipped_rows += 1;
+                            continue;
+                        }
+                        "order" => IbkrTradeDiscriminator::Order,
+                        "trade" => IbkrTradeDiscriminator::Trade,
+                        _ => IbkrTradeDiscriminator::Untagged,
+                    }
+                } else {
+                    IbkrTradeDiscriminator::Untagged
+                };
                 let raw_symbol = find_cell(headers, values, SYMBOL_ALIASES).unwrap_or("");
                 if is_summary_or_blank_symbol(raw_symbol) {
                     skipped_rows += 1;
@@ -765,16 +794,19 @@ fn parse_ibkr_multi_section(
                 );
                 let action = if qty_fixed >= 0 { "BUY" } else { "SELL" };
 
-                transactions.push(StoredPortfolioTransaction {
-                    date,
-                    action: action.to_string(),
-                    symbol,
-                    quantity: format_fixed_trimmed(qty_fixed.abs()),
-                    price: format_fixed(price_fixed.abs(), 4),
-                    amount: format_fixed(proceeds_fixed, 2),
-                    fees: format_fixed(comm_fixed.abs(), 2),
-                    currency,
-                });
+                raw_trades.push((
+                    discriminator_kind,
+                    StoredPortfolioTransaction {
+                        date,
+                        action: action.to_string(),
+                        symbol,
+                        quantity: format_fixed_trimmed(qty_fixed.abs()),
+                        price: format_fixed(price_fixed.abs(), 4),
+                        amount: format_fixed(proceeds_fixed, 2),
+                        fees: format_fixed(comm_fixed.abs(), 2),
+                        currency,
+                    },
+                ));
             }
             "cash report" => {
                 let Some(headers) = cash_headers.as_ref() else {
@@ -809,6 +841,36 @@ fn parse_ibkr_multi_section(
                 skipped_rows += 1;
             }
         }
+    }
+
+    // Prefer canonical `Order` rows over child `Trade` execution rows for the same
+    // `(symbol, date, currency, action)`; adopt `Trade` rows whenever no `Order` exists.
+    let order_keys: BTreeSet<(String, String, String, String)> = raw_trades
+        .iter()
+        .filter(|(kind, _)| *kind == IbkrTradeDiscriminator::Order)
+        .map(|(_, tx)| {
+            (
+                tx.symbol.clone(),
+                tx.date.clone(),
+                tx.currency.clone(),
+                tx.action.clone(),
+            )
+        })
+        .collect();
+    let mut transactions = Vec::with_capacity(raw_trades.len());
+    for (kind, tx) in raw_trades {
+        if kind == IbkrTradeDiscriminator::Trade
+            && order_keys.contains(&(
+                tx.symbol.clone(),
+                tx.date.clone(),
+                tx.currency.clone(),
+                tx.action.clone(),
+            ))
+        {
+            skipped_rows += 1;
+            continue;
+        }
+        transactions.push(tx);
     }
 
     if holdings_map.is_empty() && !transactions.is_empty() {
@@ -847,6 +909,8 @@ fn parse_tabular_csv(
     let mut holdings_map: BTreeMap<(String, String), HoldingAccumulator> = BTreeMap::new();
     let mut transactions = Vec::new();
     let mut cash_by_currency: BTreeMap<String, i128> = BTreeMap::new();
+    let mut pending_untagged_cash_rows: Vec<i128> = Vec::new();
+    let mut pending_untagged_cash_cols: Vec<i128> = Vec::new();
     let mut skipped_rows = header_index;
 
     for (offset, row) in rows.iter().enumerate().skip(header_index + 1) {
@@ -900,39 +964,60 @@ fn parse_tabular_csv(
             if let Some(val_raw) = find_cell(headers, row, CASH_ROW_VALUE_ALIASES) {
                 if !val_raw.trim().is_empty() && !is_na_placeholder(val_raw) {
                     let parsed = parse_decimal_fixed(val_raw, row_num, "Cash")?;
-                    let row_currency = explicit_currency
+                    if let Some(row_currency) = explicit_currency
                         .clone()
                         .or_else(|| infer_currency_from_cash_symbol(&symbol_lower))
                         .or_else(|| infer_currency_from_amount(val_raw))
-                        .unwrap_or_else(|| "USD".to_string());
-                    add_cash(&mut cash_by_currency, &row_currency, parsed)?;
+                    {
+                        add_cash(&mut cash_by_currency, &row_currency, parsed)?;
+                    } else {
+                        pending_untagged_cash_rows.push(parsed);
+                    }
                 }
             }
             continue;
         }
 
-        // Optional explicit cash column on standard/Futu/Tiger CSV rows
+        // Optional explicit cash column on standard/Futu/Tiger CSV rows.
+        // Defer untagged cash values until the row's own holding/transaction currency (or file
+        // holding currency) is resolved so non-USD portfolios never get a ghost `USD` bucket.
+        let mut row_cash_col: Option<(i128, Option<String>)> = None;
         if !in_secondary_tx_section {
             if let Some(cash_col) = find_cell(headers, row, CASH_COL_ALIASES) {
                 if !cash_col.trim().is_empty() && !is_na_placeholder(cash_col) {
                     let parsed = parse_decimal_fixed(cash_col, row_num, "cash")?;
-                    let cash_curr = explicit_currency
+                    let tagged_curr = explicit_currency
                         .clone()
-                        .or_else(|| infer_currency_from_amount(cash_col))
-                        .unwrap_or_else(|| "USD".to_string());
-                    if parsed > 0 && cash_by_currency.get(&cash_curr).copied().unwrap_or(0) == 0 {
-                        cash_by_currency.insert(cash_curr, parsed);
-                    }
+                        .or_else(|| infer_currency_from_amount(cash_col));
+                    row_cash_col = Some((parsed, tagged_curr));
                 }
             }
         }
 
         if is_summary_or_blank_symbol(raw_symbol) {
+            if let Some((parsed, tagged_curr)) = row_cash_col {
+                if let Some(curr) = tagged_curr {
+                    if parsed > 0 && cash_by_currency.get(&curr).copied().unwrap_or(0) == 0 {
+                        cash_by_currency.insert(curr, parsed);
+                    }
+                } else if parsed > 0 {
+                    pending_untagged_cash_cols.push(parsed);
+                }
+            }
             skipped_rows += 1;
             continue;
         }
 
         if is_option_row(headers, row, raw_symbol) {
+            if let Some((parsed, tagged_curr)) = row_cash_col {
+                if let Some(curr) = tagged_curr {
+                    if parsed > 0 && cash_by_currency.get(&curr).copied().unwrap_or(0) == 0 {
+                        cash_by_currency.insert(curr, parsed);
+                    }
+                } else if parsed > 0 {
+                    pending_untagged_cash_cols.push(parsed);
+                }
+            }
             warnings.push(format!(
                 "Skipped unsupported option/derivative row {row_num} ({})",
                 raw_symbol.trim().chars().take(32).collect::<String>()
@@ -1008,6 +1093,13 @@ fn parse_tabular_csv(
                 .or_else(|| infer_currency_from_amount(amount_raw))
                 .or_else(|| infer_currency_from_symbol(&symbol))
                 .unwrap_or_else(|| "USD".to_string());
+
+            if let Some((parsed, tagged_curr)) = row_cash_col {
+                let cash_curr = tagged_curr.unwrap_or_else(|| row_currency.clone());
+                if parsed > 0 && cash_by_currency.get(&cash_curr).copied().unwrap_or(0) == 0 {
+                    cash_by_currency.insert(cash_curr, parsed);
+                }
+            }
 
             transactions.push(StoredPortfolioTransaction {
                 date,
@@ -1117,6 +1209,13 @@ fn parse_tabular_csv(
             .or_else(|| infer_currency_from_symbol(&symbol))
             .unwrap_or_else(|| "USD".to_string());
 
+        if let Some((parsed, tagged_curr)) = row_cash_col {
+            let cash_curr = tagged_curr.unwrap_or_else(|| row_currency.clone());
+            if parsed > 0 && cash_by_currency.get(&cash_curr).copied().unwrap_or(0) == 0 {
+                cash_by_currency.insert(cash_curr, parsed);
+            }
+        }
+
         let company = sanitize_text_cell(company_raw, "Description", warnings);
 
         accumulate_holding(
@@ -1132,6 +1231,38 @@ fn parse_tabular_csv(
 
     if holdings_map.is_empty() && !transactions.is_empty() {
         replay_transactions_into_holdings(&transactions, &mut holdings_map, warnings)?;
+    }
+
+    if !pending_untagged_cash_rows.is_empty() || !pending_untagged_cash_cols.is_empty() {
+        let mut inferred_currencies: BTreeSet<String> =
+            holdings_map.keys().map(|(_, curr)| curr.clone()).collect();
+        if inferred_currencies.is_empty() {
+            for tx in &transactions {
+                inferred_currencies.insert(tx.currency.clone());
+            }
+        }
+        let fallback_currency = if inferred_currencies.len() == 1 {
+            inferred_currencies
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "USD".to_string())
+        } else {
+            "USD".to_string()
+        };
+        for amt in pending_untagged_cash_rows {
+            add_cash(&mut cash_by_currency, &fallback_currency, amt)?;
+        }
+        for amt in pending_untagged_cash_cols {
+            if amt > 0
+                && cash_by_currency
+                    .get(&fallback_currency)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            {
+                cash_by_currency.insert(fallback_currency.clone(), amt);
+            }
+        }
     }
 
     Ok((
@@ -1681,20 +1812,30 @@ fn infer_currency_from_cash_symbol(symbol_lower: &str) -> Option<String> {
         "eur" => Some("EUR".to_string()),
         "gbp" => Some("GBP".to_string()),
         "sgd" => Some("SGD".to_string()),
+        "jpy" => Some("JPY".to_string()),
+        "cad" => Some("CAD".to_string()),
+        "aud" => Some("AUD".to_string()),
+        "chf" => Some("CHF".to_string()),
+        "dkk" => Some("DKK".to_string()),
+        "sek" => Some("SEK".to_string()),
+        "nok" => Some("NOK".to_string()),
+        "twd" => Some("TWD".to_string()),
+        "krw" => Some("KRW".to_string()),
+        "inr" => Some("INR".to_string()),
+        "nzd" => Some("NZD".to_string()),
+        "brl" => Some("BRL".to_string()),
+        "mxn" => Some("MXN".to_string()),
+        "idr" => Some("IDR".to_string()),
+        "thb" => Some("THB".to_string()),
+        "myr" => Some("MYR".to_string()),
+        "ils" => Some("ILS".to_string()),
+        "zar" => Some("ZAR".to_string()),
         _ => None,
     }
 }
 
 fn infer_currency_from_symbol(symbol: &str) -> Option<String> {
-    if symbol.ends_with(".HK") {
-        Some("HKD".to_string())
-    } else if symbol.ends_with(".SS") || symbol.ends_with(".SZ") {
-        Some("CNY".to_string())
-    } else if symbol.ends_with(".SI") {
-        Some("SGD".to_string())
-    } else {
-        None
-    }
+    crate::quotes::infer_exchange_currency_from_symbol(symbol).map(str::to_string)
 }
 
 fn is_secondary_transaction_header(normalized: &[String]) -> bool {
@@ -2813,5 +2954,114 @@ Cash Report,Data,Ending Cash,EUR,1000.00
             "expected explicit warnings for all reverse splits, got: {:?}",
             preview.warnings
         );
+    }
+
+    #[test]
+    fn v021_ibkr_trades_filters_data_discriminator_order_trade_subtotal_closedlot_washsale() {
+        let csv = r#"Trades,Header,DataDiscriminator,Asset Category,Currency,Symbol,Date/Time,Quantity,T. Price,Proceeds,Comm/Fee
+Trades,Data,Order,Stocks,USD,AAPL,"2026-11-20, 09:30:01",100,200.00,-20000.00,-1.00
+Trades,Data,Trade,Stocks,USD,AAPL,"2026-11-20, 09:30:02",60,200.00,-12000.00,-0.60
+Trades,Data,Trade,Stocks,USD,AAPL,"2026-11-20, 09:30:03",40,200.00,-8000.00,-0.40
+Trades,Data,SubTotal,Stocks,USD,AAPL,,100,200.00,-20000.00,-1.00
+Trades,Data,ClosedLot,Stocks,USD,AAPL,"2026-10-01, 10:00:00",-100,190.00,19000.00,0.00
+Trades,Data,WashSale,Stocks,USD,AAPL,"2026-11-20, 09:30:01",10,195.00,-1950.00,0.00
+Trades,Data,Trade,Stocks,USD,MSFT,"2026-11-21, 11:00:00",50,410.00,-20500.00,-1.00
+Trades,Data,Total,Stocks,USD,,,150,,-40500.00,-2.00
+"#;
+        let preview = parse_and_preview_csv(csv, "ibkr-disc.csv", false).expect("parse ibkr");
+        // AAPL keeps ONLY the Order row (drops duplicate child Trade rows + SubTotal/ClosedLot/WashSale/Total).
+        // MSFT has no Order row, so its standalone Trade row is adopted cleanly!
+        assert_eq!(preview.snapshot.transactions.len(), 2);
+        let aapl_tx = preview
+            .snapshot
+            .transactions
+            .iter()
+            .find(|t| t.symbol == "AAPL")
+            .expect("AAPL tx");
+        assert_eq!(aapl_tx.quantity, "100");
+        let msft_tx = preview
+            .snapshot
+            .transactions
+            .iter()
+            .find(|t| t.symbol == "MSFT")
+            .expect("MSFT tx");
+        assert_eq!(msft_tx.quantity, "50");
+
+        // Replayed holdings must equal exact non-duplicated quantities (AAPL=100, MSFT=50).
+        let aapl_pos = preview
+            .snapshot
+            .holdings
+            .iter()
+            .find(|h| h.symbol == "AAPL")
+            .expect("AAPL pos");
+        assert_eq!(aapl_pos.quantity, "100");
+        let msft_pos = preview
+            .snapshot
+            .holdings
+            .iter()
+            .find(|h| h.symbol == "MSFT")
+            .expect("MSFT pos");
+        assert_eq!(msft_pos.quantity, "50");
+    }
+
+    #[test]
+    fn v021_csv_infers_all_24_exchange_suffix_currencies_and_avoids_ghost_usd_cash() {
+        // 1. Single non-USD market CSV with untagged `Cash` column must NOT create a ghost USD bucket!
+        let hk_csv = "Symbol,Quantity,Average Cost,Price,Cash\n00700.HK,100,320,380,15000\n";
+        let hk = parse_and_preview_csv(hk_csv, "hk-cash.csv", false).expect("parse hk");
+        assert!(!hk.snapshot.is_multi_currency);
+        assert_eq!(hk.snapshot.currency, "HKD");
+        assert_eq!(hk.snapshot.currencies, vec!["HKD"]);
+        assert_eq!(hk.snapshot.cash, "15000.00");
+        assert_eq!(
+            hk.snapshot.cash_by_currency.get("HKD").map(String::as_str),
+            Some("15000.00")
+        );
+        assert!(!hk.snapshot.cash_by_currency.contains_key("USD"));
+
+        // 2. Untagged generic `Cash` row in a Tokyo `.T` CSV inherits JPY instead of USD!
+        let jp_csv =
+            "Symbol,Quantity,Average Cost,Price\nCash,1,500000,500000\n7203.T,100,2500,2800\n";
+        let jp = parse_and_preview_csv(jp_csv, "jp-cash.csv", false).expect("parse jp");
+        assert!(!jp.snapshot.is_multi_currency);
+        assert_eq!(jp.snapshot.currency, "JPY");
+        assert_eq!(jp.snapshot.cash, "500000.00");
+
+        // 3. Spot-check global 24-market suffix inference.
+        let cases = [
+            ("00700.HK", "HKD"),
+            ("600519.SS", "CNY"),
+            ("000858.SZ", "CNY"),
+            ("D05.SI", "SGD"),
+            ("7203.T", "JPY"),
+            ("HSBA.L", "GBP"),
+            ("RY.TO", "CAD"),
+            ("BHP.AX", "AUD"),
+            ("SAP.DE", "EUR"),
+            ("MC.PA", "EUR"),
+            ("NESN.SW", "CHF"),
+            ("NOVO.CO", "DKK"),
+            ("VOLV.ST", "SEK"),
+            ("EQNR.OL", "NOK"),
+            ("2330.TW", "TWD"),
+            ("8069.TWO", "TWD"),
+            ("005930.KS", "KRW"),
+            ("RELIANCE.NS", "INR"),
+            ("FPH.NZ", "NZD"),
+            ("PETR4.SA", "BRL"),
+            ("WALMEX.MX", "MXN"),
+            ("BBCA.JK", "IDR"),
+            ("PTT.BK", "THB"),
+            ("MAYBANK.KL", "MYR"),
+            ("TEVA.TA", "ILS"),
+            ("NPN.JO", "ZAR"),
+        ];
+        for (sym, expected_curr) in cases {
+            assert_eq!(
+                infer_currency_from_symbol(sym).as_deref(),
+                Some(expected_curr),
+                "suffix currency mismatch for {sym}"
+            );
+        }
     }
 }

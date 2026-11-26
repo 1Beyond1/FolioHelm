@@ -1,6 +1,6 @@
 # FolioHelm Known Issues
 
-状态：持续更新（2026-11-23 · v0.2.0）。Schwab API Gate 不阻塞 Mock / Local Portfolio 版本其余工作。
+状态：持续更新（2026-11-26 · v0.2.1）。Schwab API Gate 不阻塞 Mock / Local Portfolio 版本其余工作。
 
 ## 当前仍存在的问题
 
@@ -40,6 +40,15 @@
 - 处理：继续保留 portable 目标与校验清单，绝不把未签名 EXE 伪装成签名安装器。
 
 ## 已修复并验证的问题
+
+### FH-V021-001（v0.2.1 已落地）— 纸上订单防碰撞、灾难恢复 WAL 保护、行情缩放、IBKR 过滤、多账户 TWR 与现金流归因一致性修复
+
+- **纸上订单主键保护**：本地纸上订单改用 `PAPER-ORDER-<UUID>` 唯一标识，跨模式水合不再重置序号；Rust `save_paper_order` 改用严格 `INSERT INTO paper_orders` 拒绝主键静默覆盖。
+- **`ErrorLocked` 灾难恢复加固**：恢复前校验非空 `db_path`、复用加密 `.restore-intent`、暂存并按需完整回滚 `-wal`/`-shm` 伴生文件，恢复成功后通过 `appLockCleared` 提示用户重设应用锁密码。
+- **IBKR 与 24 市场 CSV 准确性**：IBKR `Trades` 分区新增 `DataDiscriminator` 过滤（跳过 `SubTotal`/`Total`/`ClosedLot`/`WashSale`，优先 `Order`、无 `Order` 时采纳 `Trade`）；CSV 交易所后缀币种推导扩展至全部 24 个全球市场，并修复未标币种 `cash` 列/行落入幽灵 `USD` 桶的问题。
+- **Yahoo Finance 1 日涨跌与亚单位缩放**：请求 `range=1d` 且优先采用 `meta.previousClose`（兜底倒数第二根收盘价），在转大写前识别 `GBp`/`GBX` → `GBP`、`ZAc` → `ZAR`、`ILA` → `ILS` 并以 `i128` 定点缩小 100 倍；`User-Agent` 改为编译期 `env!("CARGO_PKG_VERSION")`。
+- **多账户 TWR 与现金流/归因勾稽**：分离 `eod_onboarding_micros` 与期初外部现金流 `external_cash_flow_micros`，消除新接入账户 EOD 稀释并修复零基底期初入金收益率；`cash_flows` 的 `deposit`/`withdrawal` 增删在 Rust 同一事务内同步聚合回写 `nav_snapshots.external_cash_flow_micros`；盈亏归因补齐已清仓标的（`quantity = 0`）与 `UNATTRIBUTED` 未挂靠分红行，确保明细求和与汇总严格相等。
+- **空闲锁屏与界面细节**：修复 `App.tsx` 空闲自动锁屏 `useEffect` 遗漏 `vaultErrorLocked` 依赖；修复 `TradePage` 限价输入 `step="any"` 支持 6 位小数，补齐 `SearchPalette`/`PortfolioPage` 跨币种复合 React key。
 
 ### FH-V020-001（v0.2.0 已落地）— 真实 NAV / `i128` TWR、多账户分币种桶、现金流归因、自选预警与 Stage 6 安全加固
 

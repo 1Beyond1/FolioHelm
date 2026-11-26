@@ -1,19 +1,15 @@
-# Windows Mock Release Checklist
+# Windows Desktop Release Checklist (v0.2.1)
 
-This checklist is for a public preview of the local Mock build. It is not a
-checklist for enabling Schwab live trading.
+This checklist applies to public releases of **FolioHelm** covering both isolated local modes (**Mock Demo** and **Local Portfolio (CSV + Paper)**). It is **not** a checklist for enabling Schwab live brokerage trading (`API Gate Pending`).
 
-## Source and safety
+## Source, version alignment, and safety
 
-- [ ] Working tree reviewed; unrelated user changes preserved.
-- [ ] Local Git checkpoint created and commit ID recorded.
-- [ ] No API key, secret, token, cookie, private key, account export, or live
-      order identifier is in the source, logs, artifact, or screenshots.
-- [ ] `API Gate Pending` remains visible in the product/documentation.
-- [ ] Real Trading is disabled and no Place/Cancel/Replace path exists in the
-      Mock profile.
-- [ ] README, SECURITY.md, API Gate, user guides, and known issues agree on
-      the current boundary.
+- [ ] Working tree reviewed; unrelated local changes preserved.
+- [ ] Version aligned across `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/tauri.conf.json`, `SettingsPage.tsx`, `evidenceJournal.ts`, and `CHANGELOG.md`.
+- [ ] No API key, secret, token, cookie, private key, account export, or live order identifier exists in source, logs, artifacts, or screenshots.
+- [ ] `API Gate Pending` remains visible in the UI and documentation.
+- [ ] Live brokerage write capability remains disabled (no live Place/Cancel/Replace path exists).
+- [ ] `README.md`, `README.zh-CN.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/security-model.md`, and `docs/known-issues.md` agree on the current security boundary.
 
 ## Automated verification
 
@@ -26,39 +22,26 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features -- -D warnings
 ```
 
-- [x] Windows portable build completes:
+- [ ] Portable Windows desktop build completes:
 
 ```powershell
 npm run desktop:build:portable
 ```
 
-- [x] The EXE starts without a Vite dev server and exits cleanly.
-- [x] The artifact is hashed with SHA-256.
+- [ ] The portable EXE starts cleanly without a Vite dev server and exits cleanly.
+- [ ] Published artifact SHA-256 is computed and recorded (and unsigned status is clearly disclosed).
 
 ## Manual acceptance
 
-- [ ] Home, Markets, Instrument, Portfolio, Orders, Trade, Settings, and
-      Automation reviewed in a real browser/Tauri window.
-- [ ] 900×680 minimum window checked.
-- [ ] English/Chinese and System/Dark/Light checked.
-- [ ] Mock scenario matrix checked.
-- [ ] Trade modal close button and Escape tested.
-- [ ] Unknown order warning says to reconcile and not resubmit.
-- [ ] Evidence verify/export/import and clear-data confirmation checked.
+- [ ] Home, Markets, Instrument, Portfolio, Orders, Trade, Settings, and Automation reviewed in a desktop Tauri window.
+- [ ] 900×680 minimum window size checked; English/Chinese and System/Dark/Light themes checked.
+- [ ] CSV import verified (Schwab, IBKR `DataDiscriminator`, Fidelity, Vanguard, Futu, Tiger, multi-market suffixes, multi-currency isolation).
+- [ ] Paper-order persistence verified across restart/lock/unlock (UUID IDs, no overwrite of historical orders).
+- [ ] Real NAV & `i128` TWR verified across multi-account onboarding, `cash_flows` deposit/withdrawal sync, and P&L attribution reconciliation.
+- [ ] Encrypted SQLite vault, `.fhvault` Argon2id backup/restore (including `ErrorLocked` recovery and App Lock re-set prompt), and manual/idle App Lock verified.
+- [ ] Trade modal close button, Escape key, 6-decimal limit price input, and `Unknown` order reconcile-only safeguard checked.
+- [ ] Evidence verify/export/import, sanitized Markdown/CSV report export, and clear-data confirmation checked.
 
-## Current known release limitation
+## Known packaging limitation
 
-The current restricted Windows environment successfully produces an independent
-portable EXE but may fail in the final WiX/NSIS bundler step with `os error 5`
-(Access denied). Until an installer is rebuilt in an environment with the
-required bundler permissions, publish the portable EXE only with its exact
-SHA-256 and mark it unsigned.
-
-## Artifact record
-
-The last verified portable artifact was:
-
-- path: `artifacts/foliohelm-0.1.0-windows-x64-mock.exe`
-- SHA-256: `0125964F1C7E4FB192E8C4D496618C5E0CCE91A70898F0E8F960E00A89676DF7`
-- build command: `npm run desktop:build:portable`
-- commit: `4434a71` (theme parity and interaction checkpoint)
+In restricted Windows environments, WiX/NSIS installer bundling may encounter `os error 5` (Access denied) while `npm run desktop:build:portable` succeeds cleanly. Until an installer is built in a standard-privilege environment, ship the portable EXE with its exact SHA-256 digest and explicitly mark it unsigned.

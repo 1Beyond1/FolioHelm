@@ -1,6 +1,6 @@
 [package]
 name = "foliohelm"
-version = "0.2.0"
+version = "0.2.1"
 description = "FolioHelm desktop application core"
 authors = ["FolioHelm contributors"]
 edition = "2021"

@@ -6,7 +6,7 @@ FolioHelm is a local-first, security-first Windows desktop portfolio and paper-t
 
 > FolioHelm runs in two isolated local modes — **Mock Demo** and **Local Portfolio (CSV + Paper)** — keeping all portfolio data on your machine. Live brokerage OAuth and order execution are planned once [API Gate](docs/api-gate.md) review is completed.
 
-## What's Implemented (v0.2.0)
+## What's Implemented (v0.2.1)
 
 - **Encrypted Local Persistence & `.fhvault` Offline Backup (Fail-Closed)**:
   - Stores imported portfolios, multi-account profiles, daily NAV snapshots, cached benchmarks, cash-flow & dividend ledgers, watchlist targets, paper orders, evidence journal, cached quotes, automation policies, safety preferences, and rebalance targets in bundled SQLite (`WAL` + `secure_delete = ON`) encrypted at rest with **AES-256-GCM** (random 96-bit nonces + `schema_version|table|record_id` AAD) and `Zeroizing` plaintext buffers.
